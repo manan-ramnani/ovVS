@@ -98,5 +98,7 @@ IOVS_TEST(pca_reduces_and_pairwise_ip) {
   expect_status(iovsPairwiseDistance(res.r, IOVS_METRIC_INNER_PRODUCT, data.data(), n, data.data(), n,
                                      dim, out.data(), 2.f),
                 "ip");
-  expect(out[0] < 0.f || std::fabs(out[0]) >= 0.f, "ip finite");
+  float self = 0.f;
+  for (int64_t d = 0; d < dim; ++d) self += data[static_cast<size_t>(d)] * data[static_cast<size_t>(d)];
+  expect(std::fabs(out[0] + self) < 1e-4f, "pairwise IP stores -dot");
 }

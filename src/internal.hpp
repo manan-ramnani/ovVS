@@ -22,9 +22,9 @@ namespace impl {
 
 constexpr float kInf = std::numeric_limits<float>::infinity();
 
-inline bool metric_largest(iovsMetric m) {
-  return m == IOVS_METRIC_INNER_PRODUCT || m == IOVS_METRIC_COSINE_EXPANDED;
-}
+/* Pairwise scores are always distances (smaller is better): L2, -IP, 1-cos, Hamming.
+   Search must take the minimum. INNER_PRODUCT is converted back to +IP after topk. */
+inline bool metric_largest(iovsMetric) { return false; }
 
 inline float l2sq(const float* a, const float* b, int64_t d) {
   float s = 0.f;

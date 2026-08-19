@@ -156,7 +156,7 @@ void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_
     for (int64_t i = 0; i < nq; ++i) {
       for (int64_t j = 0; j < n; ++j) {
         if (!allowed(bitset, j)) {
-          scores[static_cast<size_t>(i * n + j)] = metric_largest(metric) ? -kInf : kInf;
+          scores[static_cast<size_t>(i * n + j)] = kInf;
         }
       }
     }

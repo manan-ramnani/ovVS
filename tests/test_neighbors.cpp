@@ -2,16 +2,71 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <numeric>
 #include <set>
+#include <vector>
+
+static float oracle_dot(const float* a, const float* b, int64_t d) {
+  float s = 0.f;
+  for (int64_t i = 0; i < d; ++i) s += a[i] * b[i];
+  return s;
+}
+
+static float oracle_n2(const float* a, int64_t d) {
+  float s = 0.f;
+  for (int64_t i = 0; i < d; ++i) s += a[i] * a[i];
+  return s;
+}
+
+/* Independent of libiovs search: rank dataset rows by a caller-supplied score (higher is better). */
+static void rank_oracle(const float* data, int64_t n, int64_t dim, const float* q, int64_t k,
+                        int64_t* idx, float* out_score, bool ip) {
+  std::vector<int64_t> order(static_cast<size_t>(n));
+  std::iota(order.begin(), order.end(), 0);
+  std::vector<float> sc(static_cast<size_t>(n));
+  const float qn = std::sqrt(std::max(oracle_n2(q, dim), 1e-12f));
+  for (int64_t j = 0; j < n; ++j) {
+    const float* x = data + j * dim;
+    if (ip) {
+      sc[static_cast<size_t>(j)] = oracle_dot(q, x, dim);
+    } else {
+      const float xn = std::sqrt(std::max(oracle_n2(x, dim), 1e-12f));
+      sc[static_cast<size_t>(j)] = oracle_dot(q, x, dim) / (qn * xn);
+    }
+  }
+  std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int64_t a, int64_t b) {
+    return sc[static_cast<size_t>(a)] > sc[static_cast<size_t>(b)];
+  });
+  for (int64_t t = 0; t < k; ++t) {
+    idx[t] = order[static_cast<size_t>(t)];
+    out_score[t] = sc[static_cast<size_t>(order[static_cast<size_t>(t)])];
+  }
+}
 
 static void brute_oracle(const float* data, int64_t n, int64_t dim, const float* q, int64_t nq,
                          int64_t k, int64_t* idx, float* dist) {
-  Res res;
-  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
-  iovsBruteForceIndex_t ix = nullptr;
-  expect_status(iovsBruteForceBuild(res.r, data, n, dim, IOVS_METRIC_L2_EXPANDED, &ix), "oracle build");
-  expect_status(iovsBruteForceSearch(res.r, ix, q, nq, k, nullptr, idx, dist), "oracle search");
-  iovsBruteForceDestroy(ix);
+  for (int64_t qi = 0; qi < nq; ++qi) {
+    std::vector<int64_t> order(static_cast<size_t>(n));
+    std::iota(order.begin(), order.end(), 0);
+    std::vector<float> sc(static_cast<size_t>(n));
+    const float* qq = q + qi * dim;
+    for (int64_t j = 0; j < n; ++j) {
+      float s = 0.f;
+      const float* x = data + j * dim;
+      for (int64_t d = 0; d < dim; ++d) {
+        const float t = qq[d] - x[d];
+        s += t * t;
+      }
+      sc[static_cast<size_t>(j)] = s;
+    }
+    std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int64_t a, int64_t b) {
+      return sc[static_cast<size_t>(a)] < sc[static_cast<size_t>(b)];
+    });
+    for (int64_t t = 0; t < k; ++t) {
+      idx[qi * k + t] = order[static_cast<size_t>(t)];
+      dist[qi * k + t] = sc[static_cast<size_t>(order[static_cast<size_t>(t)])];
+    }
+  }
 }
 
 IOVS_TEST(brute_force_recall_one) {
@@ -28,6 +83,86 @@ IOVS_TEST(brute_force_recall_one) {
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   expect(recall_at_k(got.data(), truth.data(), nq, k) > 0.999f, "bf recall");
   iovsBruteForceDestroy(ix);
+}
+
+IOVS_TEST(brute_force_inner_product_vs_dot_oracle) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const float data[] = {1.f, 0.f, 0.f, 1.f, -1.f, 0.f};
+  const float q[] = {1.f, 0.f};
+  iovsBruteForceIndex_t ix = nullptr;
+  expect_status(iovsBruteForceBuild(res.r, data, 3, 2, IOVS_METRIC_INNER_PRODUCT, &ix), "ip build");
+  int64_t nb[2];
+  float ds[2];
+  expect_status(iovsBruteForceSearch(res.r, ix, q, 1, 2, nullptr, nb, ds), "ip search");
+  int64_t truth[2];
+  float tscore[2];
+  rank_oracle(data, 3, 2, q, 2, truth, tscore, true);
+  expect(nb[0] == truth[0] && nb[1] == truth[1], "ip neighbor ids");
+  expect(std::fabs(ds[0] - tscore[0]) < 1e-5f && std::fabs(ds[1] - tscore[1]) < 1e-5f, "ip values");
+  expect(nb[0] == 0 && nb[1] == 1, "ip order vs [1,0],[0,1],[-1,0]");
+  iovsBruteForceDestroy(ix);
+}
+
+IOVS_TEST(brute_force_cosine_vs_oracle) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const float data[] = {1.f, 0.f, 0.f, 1.f, -1.f, 0.f};
+  const float q[] = {1.f, 0.f};
+  iovsBruteForceIndex_t ix = nullptr;
+  expect_status(iovsBruteForceBuild(res.r, data, 3, 2, IOVS_METRIC_COSINE_EXPANDED, &ix), "cos build");
+  int64_t nb[2];
+  float ds[2];
+  expect_status(iovsBruteForceSearch(res.r, ix, q, 1, 2, nullptr, nb, ds), "cos search");
+  int64_t truth[2];
+  float tscore[2];
+  rank_oracle(data, 3, 2, q, 2, truth, tscore, false);
+  expect(nb[0] == truth[0] && nb[1] == truth[1], "cosine neighbor ids");
+  expect(nb[0] == 0 && nb[1] == 1, "cosine order");
+  /* API reports 1-cos distance. */
+  expect(std::fabs(ds[0] - (1.f - tscore[0])) < 1e-5f, "cosine dist 0");
+  expect(std::fabs(ds[1] - (1.f - tscore[1])) < 1e-5f, "cosine dist 1");
+  iovsBruteForceDestroy(ix);
+}
+
+IOVS_TEST(ivf_flat_inner_product_refine_vs_oracle) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const float data[] = {1.f, 0.f, 0.f, 1.f, -1.f, 0.f, 0.5f, 0.5f};
+  const float q[] = {1.f, 0.f};
+  iovsIvfFlatIndex_t ix = nullptr;
+  expect_status(iovsIvfFlatBuild(res.r, data, 4, 2, IOVS_METRIC_INNER_PRODUCT, 1, &ix), "ivf ip");
+  int64_t nb[2];
+  float ds[2];
+  expect_status(iovsIvfFlatSearch(res.r, ix, q, 1, 2, 1, nullptr, nb, ds), "ivf ip search");
+  int64_t truth[2];
+  float tscore[2];
+  rank_oracle(data, 4, 2, q, 2, truth, tscore, true);
+  expect(nb[0] == truth[0] && nb[1] == truth[1], "ivf ip ids");
+  expect(std::fabs(ds[0] - tscore[0]) < 1e-4f, "ivf ip value");
+  iovsIvfFlatDestroy(ix);
+}
+
+IOVS_TEST(ivf_pq_cosine_refine_vs_oracle) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 12, dim = 4, k = 3;
+  auto data = make_data(n, dim, 222);
+  const float q[] = {0.4f, -0.1f, 0.2f, 0.8f};
+  iovsIvfPqIndex_t ix = nullptr;
+  expect_status(iovsIvfPqBuild(res.r, data.data(), n, dim, IOVS_METRIC_COSINE_EXPANDED, 1, 2, 8, &ix),
+                "ivfpq cos");
+  std::vector<int64_t> nb(static_cast<size_t>(k));
+  std::vector<float> ds(static_cast<size_t>(k));
+  /* nprobe=1, krefine large: refine is exact over the whole list. */
+  expect_status(iovsIvfPqSearch(res.r, ix, q, 1, k, 1, static_cast<int32_t>(n), nullptr, nb.data(),
+                                ds.data()),
+                "ivfpq cos search");
+  int64_t truth[3];
+  float tscore[3];
+  rank_oracle(data.data(), n, dim, q, k, truth, tscore, false);
+  for (int64_t t = 0; t < k; ++t) expect(nb[static_cast<size_t>(t)] == truth[t], "ivfpq cosine id");
+  iovsIvfPqDestroy(ix);
 }
 
 IOVS_TEST(brute_force_bitset_filter) {

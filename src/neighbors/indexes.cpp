@@ -176,7 +176,7 @@ iovsStatus iovsIvfFlatSearch(iovsResources_t res, iovsIvfFlatIndex_t index, cons
                   static_cast<int64_t>(ids.size()), dim, sc.data(), 2.f);
     if (bitset) {
       for (size_t i = 0; i < ids.size(); ++i) {
-        if (!allowed(bitset, ids[i])) sc[i] = metric_largest(ix->ds.metric) ? -kInf : kInf;
+        if (!allowed(bitset, ids[i])) sc[i] = kInf;
       }
     }
     const int64_t kk = std::min(k, static_cast<int64_t>(ids.size()));
