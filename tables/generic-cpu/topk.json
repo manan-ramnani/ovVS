@@ -1,0 +1,6 @@
+{
+  "sku": "generic-cpu",
+  "op": "topk",
+  "policy": "iGPU for rows*cols >= 4096 when present, else CPU",
+  "crossover_elems": 4096
+}

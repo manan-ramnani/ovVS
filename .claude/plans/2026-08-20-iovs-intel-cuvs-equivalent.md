@@ -1,6 +1,6 @@
 # ioVS: Complete cuVS Equivalent on Intel NPU + iGPU
 
-**Status:** planning  
+**Status:** implementing (v0.1 library in-tree; Arrow Lake bakeoff tables checked in)  
 **Date:** 2026-08-20  
 **Non-negotiable:** feature-complete vs NVIDIA cuVS. Hard problems are sequenced, not dropped. NPU is used wherever it lifts; otherwise iGPU; CPU only as control plane or when it actually wins latency. Custom kernels, compiler patches, and SHAVE/DPU work are in-scope.
 
@@ -813,6 +813,8 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | CPU role | control, tiny-B, HostCompile, HNSW export | not the library’s identity |
 | SVS | competitor / idea source | no proprietary blob in core |
 | Equivalence | API + algorithms + quality knobs | not CUDA kernel isomorphism |
+| iGPU GEMM without DPC++ | OpenVINO GPU plugin | DPC++ not on this host; SYCL sources still required for icpx builds |
+| First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
 
 ---
 

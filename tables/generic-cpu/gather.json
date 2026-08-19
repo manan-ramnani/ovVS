@@ -1,0 +1,6 @@
+{
+  "sku": "generic-cpu",
+  "op": "gather",
+  "policy": "iGPU for nidx*dim >= 4096 when present, else CPU",
+  "crossover_elems": 4096
+}

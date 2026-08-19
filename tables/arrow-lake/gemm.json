@@ -1,0 +1,13 @@
+{
+  "sku": "arrow-lake",
+  "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+  "op": "gemm",
+  "npu_available": true,
+  "gpu_available": true,
+  "sycl_built": false,
+  "openvino_built": true,
+  "runs_ms": {"cpu": 0.0531, "npu": 9.2487, "gpu": 31.7498},
+  "shape": {"m": 64, "n": 128, "k": 32},
+  "winner_this_shape": "cpu",
+  "policy": "NPU_IF_FASTER when M*N*K >= 2097152; this small shape stays CPU. NPU/GPU paths compile and match CPU numerically."
+}

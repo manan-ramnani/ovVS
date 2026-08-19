@@ -1,0 +1,6 @@
+{
+  "sku": "arrow-lake",
+  "op": "gather",
+  "runs_ms": {"cpu": 0.0067, "npu": 0.0006, "gpu": 0.0004},
+  "note": "gather bakeoff currently times CPU implementation under FORCE_* when NPU has no gather kernel; iGPU SYCL gather exists in source."
+}

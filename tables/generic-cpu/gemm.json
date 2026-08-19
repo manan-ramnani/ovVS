@@ -1,0 +1,7 @@
+{
+  "sku": "generic-cpu",
+  "op": "gemm",
+  "policy": "FORCE_CPU wins when NPU/iGPU are absent; NPU_IF_FASTER when a Core Ultra NPU is present and M*N*K >= 256*256*32",
+  "crossover_flops": 2097152,
+  "notes": "Checked in without a device bakeoff. Re-run tools/iovs_bakeoff gemm on Lunar Lake and replace this file."
+}

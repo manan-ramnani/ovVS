@@ -1,0 +1,9 @@
+[package]
+name = "iovs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust FFI for ioVS (links libiovs C ABI)"
+
+[lib]
+path = "src/lib.rs"
