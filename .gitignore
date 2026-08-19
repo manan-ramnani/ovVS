@@ -1,0 +1,64 @@
+# Build
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exp
+*.pdb
+*.ilk
+*.exe
+CMakeUserPresets.json
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+compile_commands.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+.tox/
+
+# Data and local caches (datasets are fetched, not committed)
+/data/
+/.cache/
+*.bin
+*.iovs
+*.blob
+
+# Keep checked-in bakeoff JSON
+!/tables/
+!/tables/**/*.json
+
+# NPU / OpenVINO local
+*.xml
+!**/tests/**/*.xml
+*.onnx
+*.pt
+*.pth
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+/tmp/
