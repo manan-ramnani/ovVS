@@ -32,6 +32,8 @@ set(IOVS_SOURCES
   src/rt/status.cpp
   src/rt/probe.cpp
   src/rt/resources.cpp
+  compiler/shave/topk.c
+  compiler/shave/adc.c
   src/prim/cpu/cpu_prims.cpp
   src/prim/mixer.cpp
   src/prim/npu/backend_npu.cpp
@@ -49,6 +51,7 @@ target_include_directories(iovs
     $<INSTALL_INTERFACE:include>
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/compiler/shave
 )
 target_compile_definitions(iovs PRIVATE IOVS_BUILD)
 

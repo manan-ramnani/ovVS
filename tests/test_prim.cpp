@@ -96,6 +96,113 @@ IOVS_TEST(gemm_gpu_matches_cpu_when_present) {
   }
 }
 
+static const char* dev_name(iovsDevice d) {
+  switch (d) {
+    case IOVS_DEVICE_NPU:
+      return "npu";
+    case IOVS_DEVICE_GPU:
+      return "gpu";
+    case IOVS_DEVICE_CPU:
+      return "cpu";
+    default:
+      return "other";
+  }
+}
+
+IOVS_TEST(topk_npu_matches_cpu_when_present) {
+  Res res;
+  int32_t npu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+  auto scores = make_data(4, 16, 91);
+  std::vector<int64_t> ic(40), in(40);
+  std::vector<float> vc(40), vn(40);
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  expect_status(iovsTopk(res.r, scores.data(), 4, 16, 5, ic.data(), vc.data(), 0), "cpu topk");
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_NPU);
+  expect_status(iovsTopk(res.r, scores.data(), 4, 16, 5, in.data(), vn.data(), 0), "npu topk");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last == IOVS_DEVICE_NPU, std::string("topk last device ") + dev_name(last));
+  for (int i = 0; i < 20; ++i) {
+    expect(ic[static_cast<size_t>(i)] == in[static_cast<size_t>(i)], "npu topk idx");
+    expect(std::fabs(vc[static_cast<size_t>(i)] - vn[static_cast<size_t>(i)]) < 2e-2f, "npu topk val");
+  }
+}
+
+IOVS_TEST(topk_gpu_matches_cpu_when_present) {
+  Res res;
+  int32_t gpu = 0;
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  auto scores = make_data(4, 16, 92);
+  std::vector<int64_t> ic(40), ig(40);
+  std::vector<float> vc(40), vg(40);
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  expect_status(iovsTopk(res.r, scores.data(), 4, 16, 5, ic.data(), vc.data(), 0), "cpu topk");
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+  expect_status(iovsTopk(res.r, scores.data(), 4, 16, 5, ig.data(), vg.data(), 0), "gpu topk");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last == IOVS_DEVICE_GPU, std::string("gpu topk last ") + dev_name(last));
+  for (int i = 0; i < 20; ++i) {
+    expect(ic[static_cast<size_t>(i)] == ig[static_cast<size_t>(i)], "gpu topk idx");
+  }
+}
+
+IOVS_TEST(gather_npu_matches_cpu_when_present) {
+  Res res;
+  int32_t npu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+  const int64_t n = 10, dim = 8, nidx = 4;
+  auto src = make_data(n, dim, 93);
+  const int64_t idxv[4] = {1, 4, 9, 0};
+  std::vector<float> cpu(static_cast<size_t>(nidx * dim)), np(static_cast<size_t>(nidx * dim));
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  expect_status(iovsGatherRows(res.r, src.data(), n, dim, idxv, nidx, cpu.data()), "cpu gather");
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_NPU);
+  expect_status(iovsGatherRows(res.r, src.data(), n, dim, idxv, nidx, np.data()), "npu gather");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last == IOVS_DEVICE_NPU, std::string("gather last ") + dev_name(last));
+  for (size_t i = 0; i < cpu.size(); ++i) expect(std::fabs(cpu[i] - np[i]) < 2e-2f, "npu gather");
+}
+
+IOVS_TEST(gather_gpu_matches_cpu_when_present) {
+  Res res;
+  int32_t gpu = 0;
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  const int64_t n = 10, dim = 8, nidx = 4;
+  auto src = make_data(n, dim, 94);
+  const int64_t idxv[4] = {2, 3, 7, 1};
+  std::vector<float> cpu(static_cast<size_t>(nidx * dim)), g(static_cast<size_t>(nidx * dim));
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  expect_status(iovsGatherRows(res.r, src.data(), n, dim, idxv, nidx, cpu.data()), "cpu gather");
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+  expect_status(iovsGatherRows(res.r, src.data(), n, dim, idxv, nidx, g.data()), "gpu gather");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last == IOVS_DEVICE_GPU, std::string("gpu gather last ") + dev_name(last));
+  for (size_t i = 0; i < cpu.size(); ++i) expect(std::fabs(cpu[i] - g[i]) < 2e-2f, "gpu gather");
+}
+
+IOVS_TEST(shave_topk_matches_cpu_row) {
+  auto scores = make_data(1, 12, 95);
+  std::vector<int32_t> idx(4);
+  std::vector<float> val(4);
+  iovsShaveTopkSmallest(scores.data(), 12, 4, idx.data(), val.data());
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  std::vector<int64_t> ic(4);
+  std::vector<float> vc(4);
+  expect_status(iovsTopk(res.r, scores.data(), 1, 12, 4, ic.data(), vc.data(), 0), "cpu");
+  for (int i = 0; i < 4; ++i) {
+    expect(idx[static_cast<size_t>(i)] == static_cast<int32_t>(ic[static_cast<size_t>(i)]), "shave idx");
+  }
+}
+
 IOVS_TEST(gather_rows_matches_index) {
   Res res;
   const int64_t n = 9, dim = 6, nidx = 4;

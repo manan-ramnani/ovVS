@@ -69,6 +69,27 @@ _lib.iovsGemm.argtypes = [
     c_int64,
     c_int32,
 ]
+_lib.iovsTopk.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int64,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_int32,
+]
+_lib.iovsGatherRows.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    POINTER(c_int64),
+    c_int64,
+    POINTER(c_float),
+]
+_lib.iovsResourcesSetPolicy.argtypes = [c_void_p, c_int32]
+_lib.iovsResourcesLastDevice.argtypes = [c_void_p, POINTER(c_int32)]
 
 
 def version() -> str:
@@ -85,6 +106,44 @@ class Resources:
         if self._h:
             _lib.iovsResourcesDestroy(self._h)
             self._h = None
+
+    def set_policy(self, policy: int) -> None:
+        if _lib.iovsResourcesSetPolicy(self._h, c_int32(policy)) != 0:
+            raise RuntimeError("set_policy failed")
+
+    def last_device(self) -> int:
+        d = c_int32()
+        if _lib.iovsResourcesLastDevice(self._h, ctypes.byref(d)) != 0:
+            raise RuntimeError("last_device failed")
+        return int(d.value)
+
+    def gemm(self, a, b, m, n, k, trans_b=1):
+        cbuf = (c_float * (m * n))()
+        ap = (c_float * len(a))(*list(a))
+        bp = (c_float * len(b))(*list(b))
+        rc = _lib.iovsGemm(self._h, ap, bp, cbuf, c_int64(m), c_int64(n), c_int64(k), c_int32(trans_b))
+        if rc != 0:
+            raise RuntimeError(f"gemm failed rc={rc}")
+        return [cbuf[i] for i in range(m * n)]
+
+    def topk(self, scores, rows, cols, k, largest=0):
+        idx = (c_int64 * (rows * k))()
+        val = (c_float * (rows * k))()
+        sp = (c_float * len(scores))(*list(scores))
+        rc = _lib.iovsTopk(self._h, sp, c_int64(rows), c_int64(cols), c_int64(k), idx, val, c_int32(largest))
+        if rc != 0:
+            raise RuntimeError(f"topk failed rc={rc}")
+        return [idx[i] for i in range(rows * k)], [val[i] for i in range(rows * k)]
+
+    def gather_rows(self, src, src_rows, dim, indices):
+        nidx = len(indices)
+        out = (c_float * (nidx * dim))()
+        sp = (c_float * len(src))(*list(src))
+        ip = (c_int64 * nidx)(*list(indices))
+        rc = _lib.iovsGatherRows(self._h, sp, c_int64(src_rows), c_int64(dim), ip, c_int64(nidx), out)
+        if rc != 0:
+            raise RuntimeError(f"gather failed rc={rc}")
+        return [out[i] for i in range(nidx * dim)]
 
     def __del__(self):
         self.close()

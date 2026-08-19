@@ -1,14 +1,17 @@
+//go:build !windows
+
 package iovs
 
-// Thin cgo wrapper around libiovs. Requires the shared library on the linker path.
+// Non-Windows builds should link libiovs via cgo. Windows uses syscall in iovs_windows.go.
 
-/*
-#cgo CFLAGS: -I../include
-#cgo LDFLAGS: -liovs
-#include "iovs/iovs.h"
-*/
-import "C"
+func Version() string { return "" }
 
-func Version() string {
-	return C.GoString(C.iovsGetVersion())
+func Gemm(a, b []float32, m, n, k int) ([]float32, error) {
+	return nil, errUnimplemented
 }
+
+var errUnimplemented = errString("iovs: cgo path not built")
+
+type errString string
+
+func (e errString) Error() string { return string(e) }

@@ -1,6 +1,10 @@
 {
   "sku": "arrow-lake",
   "op": "topk",
-  "runs_ms": {"cpu": 0.0160, "npu": 0.0093, "gpu": 0.0089},
-  "note": "topk bakeoff currently times CPU implementation under FORCE_* when NPU/GPU have no dedicated topk kernel; iGPU SYCL topk exists in source."
+  "runs": [
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0443, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 80.0431, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 368.8626, "status": "success"}
+  ],
+  "note": "OpenVINO TopK on NPU and GPU. first-compile included in ms. last_device is the device that ran, not a CPU fallback."
 }

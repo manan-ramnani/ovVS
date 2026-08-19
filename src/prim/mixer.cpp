@@ -1,7 +1,6 @@
 #include "internal.hpp"
 
-#include <cstdlib>
-#include <fstream>
+#include <cstring>
 
 namespace iovs {
 namespace impl {
@@ -23,67 +22,107 @@ iovsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elem
   const iovsDevice forced = policy_force(r.policy);
   if (forced != IOVS_DEVICE_AUTO) return forced;
 
-  /* NPU first when the work is a large static GEMM-shaped op. */
-  const bool gemmish = std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0;
-  if (r.npu_available && gemmish && flops_or_elems >= 256 * 256 * 32) {
+  const bool npu_shaped =
+      std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0 ||
+      std::strcmp(op, "topk") == 0 || std::strcmp(op, "gather") == 0;
+  if (r.npu_available && npu_shaped && flops_or_elems >= 256 * 256 * 32) {
     return IOVS_DEVICE_NPU;
   }
   if (r.gpu_available && flops_or_elems >= 64 * 64) {
-    if (std::strcmp(op, "topk") == 0 || std::strcmp(op, "gather") == 0 ||
-        std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0) {
-      return IOVS_DEVICE_GPU;
-    }
+    if (npu_shaped) return IOVS_DEVICE_GPU;
   }
   return IOVS_DEVICE_CPU;
 }
 
-void prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-               int64_t k, bool trans_b) {
-  const int64_t flops = m * n * k;
-  const iovsDevice d = choose_device(r, "gemm", flops);
+static iovsStatus finish_forced_fail(ResourcesData& r) {
+  ++r.npu_fallbacks;
+  return IOVS_STATUS_DEVICE_UNAVAILABLE;
+}
+
+iovsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
+                     int64_t k, bool trans_b) {
+  const iovsDevice d = choose_device(r, "gemm", m * n * k);
   if (d == IOVS_DEVICE_NPU) {
-    if (npu_gemm(r, a, b, c, m, n, k, trans_b)) return;
-    ++r.npu_fallbacks;
+    if (npu_gemm(r, a, b, c, m, n, k, trans_b)) {
+      r.last_device = IOVS_DEVICE_NPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
   }
-  if (d == IOVS_DEVICE_GPU || d == IOVS_DEVICE_NPU) {
-    if (gpu_gemm(r, a, b, c, m, n, k, trans_b)) return;
+  if (d == IOVS_DEVICE_GPU || (d == IOVS_DEVICE_NPU && r.policy != IOVS_POLICY_FORCE_CPU)) {
+    if (gpu_gemm(r, a, b, c, m, n, k, trans_b)) {
+      r.last_device = IOVS_DEVICE_GPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
   }
-  if (d == IOVS_DEVICE_NPU && r.policy == IOVS_POLICY_FORCE_NPU) {
-    /* Forced NPU but compile/run failed: still produce a result via CPU so
-       callers stay correct, and the fallback counter records the miss. */
-  }
-  if (d == IOVS_DEVICE_GPU && r.policy == IOVS_POLICY_FORCE_GPU && !gpu_available()) {
-    /* GPU forced but absent — CPU oracle keeps the library usable. */
+  if (r.policy == IOVS_POLICY_FORCE_NPU || r.policy == IOVS_POLICY_FORCE_GPU) {
+    return finish_forced_fail(r);
   }
   cpu_gemm(a, b, c, m, n, k, trans_b);
+  r.last_device = IOVS_DEVICE_CPU;
+  return IOVS_STATUS_SUCCESS;
 }
 
-void prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
-               int64_t* indices, float* values, bool largest) {
+iovsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
+                     int64_t* indices, float* values, bool largest) {
   const iovsDevice d = choose_device(r, "topk", rows * cols);
-  if (d == IOVS_DEVICE_GPU) {
-    if (gpu_topk(r, scores, rows, cols, k, indices, values, largest)) return;
+  if (d == IOVS_DEVICE_NPU) {
+    if (npu_topk(r, scores, rows, cols, k, indices, values, largest)) {
+      r.last_device = IOVS_DEVICE_NPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  }
+  if (d == IOVS_DEVICE_GPU || (d == IOVS_DEVICE_NPU && r.policy != IOVS_POLICY_FORCE_CPU)) {
+    if (gpu_topk(r, scores, rows, cols, k, indices, values, largest)) {
+      r.last_device = IOVS_DEVICE_GPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+  }
+  if (r.policy == IOVS_POLICY_FORCE_NPU || r.policy == IOVS_POLICY_FORCE_GPU) {
+    return finish_forced_fail(r);
   }
   cpu_topk(scores, rows, cols, k, indices, values, largest);
+  r.last_device = IOVS_DEVICE_CPU;
+  return IOVS_STATUS_SUCCESS;
 }
 
-void prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
-                      const int64_t* idx, int64_t nidx, float* out) {
+iovsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
+                            const int64_t* idx, int64_t nidx, float* out) {
   const iovsDevice d = choose_device(r, "gather", nidx * dim);
-  if (d == IOVS_DEVICE_GPU) {
-    if (gpu_gather_rows(r, src, src_rows, dim, idx, nidx, out)) return;
+  if (d == IOVS_DEVICE_NPU) {
+    if (npu_gather_rows(r, src, src_rows, dim, idx, nidx, out)) {
+      r.last_device = IOVS_DEVICE_NPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  }
+  if (d == IOVS_DEVICE_GPU || (d == IOVS_DEVICE_NPU && r.policy != IOVS_POLICY_FORCE_CPU)) {
+    if (gpu_gather_rows(r, src, src_rows, dim, idx, nidx, out)) {
+      r.last_device = IOVS_DEVICE_GPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+  }
+  if (r.policy == IOVS_POLICY_FORCE_NPU || r.policy == IOVS_POLICY_FORCE_GPU) {
+    return finish_forced_fail(r);
   }
   cpu_gather_rows(src, src_rows, dim, idx, nidx, out);
+  r.last_device = IOVS_DEVICE_CPU;
+  return IOVS_STATUS_SUCCESS;
 }
 
-void prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
-                   int64_t ny, int64_t dim, float* out, float metric_arg) {
+iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx,
+                         const float* y, int64_t ny, int64_t dim, float* out, float metric_arg) {
   if (metric == IOVS_METRIC_L2_EXPANDED || metric == IOVS_METRIC_INNER_PRODUCT ||
       metric == IOVS_METRIC_COSINE_EXPANDED) {
     std::vector<float> xnorm(static_cast<size_t>(nx)), ynorm(static_cast<size_t>(ny));
     for (int64_t i = 0; i < nx; ++i) xnorm[static_cast<size_t>(i)] = nrm2sq(x + i * dim, dim);
     for (int64_t j = 0; j < ny; ++j) ynorm[static_cast<size_t>(j)] = nrm2sq(y + j * dim, dim);
-    prim_gemm(r, x, y, out, nx, ny, dim, true);
+    const iovsStatus gs = prim_gemm(r, x, y, out, nx, ny, dim, true);
+    if (gs != IOVS_STATUS_SUCCESS) return gs;
     for (int64_t i = 0; i < nx; ++i) {
       for (int64_t j = 0; j < ny; ++j) {
         const float ip = out[i * ny + j];
@@ -98,9 +137,14 @@ void prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t 
         }
       }
     }
-    return;
+    return IOVS_STATUS_SUCCESS;
+  }
+  if (r.policy == IOVS_POLICY_FORCE_NPU || r.policy == IOVS_POLICY_FORCE_GPU) {
+    return finish_forced_fail(r);
   }
   cpu_pairwise(metric, x, nx, y, ny, dim, out, metric_arg);
+  r.last_device = IOVS_DEVICE_CPU;
+  return IOVS_STATUS_SUCCESS;
 }
 
 void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
@@ -112,8 +156,7 @@ void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_
     for (int64_t i = 0; i < nq; ++i) {
       for (int64_t j = 0; j < n; ++j) {
         if (!allowed(bitset, j)) {
-          scores[static_cast<size_t>(i * n + j)] =
-              metric_largest(metric) ? -kInf : kInf;
+          scores[static_cast<size_t>(i * n + j)] = metric_largest(metric) ? -kInf : kInf;
         }
       }
     }

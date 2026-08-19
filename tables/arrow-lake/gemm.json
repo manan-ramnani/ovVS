@@ -4,10 +4,11 @@
   "op": "gemm",
   "npu_available": true,
   "gpu_available": true,
-  "sycl_built": false,
-  "openvino_built": true,
-  "runs_ms": {"cpu": 0.0531, "npu": 9.2487, "gpu": 31.7498},
-  "shape": {"m": 64, "n": 128, "k": 32},
+  "runs": [
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0516, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 7.0740, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 29.6389, "status": "success"}
+  ],
   "winner_this_shape": "cpu",
-  "policy": "NPU_IF_FASTER when M*N*K >= 2097152; this small shape stays CPU. NPU/GPU paths compile and match CPU numerically."
+  "note": "FORCE_NPU/GPU run OpenVINO MatMul on that device (last_device). Tiny 64x128x32 stays CPU under AUTO."
 }

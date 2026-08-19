@@ -98,6 +98,7 @@ bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_
 
 bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
               int64_t* indices, float* values, bool largest) {
+  if (ov_topk(r, "GPU", scores, rows, cols, k, indices, values, largest)) return true;
 #if defined(IOVS_WITH_SYCL)
   /* Subgroup-friendly per-row partial select; correctness first. */
   try {
@@ -158,6 +159,7 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
 
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out) {
+  if (ov_gather_rows(r, "GPU", src, src_rows, dim, idx, nidx, out)) return true;
 #if defined(IOVS_WITH_SYCL)
   try {
     auto& q = gpu_queue();

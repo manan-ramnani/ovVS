@@ -137,40 +137,38 @@ void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, i
     }
     std::memcpy(graph.data() + i * degree, row.data(), static_cast<size_t>(degree) * sizeof(int32_t));
   }
-  std::vector<float> dist(static_cast<size_t>(n) * static_cast<size_t>(degree), kInf);
-  for (int64_t i = 0; i < n; ++i) {
-    for (int32_t t = 0; t < degree; ++t) {
-      const int32_t j = graph[static_cast<size_t>(i * degree + t)];
-      dist[static_cast<size_t>(i * degree + t)] =
-          distance_one(metric, x + i * dim, x + static_cast<int64_t>(j) * dim, dim, 2.f);
-    }
-  }
   for (int it = 0; it < iters; ++it) {
     for (int64_t i = 0; i < n; ++i) {
+      std::vector<int64_t> cands;
+      cands.reserve(static_cast<size_t>(degree) * (degree + 1));
       for (int32_t a = 0; a < degree; ++a) {
         const int32_t u = graph[static_cast<size_t>(i * degree + a)];
-        if (u < 0) continue;
+        if (u < 0 || u == static_cast<int32_t>(i)) continue;
+        cands.push_back(u);
         for (int32_t b = 0; b < degree; ++b) {
           const int32_t v = graph[static_cast<size_t>(static_cast<int64_t>(u) * degree + b)];
           if (v < 0 || v == static_cast<int32_t>(i)) continue;
-          const float d = distance_one(metric, x + i * dim, x + static_cast<int64_t>(v) * dim, dim, 2.f);
-          int32_t worst = 0;
-          float worst_d = dist[static_cast<size_t>(i * degree)];
-          bool have = false;
-          for (int32_t t = 0; t < degree; ++t) {
-            if (graph[static_cast<size_t>(i * degree + t)] == v) {
-              have = true;
-              break;
-            }
-            if (dist[static_cast<size_t>(i * degree + t)] > worst_d) {
-              worst_d = dist[static_cast<size_t>(i * degree + t)];
-              worst = t;
-            }
-          }
-          if (!have && d < worst_d) {
-            graph[static_cast<size_t>(i * degree + worst)] = v;
-            dist[static_cast<size_t>(i * degree + worst)] = d;
-          }
+          cands.push_back(v);
+        }
+      }
+      std::sort(cands.begin(), cands.end());
+      cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
+      if (cands.empty()) continue;
+      std::vector<float> gathered(cands.size() * static_cast<size_t>(dim));
+      std::vector<float> sc(cands.size());
+      prim_gather_rows(r, x, n, dim, cands.data(), static_cast<int64_t>(cands.size()), gathered.data());
+      prim_pairwise(r, metric, x + i * dim, 1, gathered.data(), static_cast<int64_t>(cands.size()), dim,
+                    sc.data(), 2.f);
+      const int64_t kk = std::min(static_cast<int64_t>(degree), static_cast<int64_t>(cands.size()));
+      std::vector<int64_t> ti(static_cast<size_t>(kk));
+      std::vector<float> tv(static_cast<size_t>(kk));
+      prim_topk(r, sc.data(), 1, static_cast<int64_t>(cands.size()), kk, ti.data(), tv.data(), false);
+      for (int64_t t = 0; t < degree; ++t) {
+        if (t < kk) {
+          graph[static_cast<size_t>(i * degree + t)] =
+              static_cast<int32_t>(cands[static_cast<size_t>(ti[static_cast<size_t>(t)])]);
+        } else {
+          graph[static_cast<size_t>(i * degree + t)] = -1;
         }
       }
     }
@@ -223,27 +221,40 @@ void prune_graph(const float* x, int64_t n, int64_t dim, iovsMetric metric, cons
   }
 }
 
-void graph_search(const float* dataset, int64_t n, int64_t dim, iovsMetric metric, const int32_t* graph,
-                  int32_t degree, const float* queries, int64_t nq, int64_t k, int32_t itopk,
-                  int32_t search_width, const uint8_t* bitset, int64_t* neighbors, float* distances) {
+void graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, iovsMetric metric,
+                  const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
+                  int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
+                  float* distances) {
   itopk = std::max(itopk, static_cast<int32_t>(k));
   search_width = std::max(1, search_width);
   struct Node {
     float d;
     int64_t id;
   };
+  auto score_ids = [&](const float* query, const std::vector<int64_t>& ids, std::vector<float>& sc) {
+    if (ids.empty()) return;
+    std::vector<float> gathered(ids.size() * static_cast<size_t>(dim));
+    sc.assign(ids.size(), kInf);
+    prim_gather_rows(r, dataset, n, dim, ids.data(), static_cast<int64_t>(ids.size()), gathered.data());
+    prim_pairwise(r, metric, query, 1, gathered.data(), static_cast<int64_t>(ids.size()), dim, sc.data(),
+                  2.f);
+  };
   for (int64_t q = 0; q < nq; ++q) {
     const float* query = queries + q * dim;
     std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
     std::vector<char> expanded(static_cast<size_t>(n), 0);
     std::vector<Node> cand;
+    std::vector<int64_t> seed_ids;
     const int64_t nseeds = std::min<int64_t>(search_width, n);
     for (int64_t s = 0; s < nseeds; ++s) {
       int64_t id = (s * 9973 + q * 13) % n;
       if (!allowed(bitset, id) || seen[static_cast<size_t>(id)]) continue;
       seen[static_cast<size_t>(id)] = 1;
-      cand.push_back({distance_one(metric, query, dataset + id * dim, dim, 2.f), id});
+      seed_ids.push_back(id);
     }
+    std::vector<float> seed_sc;
+    score_ids(query, seed_ids, seed_sc);
+    for (size_t i = 0; i < seed_ids.size(); ++i) cand.push_back({seed_sc[i], seed_ids[i]});
     if (cand.empty()) {
       for (int64_t t = 0; t < k; ++t) {
         neighbors[q * k + t] = -1;
@@ -264,6 +275,7 @@ void graph_search(const float* dataset, int64_t n, int64_t dim, iovsMetric metri
       }
       if (pick < 0) break;
       expanded[static_cast<size_t>(pick)] = 1;
+      std::vector<int64_t> batch;
       const int32_t* nbrs = graph + pick * degree;
       for (int32_t e = 0; e < degree; ++e) {
         const int32_t nb = nbrs[e];
@@ -271,9 +283,11 @@ void graph_search(const float* dataset, int64_t n, int64_t dim, iovsMetric metri
         if (seen[static_cast<size_t>(nb)]) continue;
         if (!allowed(bitset, nb)) continue;
         seen[static_cast<size_t>(nb)] = 1;
-        cand.push_back({distance_one(metric, query, dataset + static_cast<int64_t>(nb) * dim, dim, 2.f),
-                        nb});
+        batch.push_back(nb);
       }
+      std::vector<float> bsc;
+      score_ids(query, batch, bsc);
+      for (size_t i = 0; i < batch.size(); ++i) cand.push_back({bsc[i], batch[i]});
       if (static_cast<int32_t>(cand.size()) > itopk * 4) {
         std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
                          [](const Node& a, const Node& b) { return a.d < b.d; });
@@ -488,8 +502,8 @@ iovsStatus iovsCagraSearch(iovsResources_t res, iovsCagraIndex_t index, const fl
                            const uint8_t* bitset, int64_t* neighbors, float* distances) {
   if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
-  graph_search(ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(), ix->degree,
-               queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
+  graph_search(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+               ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
   return IOVS_STATUS_SUCCESS;
 }
 
@@ -594,8 +608,9 @@ iovsStatus iovsHnswSearch(iovsResources_t res, iovsHnswIndex_t index, const floa
                           int64_t k, int32_t ef, int64_t* neighbors, float* distances) {
   if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* hx = reinterpret_cast<HnswIndex*>(index);
-  graph_search(hx->ds.x.data(), hx->ds.n, hx->ds.dim, hx->ds.metric, hx->graph.data(), hx->degree,
-               queries, nq, k, std::max(ef, static_cast<int32_t>(k)), 1, nullptr, neighbors, distances);
+  graph_search(*rd(res), hx->ds.x.data(), hx->ds.n, hx->ds.dim, hx->ds.metric, hx->graph.data(),
+               hx->degree, queries, nq, k, std::max(ef, static_cast<int32_t>(k)), 1, nullptr, neighbors,
+               distances);
   return IOVS_STATUS_SUCCESS;
 }
 
@@ -653,8 +668,8 @@ iovsStatus iovsVamanaSearch(iovsResources_t res, iovsVamanaIndex_t index, const 
                             int64_t* neighbors, float* distances) {
   if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<VamanaIndex*>(index);
-  graph_search(ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(), ix->degree,
-               queries, nq, k, std::max(beam, static_cast<int32_t>(k)), 1, bitset, neighbors,
+  graph_search(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+               ix->degree, queries, nq, k, std::max(beam, static_cast<int32_t>(k)), 1, bitset, neighbors,
                distances);
   return IOVS_STATUS_SUCCESS;
 }

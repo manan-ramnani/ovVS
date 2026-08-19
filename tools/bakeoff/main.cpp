@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     std::vector<float> A(m * k, 0.1f), B(n * k, 0.2f), C(m * n, 0.f);
     for (int64_t i = 0; i < m * k; ++i) A[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i % 17);
     for (int64_t i = 0; i < n * k; ++i) B[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i % 13);
+    for (int64_t i = 0; i < m * n; ++i) C[static_cast<size_t>(i)] = 0.03f * static_cast<float>((i * 13) % 29);
 
     const double t0 = now_ms();
     iovsStatus st = IOVS_STATUS_SUCCESS;
@@ -55,8 +56,14 @@ int main(int argc, char** argv) {
     const double t1 = now_ms();
     if (!first) std::printf(",\n");
     first = false;
-    std::printf("    {\"device\": \"%s\", \"ms\": %.4f, \"status\": \"%s\"}", names[p], t1 - t0,
-                iovsStatusString(st));
+    iovsDevice last = IOVS_DEVICE_CPU;
+    iovsResourcesLastDevice(res, &last);
+    const char* lastn = "cpu";
+    if (last == IOVS_DEVICE_NPU) lastn = "npu";
+    else if (last == IOVS_DEVICE_GPU) lastn = "gpu";
+    std::printf(
+        "    {\"requested\": \"%s\", \"last_device\": \"%s\", \"ms\": %.4f, \"status\": \"%s\"}",
+        names[p], lastn, t1 - t0, iovsStatusString(st));
   }
   std::printf("\n  ]\n}\n");
   iovsResourcesDestroy(res);

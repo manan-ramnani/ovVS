@@ -1,6 +1,10 @@
 {
   "sku": "arrow-lake",
   "op": "gather",
-  "runs_ms": {"cpu": 0.0067, "npu": 0.0006, "gpu": 0.0004},
-  "note": "gather bakeoff currently times CPU implementation under FORCE_* when NPU has no gather kernel; iGPU SYCL gather exists in source."
+  "runs": [
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0051, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 532.7223, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 326.3043, "status": "success"}
+  ],
+  "note": "OpenVINO Gather on NPU and GPU. first-compile included in ms. last_device is the device that ran."
 }

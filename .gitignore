@@ -24,6 +24,11 @@ CMakeUserPresets.json
 *.suo
 compile_commands.json
 
+# Rust / Go / Java build
+/rust/target/
+/go/iovs.test.exe
+*.class
+
 # Python
 .venv/
 venv/

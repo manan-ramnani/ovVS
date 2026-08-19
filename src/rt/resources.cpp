@@ -62,6 +62,12 @@ iovsStatus iovsResourcesNpuFallbacks(iovsResources_t res, int32_t* count) {
   return IOVS_STATUS_SUCCESS;
 }
 
+iovsStatus iovsResourcesLastDevice(iovsResources_t res, iovsDevice* device) {
+  if (!res || !device) return IOVS_STATUS_INVALID_ARGUMENT;
+  *device = rd(res)->last_device;
+  return IOVS_STATUS_SUCCESS;
+}
+
 iovsStatus iovsProbeJson(char* buf, int32_t len) {
   if (!buf || len <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
   const std::string s = iovs::impl::probe_json();
@@ -73,8 +79,7 @@ iovsStatus iovsProbeJson(char* buf, int32_t len) {
 iovsStatus iovsGemm(iovsResources_t res, const float* a, const float* b, float* c, int64_t m,
                     int64_t n, int64_t k, int32_t trans_b) {
   if (!res || !a || !b || !c || m <= 0 || n <= 0 || k <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
-  iovs::impl::prim_gemm(*rd(res), a, b, c, m, n, k, trans_b != 0);
-  return IOVS_STATUS_SUCCESS;
+  return iovs::impl::prim_gemm(*rd(res), a, b, c, m, n, k, trans_b != 0);
 }
 
 iovsStatus iovsTopk(iovsResources_t res, const float* scores, int64_t rows, int64_t cols, int64_t k,
@@ -82,8 +87,7 @@ iovsStatus iovsTopk(iovsResources_t res, const float* scores, int64_t rows, int6
   if (!res || !scores || !indices || !values || rows <= 0 || cols <= 0 || k <= 0) {
     return IOVS_STATUS_INVALID_ARGUMENT;
   }
-  iovs::impl::prim_topk(*rd(res), scores, rows, cols, k, indices, values, largest != 0);
-  return IOVS_STATUS_SUCCESS;
+  return iovs::impl::prim_topk(*rd(res), scores, rows, cols, k, indices, values, largest != 0);
 }
 
 iovsStatus iovsGatherRows(iovsResources_t res, const float* src, int64_t src_rows, int64_t dim,
@@ -91,19 +95,27 @@ iovsStatus iovsGatherRows(iovsResources_t res, const float* src, int64_t src_row
   if (!res || !src || !idx || !out || src_rows <= 0 || dim <= 0 || nidx <= 0) {
     return IOVS_STATUS_INVALID_ARGUMENT;
   }
-  iovs::impl::prim_gather_rows(*rd(res), src, src_rows, dim, idx, nidx, out);
-  return IOVS_STATUS_SUCCESS;
+  return iovs::impl::prim_gather_rows(*rd(res), src, src_rows, dim, idx, nidx, out);
 }
 
 iovsStatus iovsPairwiseDistance(iovsResources_t res, iovsMetric metric, const float* x, int64_t nx,
                                 const float* y, int64_t ny, int64_t dim, float* out,
                                 float metric_arg) {
   if (!res || !x || !y || !out || nx <= 0 || ny <= 0 || dim <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
-  iovs::impl::prim_pairwise(*rd(res), metric, x, nx, y, ny, dim, out, metric_arg);
-  return IOVS_STATUS_SUCCESS;
+  return iovs::impl::prim_pairwise(*rd(res), metric, x, nx, y, ny, dim, out, metric_arg);
 }
 
 iovsStatus iovsKSelection(iovsResources_t res, const float* scores, int64_t rows, int64_t cols,
                           int64_t k, int64_t* indices, float* values, int32_t largest) {
   return iovsTopk(res, scores, rows, cols, k, indices, values, largest);
+}
+
+#include "iovs_shave.h"
+
+void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t* idx, float* val) {
+  iovs_shave_topk_smallest(scores, cols, k, idx, val);
+}
+
+float iovsShavePqAdc(const float* tables, const uint8_t* code, int32_t pq_m, int32_t ks) {
+  return iovs_shave_pq_adc(tables, code, pq_m, ks);
 }

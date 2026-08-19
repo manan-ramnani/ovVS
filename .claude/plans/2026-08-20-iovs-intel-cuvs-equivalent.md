@@ -815,6 +815,8 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | Equivalence | API + algorithms + quality knobs | not CUDA kernel isomorphism |
 | iGPU GEMM without DPC++ | OpenVINO GPU plugin | DPC++ not on this host; SYCL sources still required for icpx builds |
 | First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
+| FORCE_* honesty | DEVICE_UNAVAILABLE if the requested device did not run | bakeoff last_device must match requested device on success |
+| iGPU topk/gather without DPC++ | OpenVINO TopK/Gather on GPU plugin | SYCL kernels remain for icpx |
 
 ---
 

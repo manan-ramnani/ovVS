@@ -74,6 +74,11 @@ IOVS_API iovsStatus iovsResourcesGpuAvailable(iovsResources_t res, int32_t* avai
 IOVS_API iovsStatus iovsResourcesSku(iovsResources_t res, char* buf, int32_t len);
 IOVS_API iovsStatus iovsResourcesNpuCompileFails(iovsResources_t res, int32_t* count);
 IOVS_API iovsStatus iovsResourcesNpuFallbacks(iovsResources_t res, int32_t* count);
+IOVS_API iovsStatus iovsResourcesLastDevice(iovsResources_t res, iovsDevice* device);
+
+IOVS_API void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,
+                                    float* val);
+IOVS_API float iovsShavePqAdc(const float* tables, const uint8_t* code, int32_t pq_m, int32_t ks);
 
 IOVS_API iovsStatus iovsProbeJson(char* buf, int32_t len);
 

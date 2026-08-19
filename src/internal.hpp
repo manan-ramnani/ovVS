@@ -109,6 +109,7 @@ struct ResourcesData {
   iovsPolicy policy = IOVS_POLICY_AUTO;
   bool npu_available = false;
   bool gpu_available = false;
+  iovsDevice last_device = IOVS_DEVICE_CPU;
   std::string sku = "generic-cpu";
   std::string npu_name;
   std::string gpu_name;
@@ -134,8 +135,16 @@ bool gpu_available();
 bool ov_device_available(const char* name);
 bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float* b, float* c,
                int64_t m, int64_t n, int64_t k, bool trans_b);
+bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t rows, int64_t cols,
+             int64_t k, int64_t* indices, float* values, bool largest);
+bool ov_gather_rows(ResourcesData& r, const char* device, const float* src, int64_t src_rows,
+                    int64_t dim, const int64_t* idx, int64_t nidx, float* out);
 bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b);
+bool npu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
+              int64_t* indices, float* values, bool largest);
+bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
+                     const int64_t* idx, int64_t nidx, float* out);
 bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b);
 bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
@@ -155,14 +164,14 @@ void cpu_pairwise(iovsMetric metric, const float* x, int64_t nx, const float* y,
 
 iovsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elems);
 
-void prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-               int64_t k, bool trans_b);
-void prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
-               int64_t* indices, float* values, bool largest);
-void prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
-                      const int64_t* idx, int64_t nidx, float* out);
-void prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
-                   int64_t ny, int64_t dim, float* out, float metric_arg);
+iovsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
+                     int64_t k, bool trans_b);
+iovsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
+                     int64_t* indices, float* values, bool largest);
+iovsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
+                            const int64_t* idx, int64_t nidx, float* out);
+iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx,
+                         const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
 
 void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                        const float* queries, int64_t nq, iovsMetric metric, int64_t k,

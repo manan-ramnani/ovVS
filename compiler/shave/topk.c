@@ -1,7 +1,5 @@
-/* SHAVE scalar kernel: per-row smallest-k selection.
- * Intended for npu_compiler sw_runtime_kernels (VPU.SW.Kernel).
- * Compiled by the NPU toolchain, not by host MSVC. */
-#include <stdint.h>
+/* SHAVE-portable scalar kernel compiled into libiovs (host + future npu_compiler). */
+#include "iovs_shave.h"
 
 void iovs_shave_topk_smallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,
                               float* val) {
