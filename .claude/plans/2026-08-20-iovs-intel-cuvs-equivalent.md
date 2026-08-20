@@ -817,7 +817,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
 | FORCE_* honesty | DEVICE_UNAVAILABLE if the requested device did not run | bakeoff last_device must match requested device on success |
 | iGPU topk/gather without DPC++ | OpenVINO TopK/Gather on GPU plugin | SYCL kernels remain for icpx |
-| CAGRA walk | `prim_graph_walk`: fused SYCL if `IOVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | icpx/oneAPI install attempted on this host; SYCL source is in `backend_gpu.cpp` |
+| CAGRA walk | `prim_graph_walk`: fused SYCL if `IOVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | oneAPI `icpx` blocked by UAC; enabled with intel/llvm nightly `clang++ -fsycl` (`sycl_windows.tar.gz`); `cagra_force_gpu_last_device` passes |
 | HostCompile | NPU GEMM tiles of M=256 when a full-shape compile fails | in `npu_gemm`; SHAVE C still host-linked until unsigned ELF is loadable |
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
 | Mixer v2 | `iovsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
@@ -829,7 +829,8 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 
 Filled in as installs finish. Placeholder until toolchain logs land:
 
-- **SYCL/icpx:** `winget install Intel.OneAPI.BaseToolkit` downloaded the 2025.1.3.8 offline installer then failed with `0x800704c7` (UAC/admin prompt canceled: “The operation was canceled by the user”). `icpx` is not on PATH. OpenVINO GPU remains the iGPU path; fused SYCL CAGRA walk is in `src/prim/gpu/backend_gpu.cpp` behind `IOVS_WITH_SYCL`. `iovsSyclEnabled()==0` on this build.
+- **SYCL/icpx (oneAPI toolkit):** `winget install Intel.OneAPI.BaseToolkit` 2025.1.3.8 needs admin (`0x800704c7`). `--scope user` has no installer. Silent install to `%USERPROFILE%\intel\oneapi` still requires elevation. `icpx` from that toolkit is not on PATH.
+- **SYCL fused CAGRA walk (enabled):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ioVS with `-DIOVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (fused iGPU walk). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed).
 - **SHAVE ELF on NPU silicon:** `npu_compiler` cloned at `6761af885b8ff54ddf0da5bf8ad44e30746b2f62` with `sw_runtime_kernels`. No SHAVE C compiler/firmware path to load unsigned ELF on this Windows NPU. Running path: host-linked `shave/*.c` + OpenVINO NPU TopK/Gather/MatMul + HostCompile M=256 GEMM tiles. Park only “SHAVE ELF on NPU silicon”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.
 - **Energy/RAPL:** not wired if no counter after trying; search still works.

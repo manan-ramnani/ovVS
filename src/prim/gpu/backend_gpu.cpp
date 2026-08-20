@@ -117,8 +117,8 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
         const size_t r = rid[0];
         for (size_t t = 0; t < KK; ++t) {
           int64_t best_i = -1;
-          float best_v = largest ? -sycl::numeric_limits<float>::infinity()
-                                 : sycl::numeric_limits<float>::infinity();
+          float best_v = largest ? -std::numeric_limits<float>::infinity()
+                                 : std::numeric_limits<float>::infinity();
           for (size_t j = 0; j < C; ++j) {
             bool used = false;
             for (size_t u = 0; u < t; ++u) {

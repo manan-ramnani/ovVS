@@ -1,6 +1,7 @@
 # Build
 /build/
 /build-*/
+/build-sycl/
 /out/
 /cmake-build-*/
 *.obj

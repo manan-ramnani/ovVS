@@ -23,7 +23,7 @@ Tiny GEMM (`B` small, `K` small) often wins on CPU because of NPU launch tax (`t
 
 ## CAGRA walk
 
-Search is `prim_graph_walk`: fused SYCL iGPU kernel when `IOVS_WITH_SYCL=ON`, otherwise a host walk whose gather/pairwise go through OpenVINO GPU (or NPU) under FORCE_*. `iovsSyclEnabled()` reports the compile-time path.
+Search is `prim_graph_walk`: fused SYCL iGPU kernel when `IOVS_WITH_SYCL=ON` (SLM itopk, 256-slot hashmap, `search_width` seeds). Build that path with intel/llvm nightly `clang++ -fsycl` if oneAPI `icpx` is not installed. Otherwise a host walk whose gather/pairwise go through OpenVINO GPU (or NPU) under FORCE_*. `iovsSyclEnabled()` reports the compile-time path.
 
 ## FP16 / INT8
 

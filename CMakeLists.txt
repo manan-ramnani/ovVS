@@ -26,6 +26,7 @@ if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
   add_compile_options(-Wall -Wextra)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 set(IOVS_SOURCES
@@ -68,6 +69,10 @@ endif()
 
 if(IOVS_WITH_SYCL)
   target_compile_definitions(iovs PRIVATE IOVS_WITH_SYCL)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
+    target_compile_options(iovs PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsycl>)
+    target_link_options(iovs PRIVATE -fsycl)
+  endif()
 endif()
 
 add_library(iovs::iovs ALIAS iovs)
