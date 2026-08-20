@@ -31,6 +31,22 @@ func l2sq(a, b []float32) float32 {
 	return s
 }
 
+func TestKMeans(t *testing.T) {
+	n, dim := 20, 4
+	data := make([]float32, n*dim)
+	for i := range data {
+		data[i] = float32((i*17)%100)/50 - 1
+	}
+	labels, dist, err := KMeansPredict(data, n, dim, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != n || len(dist) != n {
+		t.Fatalf("shape %d %d", len(labels), len(dist))
+	}
+	t.Log("kmeans label0", labels[0])
+}
+
 func TestBruteForce(t *testing.T) {
 	n, dim, k := 12, 4, 3
 	data := make([]float32, n*dim)

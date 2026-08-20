@@ -17,6 +17,9 @@ var (
 	procBfBuild = mod.NewProc("iovsBruteForceBuild")
 	procBfSearch = mod.NewProc("iovsBruteForceSearch")
 	procBfDes   = mod.NewProc("iovsBruteForceDestroy")
+	procKmFit   = mod.NewProc("iovsKMeansFit")
+	procKmPred  = mod.NewProc("iovsKMeansPredict")
+	procKmDes   = mod.NewProc("iovsKMeansDestroy")
 )
 
 func windowsCString(p uintptr) string {
@@ -95,4 +98,37 @@ func BruteSearch(data []float32, n, dim int, query []float32, k int) ([]int64, [
 		return nil, nil, errors.New("search")
 	}
 	return nb, ds, nil
+}
+
+func KMeansPredict(data []float32, n, dim, nclusters int) ([]int64, []float32, error) {
+	var res uintptr
+	st, _, _ := procCre.Call(uintptr(unsafe.Pointer(&res)))
+	if st != 0 {
+		return nil, nil, errors.New("resources")
+	}
+	defer procDes.Call(res)
+	var model uintptr
+	st, _, _ = procKmFit.Call(
+		res,
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(n), uintptr(dim), uintptr(nclusters), uintptr(8),
+		uintptr(unsafe.Pointer(&model)),
+	)
+	if st != 0 {
+		return nil, nil, errors.New("kmeans fit")
+	}
+	defer procKmDes.Call(model)
+	labels := make([]int64, n)
+	dist := make([]float32, n)
+	st, _, _ = procKmPred.Call(
+		res, model,
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(n),
+		uintptr(unsafe.Pointer(&labels[0])),
+		uintptr(unsafe.Pointer(&dist[0])),
+	)
+	if st != 0 {
+		return nil, nil, errors.New("kmeans predict")
+	}
+	return labels, dist, nil
 }

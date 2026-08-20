@@ -3,6 +3,7 @@
 #if defined(IOVS_WITH_OPENVINO)
 #include <openvino/openvino.hpp>
 #include <openvino/op/gather.hpp>
+#include <openvino/op/reduce_sum.hpp>
 #include <openvino/op/topk.hpp>
 #include <openvino/opsets/opset8.hpp>
 #endif
@@ -245,6 +246,66 @@ bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
     if (!ov_gather_rows(r, "NPU", src, src_rows, dim, idx + i, nn, out + i * dim)) return false;
   }
   return true;
+}
+
+bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
+                int64_t ncodes, float* out) {
+#if defined(IOVS_WITH_OPENVINO)
+  if (!ov_has_device("NPU")) return false;
+  constexpr int64_t kTile = 128;
+  try {
+    using namespace ov;
+    const int64_t lut_n = static_cast<int64_t>(pq_m) * ks;
+    std::vector<float> lut(tables, tables + lut_n);
+    for (int64_t off = 0; off < ncodes; off += kTile) {
+      const int64_t nn = std::min(kTile, ncodes - off);
+      std::vector<int32_t> idx(static_cast<size_t>(nn * pq_m));
+      for (int64_t i = 0; i < nn; ++i) {
+        const uint8_t* code = codes + (off + i) * pq_m;
+        for (int32_t m = 0; m < pq_m; ++m) {
+          idx[static_cast<size_t>(i * pq_m + m)] = m * ks + static_cast<int32_t>(code[m]);
+        }
+      }
+      std::ostringstream key;
+      key << "NPU_adc_m" << pq_m << "_ks" << ks << "_n" << nn;
+      static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
+      auto it = cache.find(key.str());
+      if (it == cache.end()) {
+        auto pLut = std::make_shared<opset8::Parameter>(element::f32, Shape{static_cast<size_t>(lut_n)});
+        auto pIdx = std::make_shared<opset8::Parameter>(element::i32, Shape{static_cast<size_t>(nn),
+                                                                            static_cast<size_t>(pq_m)});
+        auto axis = opset8::Constant::create(element::i64, Shape{}, {0});
+        auto g = std::make_shared<ov::op::v8::Gather>(pLut, pIdx, axis);
+        auto red_axes = opset8::Constant::create(element::i64, Shape{1}, {1});
+        auto red = std::make_shared<ov::op::v1::ReduceSum>(g, red_axes, false);
+        auto model = std::make_shared<Model>(OutputVector{red}, ParameterVector{pLut, pIdx});
+        cache[key.str()] = ov_core().compile_model(model, "NPU");
+        it = cache.find(key.str());
+      }
+      auto req = it->second.create_infer_request();
+      Tensor tL(element::f32, Shape{static_cast<size_t>(lut_n)}, lut.data());
+      Tensor tI(element::i32, Shape{static_cast<size_t>(nn), static_cast<size_t>(pq_m)}, idx.data());
+      req.set_input_tensor(0, tL);
+      req.set_input_tensor(1, tI);
+      req.infer();
+      Tensor tO = req.get_output_tensor();
+      std::memcpy(out + off, tO.data<float>(), static_cast<size_t>(nn) * sizeof(float));
+    }
+    return true;
+  } catch (...) {
+    ++r.npu_compile_fails;
+    return false;
+  }
+#else
+  (void)r;
+  (void)tables;
+  (void)pq_m;
+  (void)ks;
+  (void)codes;
+  (void)ncodes;
+  (void)out;
+  return false;
+#endif
 }
 
 }  // namespace impl

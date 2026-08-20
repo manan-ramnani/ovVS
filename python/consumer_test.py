@@ -97,6 +97,15 @@ def main() -> int:
         print("hamming mismatch", got_h, got_h_score, htruth, hbest, file=sys.stderr)
         return 1
     print("python consumer hamming ok neighbor", got_h)
+    km = iovs.KMeans(data, nclusters=2, iters=8, dim=dim, resources=res)
+    labs, dist = km.predict(data)
+    if not any(d > 0 for d in dist):
+        print("kmeans inertia zero", file=sys.stderr)
+        return 1
+    print("python consumer kmeans ok label0", labs[0], "inertia", sum(dist))
+    vam = iovs.neighbors.vamana.build(data, dim=dim, graph_degree=4, resources=res)
+    vnb, _ = vam.search(q, k=k, beam=4)
+    print("python consumer vamana ok neighbor", int(vnb.ravel()[0] if hasattr(vnb, "ravel") else vnb[0]))
     return 0
 
 

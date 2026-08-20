@@ -5,7 +5,7 @@ using namespace iovs::impl;
 namespace {
 
 struct Dataset {
-  std::vector<float> x;
+  UsmFloatVec x;
   int64_t n = 0;
   int64_t dim = 0;
   iovsMetric metric = IOVS_METRIC_L2_EXPANDED;
@@ -118,9 +118,8 @@ iovsStatus iovsBruteForceSearch(iovsResources_t res, iovsBruteForceIndex_t index
     return IOVS_STATUS_INVALID_ARGUMENT;
   }
   auto* ix = reinterpret_cast<BruteIndex*>(index);
-  brute_search_impl(*rd(res), ix->x.data(), ix->n, ix->dim, queries, nq, ix->metric, k, bitset,
-                    neighbors, distances);
-  return IOVS_STATUS_SUCCESS;
+  return brute_search_impl(*rd(res), ix->x.data(), ix->n, ix->dim, queries, nq, ix->metric, k, bitset,
+                           neighbors, distances);
 }
 
 iovsStatus iovsBruteForceDestroy(iovsBruteForceIndex_t index) {
@@ -387,13 +386,22 @@ iovsStatus iovsIvfPqSearch(iovsResources_t res, iovsIvfPqIndex_t index, const fl
           tables[static_cast<size_t>(m * ix->pq_ks + cs)] = l2sq(sub, cb + cs * ix->dsub, ix->dsub);
         }
       }
+      std::vector<int64_t> list_ids;
+      std::vector<uint8_t> list_codes;
       for (int64_t id : ix->lists[static_cast<size_t>(c)]) {
         if (bitset && !allowed(bitset, id)) continue;
-        float s = 0.f;
+        list_ids.push_back(id);
         const uint8_t* code = ix->codes.data() + id * ix->pq_m;
-        for (int32_t m = 0; m < ix->pq_m; ++m) s += tables[static_cast<size_t>(m * ix->pq_ks + code[m])];
-        ids.push_back(id);
-        adc.push_back(s);
+        list_codes.insert(list_codes.end(), code, code + ix->pq_m);
+      }
+      if (!list_ids.empty()) {
+        std::vector<float> scores(list_ids.size());
+        const iovsStatus as =
+            prim_pq_adc(*rd(res), tables.data(), ix->pq_m, ix->pq_ks, list_codes.data(),
+                        static_cast<int64_t>(list_ids.size()), scores.data());
+        if (as != IOVS_STATUS_SUCCESS) return as;
+        ids.insert(ids.end(), list_ids.begin(), list_ids.end());
+        adc.insert(adc.end(), scores.begin(), scores.end());
       }
     }
     if (ids.empty()) {

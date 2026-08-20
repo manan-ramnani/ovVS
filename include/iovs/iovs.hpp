@@ -51,6 +51,7 @@ class BruteForceIndex {
               const uint8_t* bitset = nullptr) {
     check(iovsBruteForceSearch(res_->get(), ix_, queries, nq, k, bitset, neighbors, distances));
   }
+  iovsBruteForceIndex_t get() const { return ix_; }
 
  private:
   Resources* res_ = nullptr;
@@ -169,10 +170,115 @@ class CagraIndex {
   void extend(const float* extra, int64_t nextra) {
     check(iovsCagraExtend(res_->get(), ix_, extra, nextra));
   }
+  iovsCagraIndex_t get() const { return ix_; }
 
  private:
   Resources* res_ = nullptr;
   iovsCagraIndex_t ix_ = nullptr;
+};
+
+class VamanaIndex {
+ public:
+  VamanaIndex(Resources& res, const float* dataset, int64_t n, int64_t dim, iovsMetric metric,
+              int32_t graph_degree, float alpha)
+      : res_(&res) {
+    check(iovsVamanaBuild(res.get(), dataset, n, dim, metric, graph_degree, alpha, &ix_));
+  }
+  VamanaIndex(Resources& res, const char* path) : res_(&res) {
+    check(iovsVamanaDeserialize(res.get(), path, &ix_));
+  }
+  ~VamanaIndex() {
+    if (ix_) iovsVamanaDestroy(ix_);
+  }
+  VamanaIndex(const VamanaIndex&) = delete;
+  VamanaIndex& operator=(const VamanaIndex&) = delete;
+  void search(const float* queries, int64_t nq, int64_t k, int32_t beam, int64_t* neighbors,
+              float* distances, const uint8_t* bitset = nullptr) {
+    check(iovsVamanaSearch(res_->get(), ix_, queries, nq, k, beam, bitset, neighbors, distances));
+  }
+
+ private:
+  Resources* res_ = nullptr;
+  iovsVamanaIndex_t ix_ = nullptr;
+};
+
+class ScannIndex {
+ public:
+  ScannIndex(Resources& res, const float* dataset, int64_t n, int64_t dim, iovsMetric metric, int32_t nlist,
+             int32_t pq_m)
+      : res_(&res) {
+    check(iovsScannBuild(res.get(), dataset, n, dim, metric, nlist, pq_m, &ix_));
+  }
+  ~ScannIndex() {
+    if (ix_) iovsScannDestroy(ix_);
+  }
+  ScannIndex(const ScannIndex&) = delete;
+  ScannIndex& operator=(const ScannIndex&) = delete;
+  void search(const float* queries, int64_t nq, int64_t k, int32_t nprobe, int32_t krefine,
+              int64_t* neighbors, float* distances) {
+    check(iovsScannSearch(res_->get(), ix_, queries, nq, k, nprobe, krefine, neighbors, distances));
+  }
+
+ private:
+  Resources* res_ = nullptr;
+  iovsScannIndex_t ix_ = nullptr;
+};
+
+class HnswIndex {
+ public:
+  HnswIndex(Resources& res, CagraIndex& cagra) : res_(&res) {
+    check(iovsHnswFromCagra(res.get(), cagra.get(), &ix_));
+  }
+  ~HnswIndex() {
+    if (ix_) iovsHnswDestroy(ix_);
+  }
+  HnswIndex(const HnswIndex&) = delete;
+  HnswIndex& operator=(const HnswIndex&) = delete;
+  void search(const float* queries, int64_t nq, int64_t k, int32_t ef, int64_t* neighbors, float* distances) {
+    check(iovsHnswSearch(res_->get(), ix_, queries, nq, k, ef, neighbors, distances));
+  }
+
+ private:
+  Resources* res_ = nullptr;
+  iovsHnswIndex_t ix_ = nullptr;
+};
+
+class KMeans {
+ public:
+  KMeans(Resources& res, const float* dataset, int64_t n, int64_t dim, int32_t nclusters, int32_t iters)
+      : res_(&res) {
+    check(iovsKMeansFit(res.get(), dataset, n, dim, nclusters, iters, &m_));
+  }
+  ~KMeans() {
+    if (m_) iovsKMeansDestroy(m_);
+  }
+  KMeans(const KMeans&) = delete;
+  KMeans& operator=(const KMeans&) = delete;
+  void predict(const float* x, int64_t n, int64_t* labels, float* distances) {
+    check(iovsKMeansPredict(res_->get(), m_, x, n, labels, distances));
+  }
+
+ private:
+  Resources* res_ = nullptr;
+  iovsKMeansModel_t m_ = nullptr;
+};
+
+class Batcher {
+ public:
+  Batcher(Resources& res, BruteForceIndex& index, int32_t max_batch, int32_t max_wait_ms) {
+    check(iovsBatcherCreate(res.get(), index.get(), max_batch, max_wait_ms, &b_));
+  }
+  ~Batcher() {
+    if (b_) iovsBatcherDestroy(b_);
+  }
+  Batcher(const Batcher&) = delete;
+  Batcher& operator=(const Batcher&) = delete;
+  void search(const float* queries, int64_t nq, int64_t k, int64_t* neighbors, float* distances) {
+    check(iovsBatcherSearch(b_, queries, nq, k, neighbors, distances));
+  }
+
+ private:
+  iovsBatcher_t b_ = nullptr;
 };
 
 inline void bitset_from_allow_list(int64_t n, const int64_t* ids, int64_t nids, uint8_t* bitset) {

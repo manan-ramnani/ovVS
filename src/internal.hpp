@@ -10,6 +10,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -144,6 +145,39 @@ inline ResourcesData* rd(iovsResources_t r) { return reinterpret_cast<ResourcesD
 void probe_fill(ResourcesData& r);
 std::string probe_json();
 
+/* Shared USM (SYCL) or heap. Dataset/graph vectors use UsmAllocator so iGPU binds these pointers. */
+void* iovs_usm_malloc(size_t bytes);
+void iovs_usm_free(void* p);
+bool iovs_usm_is_shared(const void* p);
+
+template <typename T>
+struct UsmAllocator {
+  using value_type = T;
+  using size_type = std::size_t;
+  using difference_type = std::ptrdiff_t;
+  using propagate_on_container_move_assignment = std::true_type;
+  UsmAllocator() noexcept = default;
+  template <typename U>
+  UsmAllocator(const UsmAllocator<U>&) noexcept {}
+  T* allocate(std::size_t n) {
+    void* p = iovs_usm_malloc(n == 0 ? sizeof(T) : n * sizeof(T));
+    if (!p) throw std::bad_alloc();
+    return static_cast<T*>(p);
+  }
+  void deallocate(T* p, std::size_t) noexcept { iovs_usm_free(p); }
+  template <typename U>
+  bool operator==(const UsmAllocator<U>&) const noexcept {
+    return true;
+  }
+  template <typename U>
+  bool operator!=(const UsmAllocator<U>&) const noexcept {
+    return false;
+  }
+};
+
+using UsmFloatVec = std::vector<float, UsmAllocator<float>>;
+using UsmI32Vec = std::vector<int32_t, UsmAllocator<int32_t>>;
+
 /* Device backends. Return false if unavailable / failed (caller falls back). */
 bool npu_available();
 bool gpu_available();
@@ -171,7 +205,13 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances);
+bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+                  int64_t ny, int64_t dim, float* out, float metric_arg);
+bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
+                int64_t ncodes, float* out);
 int32_t sycl_enabled();
+bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components);
+bool mkl_syev_smallest(float* a, int64_t n, int32_t ncomp, float* embed);
 
 void cpu_gemm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
               bool trans_b);
@@ -192,6 +232,8 @@ iovsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows
                             const int64_t* idx, int64_t nidx, float* out);
 iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx,
                          const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
+iovsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
+                       const uint8_t* codes, int64_t ncodes, float* out);
 iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            iovsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
@@ -235,8 +277,8 @@ inline uint16_t f32_to_f16(float f) {
   return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (man >> 13));
 }
 
-inline void convert_to_f32(iovsDType dtype, const void* src, int64_t n, int64_t dim,
-                           std::vector<float>& out) {
+template <typename FloatVec>
+inline void convert_to_f32(iovsDType dtype, const void* src, int64_t n, int64_t dim, FloatVec& out) {
   const int64_t cells = n * dim;
   out.resize(static_cast<size_t>(cells));
   if (dtype == IOVS_DTYPE_F32) {
@@ -257,9 +299,9 @@ inline void convert_to_f32(iovsDType dtype, const void* src, int64_t n, int64_t 
   for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = static_cast<float>(p[i]);
 }
 
-void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
-                       const float* queries, int64_t nq, iovsMetric metric, int64_t k,
-                       const uint8_t* bitset, int64_t* neighbors, float* distances);
+iovsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                             const float* queries, int64_t nq, iovsMetric metric, int64_t k,
+                             const uint8_t* bitset, int64_t* neighbors, float* distances);
 
 void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
                      int32_t iters, std::vector<float>& centroids);

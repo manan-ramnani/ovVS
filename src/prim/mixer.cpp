@@ -146,10 +146,39 @@ iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, in
     }
     return IOVS_STATUS_SUCCESS;
   }
+  if (r.policy != IOVS_POLICY_FORCE_CPU) {
+    if (gpu_pairwise(r, metric, x, nx, y, ny, dim, out, metric_arg)) {
+      r.last_device = IOVS_DEVICE_GPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+  }
   if (r.policy == IOVS_POLICY_FORCE_NPU || r.policy == IOVS_POLICY_FORCE_GPU) {
     return finish_forced_fail(r);
   }
   cpu_pairwise(metric, x, nx, y, ny, dim, out, metric_arg);
+  r.last_device = IOVS_DEVICE_CPU;
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
+                       const uint8_t* codes, int64_t ncodes, float* out) {
+  if (!tables || !codes || !out || pq_m <= 0 || ks <= 0 || ncodes <= 0) {
+    return IOVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (r.policy != IOVS_POLICY_FORCE_CPU) {
+    if (npu_pq_adc(r, tables, pq_m, ks, codes, ncodes, out)) {
+      r.last_device = IOVS_DEVICE_NPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  }
+  if (r.policy == IOVS_POLICY_FORCE_NPU || r.policy == IOVS_POLICY_FORCE_GPU) {
+    return finish_forced_fail(r);
+  }
+  for (int64_t i = 0; i < ncodes; ++i) {
+    out[i] = iovsShavePqAdc(tables, codes + i * pq_m, pq_m, ks);
+  }
   r.last_device = IOVS_DEVICE_CPU;
   return IOVS_STATUS_SUCCESS;
 }
@@ -256,11 +285,12 @@ iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
   return IOVS_STATUS_SUCCESS;
 }
 
-void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
-                       const float* queries, int64_t nq, iovsMetric metric, int64_t k,
-                       const uint8_t* bitset, int64_t* neighbors, float* distances) {
+iovsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                             const float* queries, int64_t nq, iovsMetric metric, int64_t k,
+                             const uint8_t* bitset, int64_t* neighbors, float* distances) {
   std::vector<float> scores(static_cast<size_t>(nq * n));
-  prim_pairwise(r, metric, queries, nq, dataset, n, dim, scores.data(), 2.f);
+  const iovsStatus ps = prim_pairwise(r, metric, queries, nq, dataset, n, dim, scores.data(), 2.f);
+  if (ps != IOVS_STATUS_SUCCESS) return ps;
   if (bitset) {
     for (int64_t i = 0; i < nq; ++i) {
       for (int64_t j = 0; j < n; ++j) {
@@ -270,10 +300,12 @@ void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_
       }
     }
   }
-  prim_topk(r, scores.data(), nq, n, k, neighbors, distances, metric_largest(metric));
+  const iovsStatus ts = prim_topk(r, scores.data(), nq, n, k, neighbors, distances, metric_largest(metric));
+  if (ts != IOVS_STATUS_SUCCESS) return ts;
   if (metric == IOVS_METRIC_INNER_PRODUCT) {
     for (int64_t i = 0; i < nq * k; ++i) distances[i] = -distances[i];
   }
+  return IOVS_STATUS_SUCCESS;
 }
 
 void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,

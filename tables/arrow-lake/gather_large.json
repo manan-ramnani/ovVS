@@ -4,11 +4,11 @@
   "shape": [100000, 32, 768],
   "npu": true,
   "gpu": true,
-  "sycl": false,
+  "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 5.7366, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 645.9400, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 523.2757, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 4.0498, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 213.1547, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 24.1799, "status": "success"}
   ],
-  "note": "4096-row gather from 1e5x768: CPU wins. Accelerated path exists (FORCE_NPU/GPU last_device matches)."
+  "note": "4096-row gather from 1e5x768: CPU wins. SYCL USM GPU is faster than NPU. Accelerated FORCE_* last_device matches."
 }

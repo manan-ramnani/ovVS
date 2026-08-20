@@ -26,6 +26,9 @@ pub struct Lib {
         *mut f32,
     ) -> c_int,
     bf_destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
+    km_fit: unsafe extern "C" fn(*mut c_void, *const f32, i64, i64, i32, i32, *mut *mut c_void) -> c_int,
+    km_predict: unsafe extern "C" fn(*mut c_void, *mut c_void, *const f32, i64, *mut i64, *mut f32) -> c_int,
+    km_destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
 }
 
 impl Lib {
@@ -54,6 +57,9 @@ impl Lib {
                 bf_build: std::mem::transmute(sym(b"iovsBruteForceBuild\0")?),
                 bf_search: std::mem::transmute(sym(b"iovsBruteForceSearch\0")?),
                 bf_destroy: std::mem::transmute(sym(b"iovsBruteForceDestroy\0")?),
+                km_fit: std::mem::transmute(sym(b"iovsKMeansFit\0")?),
+                km_predict: std::mem::transmute(sym(b"iovsKMeansPredict\0")?),
+                km_destroy: std::mem::transmute(sym(b"iovsKMeansDestroy\0")?),
             })
         }
         #[cfg(not(windows))]
@@ -120,6 +126,36 @@ impl Lib {
                 return Err(format!("search rc={rc}"));
             }
             Ok((nb, ds))
+        }
+    }
+
+    pub fn kmeans_predict(
+        &self,
+        data: &[f32],
+        n: i64,
+        dim: i64,
+        nclusters: i32,
+    ) -> Result<(Vec<i64>, Vec<f32>), String> {
+        let mut res = std::ptr::null_mut();
+        unsafe {
+            if (self.create)(&mut res) != 0 {
+                return Err("create".into());
+            }
+            let mut model = std::ptr::null_mut();
+            let rc = (self.km_fit)(res, data.as_ptr(), n, dim, nclusters, 8, &mut model);
+            if rc != 0 {
+                (self.destroy)(res);
+                return Err(format!("kmeans fit rc={rc}"));
+            }
+            let mut labels = vec![0i64; n as usize];
+            let mut dist = vec![0f32; n as usize];
+            let rc = (self.km_predict)(res, model, data.as_ptr(), n, labels.as_mut_ptr(), dist.as_mut_ptr());
+            (self.km_destroy)(model);
+            (self.destroy)(res);
+            if rc != 0 {
+                return Err(format!("kmeans predict rc={rc}"));
+            }
+            Ok((labels, dist))
         }
     }
 }

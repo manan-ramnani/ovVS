@@ -191,6 +191,68 @@ _lib.iovsIvfRabitqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
 _lib.iovsIvfRabitqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
 _lib.iovsSyclEnabled.restype = c_int32
 _lib.iovsSyclEnabled.argtypes = []
+_lib.iovsVamanaBuild.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_float,
+    POINTER(c_void_p),
+]
+_lib.iovsVamanaSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_void_p,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.iovsVamanaDestroy.argtypes = [c_void_p]
+_lib.iovsScannBuild.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_int32,
+    POINTER(c_void_p),
+]
+_lib.iovsScannSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.iovsScannDestroy.argtypes = [c_void_p]
+_lib.iovsHnswFromCagra.argtypes = [c_void_p, c_void_p, POINTER(c_void_p)]
+_lib.iovsHnswSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.iovsHnswDestroy.argtypes = [c_void_p]
+_lib.iovsKMeansFit.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, c_int32, c_int32, POINTER(c_void_p)]
+_lib.iovsKMeansPredict.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64, POINTER(c_int64), POINTER(c_float)]
+_lib.iovsKMeansDestroy.argtypes = [c_void_p]
+_lib.iovsBatcherCreate.argtypes = [c_void_p, c_void_p, c_int32, c_int32, POINTER(c_void_p)]
+_lib.iovsBatcherSearch.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, POINTER(c_int64), POINTER(c_float)]
+_lib.iovsBatcherDestroy.argtypes = [c_void_p]
 
 METRIC_L2 = 0
 METRIC_L2_SQRT = 1
@@ -606,4 +668,142 @@ class neighbors:
                 res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfRabitqDestroy, n=n
             )
 
+    class vamana:
+        @staticmethod
+        def build(dataset, dim=None, metric=0, graph_degree=16, alpha=1.2, resources=None):
+            res = resources or Resources()
+            keep, ptr, n, d = _dataset_ptr(dataset, dim)
+            ix = c_void_p()
+            rc = _lib.iovsVamanaBuild(
+                res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(graph_degree),
+                c_float(alpha), ctypes.byref(ix)
+            )
+            if rc != 0:
+                raise RuntimeError("vamana.build failed")
+            return VamanaIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsVamanaDestroy, n=n)
+
+    class scann:
+        @staticmethod
+        def build(dataset, dim=None, metric=0, nlist=8, pq_m=8, resources=None):
+            res = resources or Resources()
+            keep, ptr, n, d = _dataset_ptr(dataset, dim)
+            ix = c_void_p()
+            rc = _lib.iovsScannBuild(
+                res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(nlist), c_int32(pq_m),
+                ctypes.byref(ix)
+            )
+            if rc != 0:
+                raise RuntimeError("scann.build failed")
+            return ScannIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsScannDestroy, n=n)
+
+    class hnsw:
+        @staticmethod
+        def from_cagra(cagra_index, resources=None):
+            res = resources or cagra_index._res
+            ix = c_void_p()
+            rc = _lib.iovsHnswFromCagra(res._h, cagra_index._h, ctypes.byref(ix))
+            if rc != 0:
+                raise RuntimeError("hnsw.from_cagra failed")
+            return HnswIndex(res, ix, cagra_index.dim, own_res=False, destroy=_lib.iovsHnswDestroy, n=cagra_index.n)
+
     build = brute_force.build
+
+
+class VamanaIndex(_Index):
+    def search(self, queries, k=10, beam=32, bitset=None, allow_list=None):
+        qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
+        nb = (c_int64 * (nq * k))()
+        ds = (c_float * (nq * k))()
+        rc = _lib.iovsVamanaSearch(
+            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(beam), bsp, nb, ds
+        )
+        if rc != 0:
+            raise RuntimeError("vamana search failed")
+        return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+
+class ScannIndex(_Index):
+    def search(self, queries, k=10, nprobe=8, krefine=32):
+        qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        nb = (c_int64 * (nq * k))()
+        ds = (c_float * (nq * k))()
+        rc = _lib.iovsScannSearch(
+            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(nprobe), c_int32(krefine), nb, ds
+        )
+        if rc != 0:
+            raise RuntimeError("scann search failed")
+        return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+
+class HnswIndex(_Index):
+    def search(self, queries, k=10, ef=32):
+        qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        nb = (c_int64 * (nq * k))()
+        ds = (c_float * (nq * k))()
+        rc = _lib.iovsHnswSearch(
+            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(ef), nb, ds
+        )
+        if rc != 0:
+            raise RuntimeError("hnsw search failed")
+        return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+
+class KMeans:
+    def __init__(self, dataset, nclusters=2, iters=12, dim=None, resources=None):
+        self._res = resources or Resources()
+        self._own = resources is None
+        keep, ptr, n, d = _dataset_ptr(dataset, dim)
+        self._h = c_void_p()
+        rc = _lib.iovsKMeansFit(
+            self._res._h, ptr, c_int64(n), c_int64(d), c_int32(nclusters), c_int32(iters), ctypes.byref(self._h)
+        )
+        if rc != 0:
+            raise RuntimeError("kmeans fit failed")
+        self.dim = d
+        self._keep = keep
+
+    def predict(self, x):
+        keep, ptr, n, _d = _dataset_ptr(x, self.dim)
+        labs = (c_int64 * n)()
+        dist = (c_float * n)()
+        rc = _lib.iovsKMeansPredict(self._res._h, self._h, ptr, c_int64(n), labs, dist)
+        if rc != 0:
+            raise RuntimeError("kmeans predict failed")
+        return [labs[i] for i in range(n)], [dist[i] for i in range(n)]
+
+    def close(self):
+        if self._h:
+            _lib.iovsKMeansDestroy(self._h)
+            self._h = None
+
+    def __del__(self):
+        self.close()
+
+
+class Batcher:
+    def __init__(self, brute_index, max_batch=8, max_wait_ms=0):
+        self._b = c_void_p()
+        rc = _lib.iovsBatcherCreate(
+            brute_index._res._h, brute_index._h, c_int32(max_batch), c_int32(max_wait_ms), ctypes.byref(self._b)
+        )
+        if rc != 0:
+            raise RuntimeError("batcher create failed")
+        self.dim = brute_index.dim
+
+    def search(self, queries, k=10):
+        qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        nb = (c_int64 * (nq * k))()
+        ds = (c_float * (nq * k))()
+        rc = _lib.iovsBatcherSearch(self._b, qptr, c_int64(nq), c_int64(k), nb, ds)
+        if rc != 0:
+            raise RuntimeError("batcher search failed")
+        return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+    def close(self):
+        if self._b:
+            _lib.iovsBatcherDestroy(self._b)
+            self._b = None
+
+    def __del__(self):
+        self.close()

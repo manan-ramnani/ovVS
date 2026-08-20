@@ -61,14 +61,31 @@ def main() -> int:
         print("SIFT hdf5 absent; generated stand-in n=800 dim=32 nq=32")
 
     lib = load_iovs()
+    policies = [("cpu", 6), ("npu", 4), ("gpu", 5)]
+    nb = None
+    for name, pol in policies:
+        res_p = lib.Resources()
+        res_p.set_policy(pol)
+        try:
+            idx_p = lib.neighbors.brute_force.build(data, dim=dim, resources=res_p)
+            t0 = time.perf_counter()
+            nbp, _ = idx_p.search(queries, k=k)
+            t1 = time.perf_counter()
+            print(
+                f"iovs brute policy={name} n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f} last_device={res_p.last_device()}"
+            )
+            if name == "cpu":
+                nb = nbp
+        except Exception as e:
+            print(f"iovs brute policy={name} failed: {e}")
     res = lib.Resources()
     res.set_policy(6)  # FORCE_CPU for comparable FAISS/hnswlib host bench
-    idx = lib.neighbors.brute_force.build(data, dim=dim, resources=res)
-    t0 = time.perf_counter()
-    nb, _ = idx.search(queries, k=k)
-    t1 = time.perf_counter()
-    brute_ms = (t1 - t0) * 1000
-    print(f"iovs brute n={n} dim={dim} nq={nq} ms={brute_ms:.3f} qps={nq / (t1 - t0 + 1e-9):.1f}")
+    if nb is None:
+        idx = lib.neighbors.brute_force.build(data, dim=dim, resources=res)
+        t0 = time.perf_counter()
+        nb, _ = idx.search(queries, k=k)
+        t1 = time.perf_counter()
+        print(f"iovs brute n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f}")
 
     faiss_ok = False
     try:
@@ -140,7 +157,7 @@ def main() -> int:
         print(f"hnswlib unavailable: {e}")
 
     if not faiss_ok:
-        print("ioVS-only numbers emitted; FAISS comparator parked after install retry.")
+        print("ioVS-only numbers emitted; FAISS did not import.")
     return 0
 
 

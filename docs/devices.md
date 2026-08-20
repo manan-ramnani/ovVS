@@ -23,7 +23,7 @@ Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>
 
 Bakeoff JSON lives in `tables/<sku>/`. This lab machine writes `tables/arrow-lake/` (Core Ultra 7 265K). Lunar Lake files are only created if that CPU brand string is actually probed — do not copy Arrow Lake numbers.
 
-Tiny GEMM (`B` small, `K` small) often wins on CPU because of NPU launch tax (`tables/arrow-lake/gemm.json`). Large GEMM `1e5 × 32 × 768` on this 265K: GPU 689 ms, NPU 775 ms, CPU 923 ms — both accelerators beat CPU. Large topk/gather still CPU-win (launch tax). See `tables/arrow-lake/gemm_large.json`.
+Tiny GEMM (`B` small, `K` small) often wins on CPU because of NPU launch tax (`tables/arrow-lake/gemm.json`). Large GEMM `1e5 × 32 × 768` on icx SYCL+oneMKL (warmup included): NPU 117 ms, GPU 150 ms, CPU 191 ms — **NPU is the AUTO large-GEMM winner**. Large topk/gather still CPU-win (launch tax). See `tables/arrow-lake/gemm_large.json`.
 
 ## CAGRA walk
 
@@ -39,7 +39,9 @@ ScaNN-like indexes train IVF-PQ in anisotropic (per-dim std) space and **re-rank
 
 `iovsBitsetFromAllowList(n, ids, nids, bitset)` fills a `(n+7)/8` bitset for filtered search. IVF-PQ and IVF-RaBitQ support serialize/deserialize/extend like IVF-Flat.
 
-When `IOVS_WITH_SYCL=ON`, GEMM/TopK/Gather run on SYCL **USM shared** scratch first, then fall back to the OpenVINO GPU plugin. NPU Gather/TopK HostCompile tiles rows (32) and gather indices (128) when a full-shape compile fails.
+When `IOVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Dataset/graph allocations use shared USM so iGPU GEMM/TopK/Gather/CAGRA skip a host memcpy when the pointer is already shared. NPU still binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest). PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes.
+
+NPU Gather/TopK HostCompile tiles rows (32) and gather indices (128) when a full-shape compile fails.
 
 C++ wrappers cover brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, and CAGRA (`include/iovs/iovs.hpp`), including serialize/extend. Python `search(..., allow_list=ids)` builds the filter bitset via `iovsBitsetFromAllowList`.
 

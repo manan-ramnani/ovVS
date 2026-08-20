@@ -9,7 +9,7 @@ namespace {
 constexpr uint32_t kCagraMagic = 0x31475243u; /* 'CRG1' */
 
 struct Dataset {
-  std::vector<float> x;
+  UsmFloatVec x;
   int64_t n = 0;
   int64_t dim = 0;
   iovsMetric metric = IOVS_METRIC_L2_EXPANDED;
@@ -43,7 +43,7 @@ struct NnGraph {
 struct CagraIndex {
   Dataset ds;
   int32_t degree = 0;
-  std::vector<int32_t> graph;
+  UsmI32Vec graph;
   bool has_dataset = true;
   int32_t pq_m = 0;
   int32_t pq_ks = 0;
@@ -739,7 +739,9 @@ iovsStatus iovsCagraBuildEx(iovsResources_t res, const float* dataset, int64_t n
   } else {
     nndescent_build(*rd(res), dataset, n, dim, metric, intermediate_degree, 6, init);
   }
-  prune_graph(dataset, n, dim, metric, init.data(), intermediate_degree, graph_degree, ix->graph);
+  std::vector<int32_t> pruned;
+  prune_graph(dataset, n, dim, metric, init.data(), intermediate_degree, graph_degree, pruned);
+  ix->graph.assign(pruned.begin(), pruned.end());
   *index = reinterpret_cast<iovsCagraIndex_t>(ix);
   return IOVS_STATUS_SUCCESS;
 }
@@ -954,7 +956,7 @@ iovsStatus iovsHnswFromCagra(iovsResources_t res, iovsCagraIndex_t cagra, iovsHn
   auto* hx = new HnswIndex();
   hx->ds = cg->ds;
   hx->degree = cg->degree;
-  hx->graph = cg->graph;
+  hx->graph.assign(cg->graph.begin(), cg->graph.end());
   hx->level.assign(static_cast<size_t>(cg->ds.n), 0);
   auto rng = rng_from(3);
   std::uniform_real_distribution<float> u(0.f, 1.f);

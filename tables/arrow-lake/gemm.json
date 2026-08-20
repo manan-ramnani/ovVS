@@ -4,10 +4,11 @@
   "shape": [64, 128, 32],
   "npu": true,
   "gpu": true,
-  "sycl": false,
+  "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 0.0529, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 7.3244, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 24.0031, "status": "success"}
-  ]
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0163, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 1.1016, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 0.0349, "status": "success"}
+  ],
+  "note": "icx 2025.1.1 SYCL+oneMKL. Tiny GEMM still CPU-win (launch tax). GPU is oneMKL/hand-SYCL USM (MKL chosen if it matched and was not slower)."
 }

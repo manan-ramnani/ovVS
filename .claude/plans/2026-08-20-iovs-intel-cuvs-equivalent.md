@@ -827,7 +827,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | C++ API | header wrappers beyond brute-force | IVF-Flat / IVF-PQ / IVF-RaBitQ / CAGRA + serialize/extend in `iovs.hpp` |
 | Allow-list filter | `iovsBitsetFromAllowList` | fills `(n+7)/8` bitset; missing ids stay 0 |
 | IVF-PQ / RaBitQ persist | magic `IPQ1` / `RQB1` | serialize/deserialize/extend encode residuals into existing codebooks |
-| Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake winner is GPU |
+| Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake icx SYCL+oneMKL winner is NPU (117 ms vs GPU 150 vs CPU 191) |
 
 ---
 
@@ -841,7 +841,7 @@ Filled in as installs finish. Placeholder until toolchain logs land:
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.
 - **Energy/RAPL:** `iovsResourcesEnergyUj` probes Linux RAPL sysfs and Intel Power Gadget (`EnergyLib64.dll`). On this Windows 265K host those DLLs are absent and there is no RAPL sysfs; status is `unsupported`. `GetSystemPowerStatus` is not a package-joule counter. Park energy numbers only; search works. Bakeoff emits `energy_probe`.
 - **git push:** `gh repo create manan-ramnani/ioVS` succeeded. OAuth token lacks `workflow` scope, so `origin/main` is a workflow-free snapshot of the current tree (`5eba49d`, matching local `813794f` content). Local `main` keeps full history including `.github/workflows/ci.yml`. Re-push of CI requires a token with the `workflow` scope.
-- **FAISS/hnswlib pip:** park comparator only after retries on this Python; still emit ioVS bench numbers.
+- **FAISS/hnswlib pip:** `faiss-cpu` 1.15.0 and `hnswlib` 0.8.0 import. SIFT slice benches in `tables/arrow-lake/bench-recall-qps.md`.
 
 ---
 

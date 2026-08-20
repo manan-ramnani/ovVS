@@ -140,3 +140,9 @@ void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t
 float iovsShavePqAdc(const float* tables, const uint8_t* code, int32_t pq_m, int32_t ks) {
   return iovs_shave_pq_adc(tables, code, pq_m, ks);
 }
+
+iovsStatus iovsPqAdcBatch(iovsResources_t res, const float* tables, int32_t pq_m, int32_t ks,
+                          const uint8_t* codes, int64_t ncodes, float* out) {
+  if (!res) return IOVS_STATUS_INVALID_ARGUMENT;
+  return iovs::impl::prim_pq_adc(*rd(res), tables, pq_m, ks, codes, ncodes, out);
+}

@@ -169,13 +169,24 @@ iovsStatus iovsSpectralFit(iovsResources_t res, const float* dataset, int64_t n,
     for (int64_t j = 0; j < n; ++j) s += W[static_cast<size_t>(i * n + j)];
     deg[static_cast<size_t>(i)] = s;
   }
-  /* Normalized Laplacian L = I - D^{-1/2} W D^{-1/2}; take k smallest via inverse iteration
-     on (I+W-like) — use power iteration on the random-walk matrix D^{-1}W. */
+  /* Normalized Laplacian L = I - D^{-1/2} W D^{-1/2}; oneMKL syev when available. */
   const int32_t k = nclusters;
   std::vector<float> embed(static_cast<size_t>(n) * static_cast<size_t>(k), 0.f);
+  std::vector<float> L(static_cast<size_t>(n * n), 0.f);
+  for (int64_t i = 0; i < n; ++i) {
+    const float di = deg[static_cast<size_t>(i)];
+    const float isi = di > 1e-12f ? 1.f / std::sqrt(di) : 0.f;
+    for (int64_t j = 0; j < n; ++j) {
+      const float dj = deg[static_cast<size_t>(j)];
+      const float isj = dj > 1e-12f ? 1.f / std::sqrt(dj) : 0.f;
+      float v = (i == j ? 1.f : 0.f) - isi * W[static_cast<size_t>(i * n + j)] * isj;
+      L[static_cast<size_t>(i * n + j)] = v;
+    }
+  }
+  const bool syev_ok = mkl_syev_smallest(L.data(), n, k, embed.data());
   auto rng = rng_from(5);
   std::uniform_real_distribution<float> u(-1.f, 1.f);
-  for (int32_t c = 0; c < k; ++c) {
+  for (int32_t c = 0; !syev_ok && c < k; ++c) {
     std::vector<float> v(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = u(rng);
     for (int it = 0; it < 40; ++it) {
@@ -256,9 +267,21 @@ static iovsStatus spectral_embed_fill(iovsResources_t res, const float* dataset,
     deg[static_cast<size_t>(i)] = s;
   }
   embed.assign(static_cast<size_t>(n) * static_cast<size_t>(ncomp), 0.f);
+  std::vector<float> L(static_cast<size_t>(n * n), 0.f);
+  for (int64_t i = 0; i < n; ++i) {
+    const float di = deg[static_cast<size_t>(i)];
+    const float isi = di > 1e-12f ? 1.f / std::sqrt(di) : 0.f;
+    for (int64_t j = 0; j < n; ++j) {
+      const float dj = deg[static_cast<size_t>(j)];
+      const float isj = dj > 1e-12f ? 1.f / std::sqrt(dj) : 0.f;
+      L[static_cast<size_t>(i * n + j)] =
+          (i == j ? 1.f : 0.f) - isi * W[static_cast<size_t>(i * n + j)] * isj;
+    }
+  }
+  const bool syev_ok = mkl_syev_smallest(L.data(), n, ncomp, embed.data());
   auto rng = rng_from(5);
   std::uniform_real_distribution<float> u(-1.f, 1.f);
-  for (int32_t c = 0; c < ncomp; ++c) {
+  for (int32_t c = 0; !syev_ok && c < ncomp; ++c) {
     std::vector<float> v(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = u(rng);
     for (int it = 0; it < 40; ++it) {

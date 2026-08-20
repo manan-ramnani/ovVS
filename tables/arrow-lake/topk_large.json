@@ -4,11 +4,11 @@
   "shape": [32, 100000, 768],
   "npu": true,
   "gpu": true,
-  "sycl": false,
+  "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 2.6321, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 275.3884, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 343.9056, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 1.8790, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 113.7947, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 749.8954, "status": "success"}
   ],
-  "note": "Large topk (k=10 over 1e5) still CPU-win; NPU/GPU compile+launch tax dominates. GEMM is the NPU/GPU win."
+  "note": "Large topk (k=10 over 1e5) still CPU-win; NPU/GPU launch tax dominates. GEMM is the accelerator win. FORCE_* last_device matches."
 }

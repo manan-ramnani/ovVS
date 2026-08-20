@@ -4,10 +4,10 @@
   "shape": [64, 128, 32],
   "npu": true,
   "gpu": true,
-  "sycl": false,
+  "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 0.0177, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 551.5008, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 21.4839, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0054, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 1.4596, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 1.0548, "status": "success"}
   ]
 }

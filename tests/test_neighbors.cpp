@@ -225,6 +225,80 @@ IOVS_TEST(allow_list_bitset_and_hamming_lp) {
   iovsBruteForceDestroy(ix);
 }
 
+IOVS_TEST(force_gpu_hamming_lp_vs_oracle) {
+  Res res;
+  int32_t gpu = 0;
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+  const int64_t n = 16, dim = 4, k = 3;
+  auto data = make_data(n, dim, 112);
+  auto q = make_data(1, dim, 113);
+  iovsBruteForceIndex_t ix = nullptr;
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_BITWISE_HAMMING, &ix), "ham");
+  std::vector<int64_t> nb(static_cast<size_t>(k));
+  std::vector<float> ds(static_cast<size_t>(k));
+  const iovsStatus st = iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data());
+  if (st == IOVS_STATUS_DEVICE_UNAVAILABLE) {
+    iovsBruteForceDestroy(ix);
+    return;
+  }
+  expect_status(st, "ham gpu");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  expect_status(iovsResourcesLastDevice(res.r, &last), "last");
+  expect(last == IOVS_DEVICE_GPU, "FORCE_GPU hamming last_device");
+  float hbest = 1e30f;
+  for (int64_t i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int64_t d = 0; d < dim; ++d) {
+      const uint32_t ax = data[static_cast<size_t>(i * dim + d)] >= 0.f;
+      const uint32_t ay = q[static_cast<size_t>(d)] >= 0.f;
+      s += static_cast<float>(ax ^ ay);
+    }
+    if (s < hbest) hbest = s;
+  }
+  expect(nb[0] >= 0 && nb[0] < n, "ham id");
+  float got = 0.f;
+  for (int64_t d = 0; d < dim; ++d) {
+    const uint32_t ax = data[static_cast<size_t>(nb[0] * dim + d)] >= 0.f;
+    const uint32_t ay = q[static_cast<size_t>(d)] >= 0.f;
+    got += static_cast<float>(ax ^ ay);
+  }
+  expect(got == hbest, "hamming min score");
+  iovsBruteForceDestroy(ix);
+
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_LP_UNEXPANDED, &ix), "lp");
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "lps");
+  expect_status(iovsResourcesLastDevice(res.r, &last), "lp last");
+  expect(last == IOVS_DEVICE_GPU, "FORCE_GPU lp last_device");
+  float pbest = 1e30f;
+  int64_t pid = -1;
+  const float p = 2.f;
+  for (int64_t i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int64_t d = 0; d < dim; ++d) {
+      const float t = std::fabs(data[static_cast<size_t>(i * dim + d)] - q[static_cast<size_t>(d)]);
+      s += t * t;
+    }
+    s = std::sqrt(s);
+    if (s < pbest) {
+      pbest = s;
+      pid = i;
+    }
+  }
+  (void)pid;
+  expect(nb[0] >= 0 && nb[0] < n, "lp id gpu");
+  float pg = 0.f;
+  for (int64_t d = 0; d < dim; ++d) {
+    const float t = std::fabs(data[static_cast<size_t>(nb[0] * dim + d)] - q[static_cast<size_t>(d)]);
+    pg += t * t;
+  }
+  pg = std::sqrt(pg);
+  expect(std::fabs(pg - pbest) < 1e-4f, "lp min score");
+  (void)p;
+  iovsBruteForceDestroy(ix);
+}
+
 IOVS_TEST(brute_force_bitset_filter) {
   Res res;
   const int64_t n = 20, dim = 4, k = 3;

@@ -96,6 +96,50 @@ IOVS_TEST(gemm_gpu_matches_cpu_when_present) {
   }
 }
 
+IOVS_TEST(gemm_gpu_matches_ref_gemm) {
+  Res res;
+  int32_t gpu = 0;
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  const int64_t m = 6, n = 9, k = 7;
+  auto A = make_data(m, k, 83);
+  auto B = make_data(n, k, 84);
+  std::vector<float> g(static_cast<size_t>(m * n)), R(static_cast<size_t>(m * n));
+  ref_gemm(A.data(), B.data(), R.data(), m, n, k, true);
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+  expect_status(iovsGemm(res.r, A.data(), B.data(), g.data(), m, n, k, 1), "gpu ref gemm");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  expect_status(iovsResourcesLastDevice(res.r, &last), "last");
+  expect(last == IOVS_DEVICE_GPU, "FORCE_GPU last_device");
+  for (size_t i = 0; i < g.size(); ++i) expect(std::fabs(g[i] - R[i]) < 2e-2f, "gpu vs ref_gemm");
+}
+
+IOVS_TEST(npu_pq_adc_matches_shave_when_present) {
+  Res res;
+  int32_t npu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+  const int32_t pq_m = 4, ks = 8;
+  const int64_t ncodes = 6;
+  auto tables = make_data(pq_m, ks, 91);
+  std::vector<uint8_t> codes(static_cast<size_t>(ncodes * pq_m));
+  for (size_t i = 0; i < codes.size(); ++i) codes[i] = static_cast<uint8_t>(i % ks);
+  std::vector<float> host(static_cast<size_t>(ncodes)), npuo(static_cast<size_t>(ncodes));
+  for (int64_t i = 0; i < ncodes; ++i)
+    host[static_cast<size_t>(i)] = iovsShavePqAdc(tables.data(), codes.data() + i * pq_m, pq_m, ks);
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_NPU);
+  const iovsStatus st =
+      iovsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes, npuo.data());
+  if (st == IOVS_STATUS_DEVICE_UNAVAILABLE) return;
+  expect_status(st, "npu adc");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  expect_status(iovsResourcesLastDevice(res.r, &last), "adc last");
+  expect(last == IOVS_DEVICE_NPU, "FORCE_NPU adc last_device");
+  for (int64_t i = 0; i < ncodes; ++i) {
+    expect(std::fabs(host[static_cast<size_t>(i)] - npuo[static_cast<size_t>(i)]) < 2e-2f, "adc vs shave");
+  }
+}
+
 static const char* dev_name(iovsDevice d) {
   switch (d) {
     case IOVS_DEVICE_NPU:

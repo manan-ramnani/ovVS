@@ -91,6 +91,8 @@ IOVS_API iovsStatus iovsResourcesEnergyUj(iovsResources_t res, int64_t* uj);
 IOVS_API void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,
                                     float* val);
 IOVS_API float iovsShavePqAdc(const float* tables, const uint8_t* code, int32_t pq_m, int32_t ks);
+IOVS_API iovsStatus iovsPqAdcBatch(iovsResources_t res, const float* tables, int32_t pq_m, int32_t ks,
+                                   const uint8_t* codes, int64_t ncodes, float* out);
 
 IOVS_API iovsStatus iovsProbeJson(char* buf, int32_t len);
 

@@ -124,9 +124,53 @@ int main() {
     return 1;
   }
 
-  std::printf("cxx consumer wrappers ok ivf=%lld cagra=%lld pq=%lld ham=%lld allow=%lld\n",
+  iovs::VamanaIndex vam(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 1.2f);
+  int64_t vnb[3];
+  float vds[3];
+  vam.search(q, 1, k, 4, vnb, vds);
+  if (vnb[0] < 0 || vnb[0] >= n) {
+    std::fprintf(stderr, "cxx vamana id out of range\n");
+    return 1;
+  }
+  iovs::ScannIndex scann(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 2);
+  int64_t snb[3];
+  float sds[3];
+  scann.search(q, 1, k, 4, 8, snb, sds);
+  if (snb[0] < 0 || snb[0] >= n) {
+    std::fprintf(stderr, "cxx scann id out of range\n");
+    return 1;
+  }
+  iovs::HnswIndex hnsw(res, cagra);
+  int64_t wnb[3];
+  float wds[3];
+  hnsw.search(q, 1, k, 8, wnb, wds);
+  if (wnb[0] < 0 || wnb[0] >= n) {
+    std::fprintf(stderr, "cxx hnsw id out of range\n");
+    return 1;
+  }
+  iovs::KMeans km(res, data.data(), n, dim, 2, 8);
+  int64_t labs[12];
+  float kmd[12];
+  km.predict(data.data(), n, labs, kmd);
+  float inertia = 0.f;
+  for (int64_t i = 0; i < n; ++i) inertia += kmd[i];
+  if (!(inertia > 0.f)) {
+    std::fprintf(stderr, "cxx kmeans inertia\n");
+    return 1;
+  }
+  iovs::Batcher batch(res, ix, 4, 0);
+  int64_t bnb[3];
+  float bds[3];
+  batch.search(q, 1, k, bnb, bds);
+  if (bnb[0] != nb[0]) {
+    std::fprintf(stderr, "cxx batcher mismatch\n");
+    return 1;
+  }
+
+  std::printf("cxx consumer wrappers ok ivf=%lld cagra=%lld pq=%lld ham=%lld allow=%lld vam=%lld scann=%lld hnsw=%lld\n",
               static_cast<long long>(inb[0]), static_cast<long long>(cnb[0]),
               static_cast<long long>(pnb[0]), static_cast<long long>(hnb[0]),
-              static_cast<long long>(fnb[0]));
+              static_cast<long long>(fnb[0]), static_cast<long long>(vnb[0]),
+              static_cast<long long>(snb[0]), static_cast<long long>(wnb[0]));
   return 0;
 }

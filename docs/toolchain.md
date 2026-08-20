@@ -13,6 +13,7 @@ Optional CMake flags:
 ```
 -DIOVS_WITH_OPENVINO=ON
 -DIOVS_WITH_SYCL=ON
+-DIOVS_WITH_MKL=ON   # oneAPI MKL 2025.1 GPU GEMM + LAPACKE gesvd/syev; Windows Ninja uses icx
 ```
 
 CPU-only builds are supported and run the full correctness suite. Device tests are labeled `npu` / `gpu` and skip only when the device is absent.

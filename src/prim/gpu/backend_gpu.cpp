@@ -1,9 +1,20 @@
 #include "internal.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <new>
 
 #if defined(IOVS_WITH_SYCL)
 #include <sycl/sycl.hpp>
+#if defined(IOVS_WITH_MKL)
+#include <oneapi/mkl.hpp>
+#endif
+#endif
+
+#if defined(IOVS_WITH_MKL)
+#include <mkl_lapacke.h>
 #endif
 
 namespace iovs {
@@ -16,7 +27,7 @@ static sycl::queue& gpu_queue() {
 }
 
 template <typename T>
-static T* usm_t(size_t n) {
+static T* usm_scratch(size_t n) {
   static T* p = nullptr;
   static size_t cap = 0;
   auto& q = gpu_queue();
@@ -28,9 +39,49 @@ static T* usm_t(size_t n) {
   return p;
 }
 
-static float* usm_f(size_t n) { return usm_t<float>(n); }
-static int64_t* usm_i64(size_t n) { return usm_t<int64_t>(n); }
+static float* usm_f(size_t n) { return usm_scratch<float>(n); }
+static int64_t* usm_i64(size_t n) { return usm_scratch<int64_t>(n); }
 #endif
+
+void* iovs_usm_malloc(size_t bytes) {
+  if (bytes == 0) bytes = 1;
+#if defined(IOVS_WITH_SYCL)
+  try {
+    void* p = sycl::malloc_shared(bytes, gpu_queue());
+    if (p) return p;
+  } catch (...) {
+  }
+#endif
+  return std::malloc(bytes);
+}
+
+void iovs_usm_free(void* p) {
+  if (!p) return;
+#if defined(IOVS_WITH_SYCL)
+  try {
+    if (sycl::get_pointer_type(p, gpu_queue().get_context()) != sycl::usm::alloc::unknown) {
+      sycl::free(p, gpu_queue());
+      return;
+    }
+  } catch (...) {
+  }
+#endif
+  std::free(p);
+}
+
+bool iovs_usm_is_shared(const void* p) {
+  if (!p) return false;
+#if defined(IOVS_WITH_SYCL)
+  try {
+    auto k = sycl::get_pointer_type(const_cast<void*>(p), gpu_queue().get_context());
+    return k == sycl::usm::alloc::shared || k == sycl::usm::alloc::host;
+  } catch (...) {
+  }
+#endif
+  return false;
+}
+
+
 
 bool gpu_available() {
 #if defined(IOVS_WITH_SYCL)
@@ -70,34 +121,127 @@ bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n) {
 #endif
 }
 
+#if defined(IOVS_WITH_SYCL)
+static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
+                          bool trans_b) {
+  auto& q = gpu_queue();
+  const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
+  const size_t bsz = trans_b ? N * K : K * N;
+  const bool a_usm = iovs_usm_is_shared(a);
+  const bool b_usm = iovs_usm_is_shared(b);
+  const bool c_usm = iovs_usm_is_shared(c);
+  size_t scratch_n = 0;
+  if (!a_usm) scratch_n += M * K;
+  if (!b_usm) scratch_n += bsz;
+  if (!c_usm) scratch_n += M * N;
+  float* scratch = scratch_n ? usm_f(scratch_n) : nullptr;
+  if (scratch_n && !scratch) return false;
+  float* sp = scratch;
+  float* A = a_usm ? const_cast<float*>(a) : (std::memcpy(sp, a, M * K * sizeof(float)), sp);
+  if (!a_usm) sp += M * K;
+  float* B = b_usm ? const_cast<float*>(b) : (std::memcpy(sp, b, bsz * sizeof(float)), sp);
+  if (!b_usm) sp += bsz;
+  float* C = c_usm ? c : sp;
+  const bool tb = trans_b;
+  q.parallel_for(sycl::range<2>(M, N), [=](sycl::id<2> id) {
+    const size_t i = id[0];
+    const size_t j = id[1];
+    float s = 0.f;
+    if (!tb) {
+      for (size_t t = 0; t < K; ++t) s += A[i * K + t] * B[t * N + j];
+    } else {
+      for (size_t t = 0; t < K; ++t) s += A[i * K + t] * B[j * K + t];
+    }
+    C[i * N + j] = s;
+  });
+  q.wait();
+  if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
+  return true;
+}
+
+#if defined(IOVS_WITH_MKL)
+static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
+                         bool trans_b) {
+  auto& q = gpu_queue();
+  const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
+  const size_t bsz = trans_b ? N * K : K * N;
+  const bool a_usm = iovs_usm_is_shared(a);
+  const bool b_usm = iovs_usm_is_shared(b);
+  const bool c_usm = iovs_usm_is_shared(c);
+  size_t scratch_n = 0;
+  if (!a_usm) scratch_n += M * K;
+  if (!b_usm) scratch_n += bsz;
+  if (!c_usm) scratch_n += M * N;
+  float* scratch = scratch_n ? usm_f(scratch_n) : nullptr;
+  if (scratch_n && !scratch) return false;
+  float* sp = scratch;
+  float* A = a_usm ? const_cast<float*>(a) : (std::memcpy(sp, a, M * K * sizeof(float)), sp);
+  if (!a_usm) sp += M * K;
+  float* B = b_usm ? const_cast<float*>(b) : (std::memcpy(sp, b, bsz * sizeof(float)), sp);
+  if (!b_usm) sp += bsz;
+  float* C = c_usm ? c : sp;
+  const auto transA = oneapi::mkl::transpose::nontrans;
+  const auto transB = trans_b ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans;
+  const std::int64_t lda = static_cast<std::int64_t>(K);
+  const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
+  const std::int64_t ldc = static_cast<std::int64_t>(N);
+  oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, 1.f, A, lda, B, ldb, 0.f, C, ldc);
+  q.wait();
+  if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
+  return true;
+}
+#endif
+
+enum class GpuGemmKind { Unset, Mkl, Sycl };
+static GpuGemmKind g_gpu_gemm = GpuGemmKind::Unset;
+
+static void pick_gpu_gemm() {
+  if (g_gpu_gemm != GpuGemmKind::Unset) return;
+  g_gpu_gemm = GpuGemmKind::Sycl;
+#if defined(IOVS_WITH_MKL)
+  try {
+    const int64_t m = 64, n = 128, k = 32;
+    std::vector<float> A(static_cast<size_t>(m * k), 0.1f), B(static_cast<size_t>(n * k), 0.2f);
+    std::vector<float> Cm(static_cast<size_t>(m * n), 0.f), Cs(static_cast<size_t>(m * n), 0.f);
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool mok = gemm_mkl_usm(A.data(), B.data(), Cm.data(), m, n, k, true);
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool sok = gemm_sycl_usm(A.data(), B.data(), Cs.data(), m, n, k, true);
+    const auto t2 = std::chrono::steady_clock::now();
+    if (mok && sok) {
+      bool close = true;
+      for (size_t i = 0; i < Cm.size(); ++i) {
+        if (std::fabs(Cm[i] - Cs[i]) > 2e-2f) {
+          close = false;
+          break;
+        }
+      }
+      const double mkl_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      const double sycl_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+      g_gpu_gemm = (close && mkl_ms <= sycl_ms) ? GpuGemmKind::Mkl : GpuGemmKind::Sycl;
+      if (!close) g_gpu_gemm = GpuGemmKind::Sycl;
+    } else if (mok) {
+      g_gpu_gemm = GpuGemmKind::Mkl;
+    }
+    (void)sok;
+  } catch (...) {
+    g_gpu_gemm = GpuGemmKind::Sycl;
+  }
+#endif
+}
+#endif
+
 bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b) {
 #if defined(IOVS_WITH_SYCL)
   try {
-    auto& q = gpu_queue();
-    const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
-    const size_t bsz = trans_b ? N * K : K * N;
-    float* A = usm_f(M * K + bsz + M * N);
-    if (!A) throw std::bad_alloc();
-    float* B = A + M * K;
-    float* C = B + bsz;
-    std::memcpy(A, a, M * K * sizeof(float));
-    std::memcpy(B, b, bsz * sizeof(float));
-    const bool tb = trans_b;
-    q.parallel_for(sycl::range<2>(M, N), [=](sycl::id<2> id) {
-      const size_t i = id[0];
-      const size_t j = id[1];
-      float s = 0.f;
-      if (!tb) {
-        for (size_t t = 0; t < K; ++t) s += A[i * K + t] * B[t * N + j];
-      } else {
-        for (size_t t = 0; t < K; ++t) s += A[i * K + t] * B[j * K + t];
-      }
-      C[i * N + j] = s;
-    });
-    q.wait();
-    std::memcpy(c, C, M * N * sizeof(float));
-    return true;
+    pick_gpu_gemm();
+#if defined(IOVS_WITH_MKL)
+    if (g_gpu_gemm == GpuGemmKind::Mkl) {
+      if (gemm_mkl_usm(a, b, c, m, n, k, trans_b)) return true;
+    }
+#endif
+    if (gemm_sycl_usm(a, b, c, m, n, k, trans_b)) return true;
   } catch (...) {
   }
 #endif
@@ -113,11 +257,13 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
     const size_t R = static_cast<size_t>(rows);
     const size_t C = static_cast<size_t>(cols);
     const size_t KK = static_cast<size_t>(std::min(k, cols));
-    float* S = usm_f(R * C + R * KK);
+    const bool s_usm = iovs_usm_is_shared(scores);
+    float* S = s_usm ? const_cast<float*>(scores) : usm_f(R * C + R * KK);
     int64_t* I = usm_i64(R * KK);
     if (!S || !I) throw std::bad_alloc();
-    float* V = S + R * C;
-    std::memcpy(S, scores, R * C * sizeof(float));
+    float* V = s_usm ? usm_f(R * KK) : (S + R * C);
+    if (!s_usm) std::memcpy(S, scores, R * C * sizeof(float));
+    if (!V) throw std::bad_alloc();
     const bool lg = largest;
     q.parallel_for(sycl::range<1>(R), [=](sycl::id<1> rid) {
       const size_t row = rid[0];
@@ -162,12 +308,18 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
     const size_t D = static_cast<size_t>(dim);
     const size_t N = static_cast<size_t>(nidx);
     const size_t SR = static_cast<size_t>(src_rows);
-    float* S = usm_f(SR * D + N * D);
+    const bool src_usm = iovs_usm_is_shared(src);
+    float* S = src_usm ? const_cast<float*>(src) : usm_f(SR * D + N * D);
     int64_t* I = usm_i64(N);
     if (!S || !I) throw std::bad_alloc();
-    float* O = S + SR * D;
-    std::memcpy(S, src, SR * D * sizeof(float));
-    std::memcpy(I, idx, N * sizeof(int64_t));
+    float* O = src_usm ? usm_f(N * D) : (S + SR * D);
+    if (!O) throw std::bad_alloc();
+    if (!src_usm) std::memcpy(S, src, SR * D * sizeof(float));
+    if (iovs_usm_is_shared(idx)) {
+      I = const_cast<int64_t*>(idx);
+    } else {
+      std::memcpy(I, idx, N * sizeof(int64_t));
+    }
     q.parallel_for(sycl::range<2>(N, D), [=](sycl::id<2> id) {
       const size_t i = id[0];
       const size_t j = id[1];
@@ -217,33 +369,35 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t SW = static_cast<size_t>(search_width);
     const int met = static_cast<int>(metric);
     const int max_iters = std::max(24, itopk * 6);
-    sycl::buffer<float, 1> bds(const_cast<float*>(dataset), sycl::range<1>(N * D));
-    sycl::buffer<int32_t, 1> bg(const_cast<int32_t*>(graph), sycl::range<1>(N * DEG));
-    sycl::buffer<float, 1> bq(const_cast<float*>(queries), sycl::range<1>(NQ * D));
-    sycl::buffer<int64_t, 1> bn(neighbors, sycl::range<1>(NQ * KK));
-    sycl::buffer<float, 1> bd(distances, sycl::range<1>(NQ * KK));
+    float* DS = iovs_usm_is_shared(dataset) ? const_cast<float*>(dataset)
+                                           : static_cast<float*>(iovs_usm_malloc(N * D * sizeof(float)));
+    int32_t* G = iovs_usm_is_shared(graph) ? const_cast<int32_t*>(graph)
+                                          : static_cast<int32_t*>(iovs_usm_malloc(N * DEG * sizeof(int32_t)));
+    float* Q = iovs_usm_is_shared(queries) ? const_cast<float*>(queries)
+                                          : static_cast<float*>(iovs_usm_malloc(NQ * D * sizeof(float)));
+    int64_t* OUTI = iovs_usm_is_shared(neighbors) ? neighbors
+                                                 : static_cast<int64_t*>(iovs_usm_malloc(NQ * KK * sizeof(int64_t)));
+    float* OUTD = iovs_usm_is_shared(distances) ? distances
+                                               : static_cast<float*>(iovs_usm_malloc(NQ * KK * sizeof(float)));
+    if (!DS || !G || !Q || !OUTI || !OUTD) throw std::bad_alloc();
+    if (!iovs_usm_is_shared(dataset)) std::memcpy(DS, dataset, N * D * sizeof(float));
+    if (!iovs_usm_is_shared(graph)) std::memcpy(G, graph, N * DEG * sizeof(int32_t));
+    if (!iovs_usm_is_shared(queries)) std::memcpy(Q, queries, NQ * D * sizeof(float));
     const uint8_t* bits = bitset;
     std::vector<uint8_t> all_one;
     if (!bits) {
       all_one.assign((N + 7) / 8, 0xff);
       bits = all_one.data();
     }
-    sycl::buffer<uint8_t, 1> bb(const_cast<uint8_t*>(bits), sycl::range<1>((N + 7) / 8));
-    /* 0 = unseen, 1 = in heap / seen, 2 = expanded. Length NQ*N so id>=4096 is visitable. */
-    sycl::buffer<uint8_t, 1> bseen(sycl::range<1>(NQ * N));
-    sycl::buffer<int64_t, 1> bhid(sycl::range<1>(NQ * IT));
-    sycl::buffer<float, 1> bhd(sycl::range<1>(NQ * IT));
-    q.submit([&](sycl::handler& h) {
-      auto DS = bds.get_access<sycl::access::mode::read>(h);
-      auto G = bg.get_access<sycl::access::mode::read>(h);
-      auto Q = bq.get_access<sycl::access::mode::read>(h);
-      auto OUTI = bn.get_access<sycl::access::mode::write>(h);
-      auto OUTD = bd.get_access<sycl::access::mode::write>(h);
-      auto BS = bb.get_access<sycl::access::mode::read>(h);
-      auto Seen = bseen.get_access<sycl::access::mode::read_write>(h);
-      auto HID = bhid.get_access<sycl::access::mode::read_write>(h);
-      auto HD = bhd.get_access<sycl::access::mode::read_write>(h);
-      h.parallel_for(sycl::range<1>(NQ), [=](sycl::id<1> qiid) {
+    uint8_t* BS = iovs_usm_is_shared(bits) ? const_cast<uint8_t*>(bits)
+                                          : static_cast<uint8_t*>(iovs_usm_malloc(((N + 7) / 8)));
+    if (!BS) throw std::bad_alloc();
+    if (!iovs_usm_is_shared(bits)) std::memcpy(BS, bits, (N + 7) / 8);
+    uint8_t* Seen = static_cast<uint8_t*>(iovs_usm_malloc(NQ * N));
+    int64_t* HID = static_cast<int64_t*>(iovs_usm_malloc(NQ * IT * sizeof(int64_t)));
+    float* HD = static_cast<float*>(iovs_usm_malloc(NQ * IT * sizeof(float)));
+    if (!Seen || !HID || !HD) throw std::bad_alloc();
+    q.parallel_for(sycl::range<1>(NQ), [=](sycl::id<1> qiid) {
         const size_t qi = qiid[0];
         const size_t sbase = qi * N;
         const size_t hbase = qi * IT;
@@ -341,8 +495,18 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
           }
         }
       });
-    });
     q.wait();
+    if (!iovs_usm_is_shared(neighbors)) std::memcpy(neighbors, OUTI, NQ * KK * sizeof(int64_t));
+    if (!iovs_usm_is_shared(distances)) std::memcpy(distances, OUTD, NQ * KK * sizeof(float));
+    if (!iovs_usm_is_shared(dataset)) iovs_usm_free(DS);
+    if (!iovs_usm_is_shared(graph)) iovs_usm_free(G);
+    if (!iovs_usm_is_shared(queries)) iovs_usm_free(Q);
+    if (!iovs_usm_is_shared(neighbors)) iovs_usm_free(OUTI);
+    if (!iovs_usm_is_shared(distances)) iovs_usm_free(OUTD);
+    if (!iovs_usm_is_shared(bits)) iovs_usm_free(BS);
+    iovs_usm_free(Seen);
+    iovs_usm_free(HID);
+    iovs_usm_free(HD);
     (void)r;
     return true;
   } catch (...) {
@@ -364,6 +528,125 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
   (void)bitset;
   (void)neighbors;
   (void)distances;
+  return false;
+#endif
+}
+
+bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+                  int64_t ny, int64_t dim, float* out, float metric_arg) {
+#if defined(IOVS_WITH_SYCL)
+  if (metric == IOVS_METRIC_L2_EXPANDED || metric == IOVS_METRIC_INNER_PRODUCT ||
+      metric == IOVS_METRIC_COSINE_EXPANDED) {
+    return false;
+  }
+  try {
+    auto& q = gpu_queue();
+    const size_t NX = static_cast<size_t>(nx), NY = static_cast<size_t>(ny), D = static_cast<size_t>(dim);
+    const bool x_usm = iovs_usm_is_shared(x);
+    const bool y_usm = iovs_usm_is_shared(y);
+    const bool o_usm = iovs_usm_is_shared(out);
+    size_t need = 0;
+    if (!x_usm) need += NX * D;
+    if (!y_usm) need += NY * D;
+    if (!o_usm) need += NX * NY;
+    float* sc = need ? usm_f(need) : nullptr;
+    if (need && !sc) throw std::bad_alloc();
+    float* sp = sc;
+    float* X = x_usm ? const_cast<float*>(x) : (std::memcpy(sp, x, NX * D * sizeof(float)), sp);
+    if (!x_usm) sp += NX * D;
+    float* Y = y_usm ? const_cast<float*>(y) : (std::memcpy(sp, y, NY * D * sizeof(float)), sp);
+    if (!y_usm) sp += NY * D;
+    float* O = o_usm ? out : sp;
+    const int met = static_cast<int>(metric);
+    const float p = metric_arg > 0.f ? metric_arg : 2.f;
+    q.parallel_for(sycl::range<2>(NX, NY), [=](sycl::id<2> id) {
+      const size_t i = id[0];
+      const size_t j = id[1];
+      if (met == 4) {
+        float s = 0.f;
+        for (size_t d = 0; d < D; ++d) {
+          const uint32_t ax = X[i * D + d] >= 0.f;
+          const uint32_t ay = Y[j * D + d] >= 0.f;
+          s += static_cast<float>(ax ^ ay);
+        }
+        O[i * NY + j] = s;
+      } else {
+        float s = 0.f;
+        for (size_t d = 0; d < D; ++d) s += sycl::pow(sycl::fabs(X[i * D + d] - Y[j * D + d]), p);
+        O[i * NY + j] = sycl::pow(s, 1.f / p);
+      }
+    });
+    q.wait();
+    if (!iovs_usm_is_shared(out)) std::memcpy(out, O, NX * NY * sizeof(float));
+    (void)r;
+    return true;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)r;
+  (void)metric;
+  (void)x;
+  (void)nx;
+  (void)y;
+  (void)ny;
+  (void)dim;
+  (void)out;
+  (void)metric_arg;
+  return false;
+#endif
+}
+
+bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components) {
+#if defined(IOVS_WITH_MKL)
+  if (!centered || !components || n <= 0 || dim <= 0 || ncomp <= 0) return false;
+  ncomp = std::min(ncomp, static_cast<int32_t>(std::min(n, dim)));
+  std::vector<float> a(centered, centered + n * dim);
+  std::vector<float> s(static_cast<size_t>(std::min(n, dim)));
+  std::vector<float> vt(static_cast<size_t>(std::min(n, dim) * dim));
+  std::vector<float> superb(static_cast<size_t>(std::max<int64_t>(std::min(n, dim) - 1, 1)));
+  const lapack_int rc = LAPACKE_sgesvd(LAPACK_ROW_MAJOR, 'N', 'S', static_cast<lapack_int>(n),
+                                       static_cast<lapack_int>(dim), a.data(), static_cast<lapack_int>(dim),
+                                       s.data(), nullptr, static_cast<lapack_int>(n), vt.data(),
+                                       static_cast<lapack_int>(dim), superb.data());
+  if (rc != 0) return false;
+  for (int32_t c = 0; c < ncomp; ++c) {
+    std::memcpy(components + static_cast<size_t>(c) * dim, vt.data() + static_cast<size_t>(c) * dim,
+                static_cast<size_t>(dim) * sizeof(float));
+  }
+  return true;
+#else
+  (void)centered;
+  (void)n;
+  (void)dim;
+  (void)ncomp;
+  (void)components;
+  return false;
+#endif
+}
+
+bool mkl_syev_smallest(float* a, int64_t n, int32_t ncomp, float* embed) {
+#if defined(IOVS_WITH_MKL)
+  if (!a || !embed || n <= 0 || ncomp <= 0) return false;
+  ncomp = std::min(ncomp, static_cast<int32_t>(n));
+  std::vector<float> w(static_cast<size_t>(n));
+  const lapack_int rc =
+      LAPACKE_ssyev(LAPACK_ROW_MAJOR, 'V', 'U', static_cast<lapack_int>(n), a, static_cast<lapack_int>(n),
+                    w.data());
+  if (rc != 0) return false;
+  /* Eigenvectors are rows after row-major syev? LAPACKE_ssyev overwrites A with eigenvectors as columns
+     in row-major: A[i, k] is component i of eigenvector k. Smallest are first. */
+  for (int64_t i = 0; i < n; ++i) {
+    for (int32_t c = 0; c < ncomp; ++c) {
+      embed[i * ncomp + c] = a[i * n + c];
+    }
+  }
+  return true;
+#else
+  (void)a;
+  (void)n;
+  (void)ncomp;
+  (void)embed;
   return false;
 #endif
 }

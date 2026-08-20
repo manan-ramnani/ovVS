@@ -107,6 +107,69 @@ public final class IoVS {
     }
   }
 
+  public static long[] kmeansPredict(float[] data, int n, int dim, int nclusters) {
+    Linker linker = Linker.nativeLinker();
+    SymbolLookup lu = lookup();
+    try (Arena arena = Arena.ofConfined()) {
+      var create =
+          linker.downcallHandle(
+              lu.find("iovsResourcesCreate").orElseThrow(),
+              FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+      var destroy =
+          linker.downcallHandle(
+              lu.find("iovsResourcesDestroy").orElseThrow(),
+              FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+      var fit =
+          linker.downcallHandle(
+              lu.find("iovsKMeansFit").orElseThrow(),
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.ADDRESS));
+      var pred =
+          linker.downcallHandle(
+              lu.find("iovsKMeansPredict").orElseThrow(),
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.ADDRESS));
+      var kmd =
+          linker.downcallHandle(
+              lu.find("iovsKMeansDestroy").orElseThrow(),
+              FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+      MemorySegment resPtr = arena.allocate(ValueLayout.ADDRESS);
+      int st = (int) create.invoke(resPtr);
+      if (st != 0) throw new RuntimeException("create");
+      MemorySegment res = resPtr.get(ValueLayout.ADDRESS, 0);
+      MemorySegment ds = arena.allocateArray(ValueLayout.JAVA_FLOAT, data.length);
+      for (int i = 0; i < data.length; i++) ds.setAtIndex(ValueLayout.JAVA_FLOAT, i, data[i]);
+      MemorySegment mPtr = arena.allocate(ValueLayout.ADDRESS);
+      st = (int) fit.invoke(res, ds, (long) n, (long) dim, nclusters, 8, mPtr);
+      if (st != 0) throw new RuntimeException("kmeans fit");
+      MemorySegment model = mPtr.get(ValueLayout.ADDRESS, 0);
+      MemorySegment labs = arena.allocateArray(ValueLayout.JAVA_LONG, n);
+      MemorySegment dist = arena.allocateArray(ValueLayout.JAVA_FLOAT, n);
+      st = (int) pred.invoke(res, model, ds, (long) n, labs, dist);
+      if (st != 0) throw new RuntimeException("kmeans predict");
+      long[] out = new long[n];
+      for (int i = 0; i < n; i++) out[i] = labs.getAtIndex(ValueLayout.JAVA_LONG, i);
+      kmd.invoke(model);
+      destroy.invoke(res);
+      return out;
+    } catch (Throwable t) {
+      throw new RuntimeException(t);
+    }
+  }
+
   private static float l2sq(float[] a, float[] b, int off, int dim) {
     float s = 0f;
     for (int i = 0; i < dim; i++) {
@@ -146,5 +209,7 @@ public final class IoVS {
     }
     System.out.println(
         "java consumer ok neighbors=" + nb[0] + "," + nb[1] + "," + nb[2] + " version=" + getVersion());
+    long[] labs = kmeansPredict(data, n, dim, 2);
+    System.out.println("java kmeans ok label0=" + labs[0]);
   }
 }

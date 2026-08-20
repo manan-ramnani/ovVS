@@ -63,21 +63,26 @@ int main(int argc, char** argv) {
       A[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i % 17);
     for (int64_t i = 0; i < N * K; ++i) B[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i % 13);
 
+    auto run_op = [&]() {
+      iovsStatus st = IOVS_STATUS_SUCCESS;
+      if (op == "gemm") {
+        st = iovsGemm(res, A.data(), B.data(), C.data(), M, N, K, 1);
+      } else if (op == "topk") {
+        std::vector<int64_t> idx(static_cast<size_t>(M * 10));
+        std::vector<float> val(static_cast<size_t>(M * 10));
+        st = iovsTopk(res, C.data(), M, N, 10, idx.data(), val.data(), 0);
+      } else if (op == "gather") {
+        const int64_t nidx = std::min<int64_t>(4096, M);
+        std::vector<int64_t> idx(static_cast<size_t>(nidx));
+        for (int64_t i = 0; i < nidx; ++i) idx[static_cast<size_t>(i)] = i % M;
+        std::vector<float> out(static_cast<size_t>(nidx * K));
+        st = iovsGatherRows(res, A.data(), M, K, idx.data(), nidx, out.data());
+      }
+      return st;
+    };
+    (void)run_op();
     const double t0 = now_ms();
-    iovsStatus st = IOVS_STATUS_SUCCESS;
-    if (op == "gemm") {
-      st = iovsGemm(res, A.data(), B.data(), C.data(), M, N, K, 1);
-    } else if (op == "topk") {
-      std::vector<int64_t> idx(static_cast<size_t>(M * 10));
-      std::vector<float> val(static_cast<size_t>(M * 10));
-      st = iovsTopk(res, C.data(), M, N, 10, idx.data(), val.data(), 0);
-    } else if (op == "gather") {
-      const int64_t nidx = std::min<int64_t>(4096, M);
-      std::vector<int64_t> idx(static_cast<size_t>(nidx));
-      for (int64_t i = 0; i < nidx; ++i) idx[static_cast<size_t>(i)] = i % M;
-      std::vector<float> out(static_cast<size_t>(nidx * K));
-      st = iovsGatherRows(res, A.data(), M, K, idx.data(), nidx, out.data());
-    }
+    iovsStatus st = run_op();
     const double t1 = now_ms();
     if (!first) std::printf(",\n");
     first = false;

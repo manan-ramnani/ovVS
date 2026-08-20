@@ -206,6 +206,10 @@ iovsStatus iovsPcaFit(iovsResources_t res, const float* dataset, int64_t n, int6
   const float invn = 1.f / static_cast<float>(std::max<int64_t>(n - 1, 1));
   for (float& v : cov) v *= invn;
   m->components.assign(static_cast<size_t>(ncomp) * static_cast<size_t>(dim), 0.f);
+  if (mkl_gesvd_components(xc.data(), n, dim, ncomp, m->components.data())) {
+    *model = reinterpret_cast<iovsPcaModel_t>(m);
+    return IOVS_STATUS_SUCCESS;
+  }
   auto rng = rng_from(11);
   std::uniform_real_distribution<float> u(-1.f, 1.f);
   for (int32_t c = 0; c < ncomp; ++c) {
