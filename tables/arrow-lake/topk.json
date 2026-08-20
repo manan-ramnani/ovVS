@@ -1,10 +1,13 @@
 {
   "sku": "arrow-lake",
   "op": "topk",
+  "shape": [64, 128, 32],
+  "npu": true,
+  "gpu": true,
+  "sycl": false,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 0.0443, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 80.0431, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 368.8626, "status": "success"}
-  ],
-  "note": "OpenVINO TopK on NPU and GPU. first-compile included in ms. last_device is the device that ran, not a CPU fallback."
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0177, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 551.5008, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 21.4839, "status": "success"}
+  ]
 }

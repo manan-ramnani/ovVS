@@ -1,0 +1,14 @@
+{
+  "sku": "arrow-lake",
+  "op": "gemm",
+  "shape": [100000, 32, 768],
+  "npu": true,
+  "gpu": true,
+  "sycl": false,
+  "runs": [
+    {"requested": "cpu", "last_device": "cpu", "ms": 923.1449, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 774.7135, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 688.9049, "status": "success"}
+  ],
+  "note": "NPU and GPU both beat CPU on 1e5x32x768 GEMM. GPU slightly fastest; AUTO may still prefer NPU at this flop count. Tiny GEMM remains CPU-win (see gemm.json)."
+}

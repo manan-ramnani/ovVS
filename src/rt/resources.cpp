@@ -68,6 +68,14 @@ iovsStatus iovsResourcesLastDevice(iovsResources_t res, iovsDevice* device) {
   return IOVS_STATUS_SUCCESS;
 }
 
+iovsStatus iovsResourcesSetNpuBusy(iovsResources_t res, int32_t busy) {
+  if (!res) return IOVS_STATUS_INVALID_ARGUMENT;
+  rd(res)->npu_busy = busy != 0;
+  return IOVS_STATUS_SUCCESS;
+}
+
+int32_t iovsSyclEnabled(void) { return iovs::impl::sycl_enabled(); }
+
 iovsStatus iovsProbeJson(char* buf, int32_t len) {
   if (!buf || len <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
   const std::string s = iovs::impl::probe_json();

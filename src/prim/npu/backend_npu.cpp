@@ -100,7 +100,15 @@ bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float
 
 bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b) {
-  return ov_matmul(r, "NPU", a, b, c, m, n, k, trans_b);
+  if (ov_matmul(r, "NPU", a, b, c, m, n, k, trans_b)) return true;
+  /* HostCompile tiles: static M=256 blobs over a dynamic leading dimension. */
+  constexpr int64_t kTile = 256;
+  if (m <= kTile) return false;
+  for (int64_t i = 0; i < m; i += kTile) {
+    const int64_t rows = std::min(kTile, m - i);
+    if (!ov_matmul(r, "NPU", a + i * k, b, c + i * n, rows, n, k, trans_b)) return false;
+  }
+  return true;
 }
 
 bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t rows, int64_t cols,

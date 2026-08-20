@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ioVS VERSION 0.1.0 LANGUAGES C CXX)
+project(ioVS VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,7 @@ set(IOVS_SOURCES
   src/neighbors/graphs.cpp
   src/cluster/cluster.cpp
   src/preprocess/preprocess.cpp
+  src/rt/batcher.cpp
 )
 
 add_library(iovs SHARED ${IOVS_SOURCES})
@@ -92,11 +93,15 @@ if(IOVS_BUILD_TESTS)
   target_include_directories(iovs_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_executable(iovs_consumer tests/consumer.c)
   target_link_libraries(iovs_consumer PRIVATE iovs)
+  add_executable(iovs_consumer_cxx tests/consumer.cpp)
+  target_link_libraries(iovs_consumer_cxx PRIVATE iovs)
   enable_testing()
   add_test(NAME cpu COMMAND iovs_tests)
   set_tests_properties(cpu PROPERTIES LABELS "cpu")
   add_test(NAME consumer COMMAND iovs_consumer)
   set_tests_properties(consumer PROPERTIES LABELS "cpu")
+  add_test(NAME consumer_cxx COMMAND iovs_consumer_cxx)
+  set_tests_properties(consumer_cxx PROPERTIES LABELS "cpu")
 endif()
 
 install(TARGETS iovs EXPORT iovsTargets

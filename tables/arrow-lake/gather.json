@@ -1,10 +1,13 @@
 {
   "sku": "arrow-lake",
   "op": "gather",
+  "shape": [64, 128, 32],
+  "npu": true,
+  "gpu": true,
+  "sycl": false,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 0.0051, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 532.7223, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 326.3043, "status": "success"}
-  ],
-  "note": "OpenVINO Gather on NPU and GPU. first-compile included in ms. last_device is the device that ran."
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0084, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 95.1955, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 330.8165, "status": "success"}
+  ]
 }

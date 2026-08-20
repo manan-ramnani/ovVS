@@ -52,6 +52,9 @@ dist/
 !/tables/
 !/tables/**/*.json
 
+# Optional npu_compiler clone (pin URL in compiler/README.md; submodule if vendored)
+/compiler/npu_compiler/
+
 # NPU / OpenVINO local
 *.xml
 !**/tests/**/*.xml

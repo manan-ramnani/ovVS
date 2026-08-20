@@ -18,6 +18,12 @@ struct Spectral {
   std::vector<int64_t> labels;
 };
 
+struct SpectralEmbed {
+  std::vector<float> z;
+  int64_t n = 0;
+  int32_t ncomp = 0;
+};
+
 int64_t ufind(std::vector<int64_t>& p, int64_t x) {
   while (p[static_cast<size_t>(x)] != x) {
     p[static_cast<size_t>(x)] = p[static_cast<size_t>(p[static_cast<size_t>(x)])];
@@ -217,5 +223,92 @@ iovsStatus iovsSpectralLabels(iovsSpectralModel_t model, const int64_t** labels,
 
 iovsStatus iovsSpectralDestroy(iovsSpectralModel_t model) {
   delete reinterpret_cast<Spectral*>(model);
+  return IOVS_STATUS_SUCCESS;
+}
+
+static iovsStatus spectral_embed_fill(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                                      int32_t ncomp, int32_t knn, std::vector<float>& embed) {
+  knn = std::max(1, std::min(knn, static_cast<int32_t>(n - 1)));
+  ncomp = std::max(1, ncomp);
+  std::vector<int64_t> nbr(static_cast<size_t>(n) * static_cast<size_t>(knn));
+  std::vector<float> dist(static_cast<size_t>(n) * static_cast<size_t>(knn));
+  const iovsStatus st =
+      iovsAllNeighbors(res, dataset, n, dim, IOVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
+  if (st != IOVS_STATUS_SUCCESS) return st;
+  float mean = 0.f;
+  for (float v : dist) mean += v;
+  mean /= static_cast<float>(std::max<size_t>(dist.size(), 1));
+  const float sigma = std::max(mean, 1e-6f);
+  std::vector<float> W(static_cast<size_t>(n * n), 0.f);
+  std::vector<float> deg(static_cast<size_t>(n), 0.f);
+  for (int64_t i = 0; i < n; ++i) {
+    for (int32_t t = 0; t < knn; ++t) {
+      const int64_t j = nbr[static_cast<size_t>(i * knn + t)];
+      if (j < 0) continue;
+      const float a = std::exp(-dist[static_cast<size_t>(i * knn + t)] / (2.f * sigma));
+      W[static_cast<size_t>(i * n + j)] = std::max(W[static_cast<size_t>(i * n + j)], a);
+      W[static_cast<size_t>(j * n + i)] = std::max(W[static_cast<size_t>(j * n + i)], a);
+    }
+  }
+  for (int64_t i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int64_t j = 0; j < n; ++j) s += W[static_cast<size_t>(i * n + j)];
+    deg[static_cast<size_t>(i)] = s;
+  }
+  embed.assign(static_cast<size_t>(n) * static_cast<size_t>(ncomp), 0.f);
+  auto rng = rng_from(5);
+  std::uniform_real_distribution<float> u(-1.f, 1.f);
+  for (int32_t c = 0; c < ncomp; ++c) {
+    std::vector<float> v(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = u(rng);
+    for (int it = 0; it < 40; ++it) {
+      std::vector<float> nv(static_cast<size_t>(n), 0.f);
+      for (int64_t i = 0; i < n; ++i) {
+        if (deg[static_cast<size_t>(i)] <= 1e-12f) continue;
+        float s = 0.f;
+        for (int64_t j = 0; j < n; ++j) s += W[static_cast<size_t>(i * n + j)] * v[static_cast<size_t>(j)];
+        nv[static_cast<size_t>(i)] = s / deg[static_cast<size_t>(i)];
+      }
+      for (int32_t p = 0; p < c; ++p) {
+        float ip = 0.f;
+        for (int64_t i = 0; i < n; ++i) ip += nv[static_cast<size_t>(i)] * embed[static_cast<size_t>(i * ncomp + p)];
+        for (int64_t i = 0; i < n; ++i) nv[static_cast<size_t>(i)] -= ip * embed[static_cast<size_t>(i * ncomp + p)];
+      }
+      float nrm = 0.f;
+      for (float x : nv) nrm += x * x;
+      nrm = std::sqrt(std::max(nrm, 1e-12f));
+      for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = nv[static_cast<size_t>(i)] / nrm;
+    }
+    for (int64_t i = 0; i < n; ++i) embed[static_cast<size_t>(i * ncomp + c)] = v[static_cast<size_t>(i)];
+  }
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsSpectralEmbedFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                                int32_t ncomp, int32_t knn, iovsSpectralEmbed_t* model) {
+  if (!res || !dataset || !model || n <= 0 || dim <= 0 || ncomp <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* m = new SpectralEmbed();
+  m->n = n;
+  m->ncomp = ncomp;
+  const iovsStatus st = spectral_embed_fill(res, dataset, n, dim, ncomp, knn, m->z);
+  if (st != IOVS_STATUS_SUCCESS) {
+    delete m;
+    return st;
+  }
+  *model = reinterpret_cast<iovsSpectralEmbed_t>(m);
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsSpectralEmbedData(iovsSpectralEmbed_t model, const float** data, int64_t* n, int32_t* ncomp) {
+  if (!model || !data || !n || !ncomp) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* m = reinterpret_cast<SpectralEmbed*>(model);
+  *data = m->z.data();
+  *n = m->n;
+  *ncomp = m->ncomp;
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsSpectralEmbedDestroy(iovsSpectralEmbed_t model) {
+  delete reinterpret_cast<SpectralEmbed*>(model);
   return IOVS_STATUS_SUCCESS;
 }

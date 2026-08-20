@@ -102,3 +102,39 @@ IOVS_TEST(pca_reduces_and_pairwise_ip) {
   for (int64_t d = 0; d < dim; ++d) self += data[static_cast<size_t>(d)] * data[static_cast<size_t>(d)];
   expect(std::fabs(out[0] + self) < 1e-4f, "pairwise IP stores -dot");
 }
+
+IOVS_TEST(spectral_embedding_api) {
+  Res res;
+  const int64_t n = 20, dim = 4;
+  auto data = make_data(n, dim, 620);
+  for (int64_t i = 0; i < n / 2; ++i) data[static_cast<size_t>(i * dim)] += 6.f;
+  iovsSpectralEmbed_t em = nullptr;
+  expect_status(iovsSpectralEmbedFit(res.r, data.data(), n, dim, 2, 5, &em), "embed");
+  const float* z = nullptr;
+  int64_t nn = 0;
+  int32_t nc = 0;
+  expect_status(iovsSpectralEmbedData(em, &z, &nn, &nc), "data");
+  expect(nn == n && nc == 2 && z, "embed shape");
+  float nrm = 0.f;
+  for (int64_t i = 0; i < n * nc; ++i) nrm += z[i] * z[i];
+  expect(nrm > 0.f, "embed energy");
+  iovsSpectralEmbedDestroy(em);
+}
+
+IOVS_TEST(mixer_auto_skips_busy_npu) {
+  Res res;
+  int32_t npu = 0, gpu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_AUTO);
+  expect_status(iovsResourcesSetNpuBusy(res.r, 1), "busy");
+  const int64_t m = 256, n = 64, k = 128;
+  auto A = make_data(m, k, 1);
+  auto B = make_data(n, k, 2);
+  std::vector<float> C(static_cast<size_t>(m * n));
+  expect_status(iovsGemm(res.r, A.data(), B.data(), C.data(), m, n, k, 1), "gemm busy");
+  iovsDevice last = IOVS_DEVICE_NPU;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last != IOVS_DEVICE_NPU, "auto must not pick busy npu");
+  expect_status(iovsResourcesSetNpuBusy(res.r, 0), "free");
+}

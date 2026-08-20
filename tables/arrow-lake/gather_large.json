@@ -1,0 +1,14 @@
+{
+  "sku": "arrow-lake",
+  "op": "gather",
+  "shape": [100000, 32, 768],
+  "npu": true,
+  "gpu": true,
+  "sycl": false,
+  "runs": [
+    {"requested": "cpu", "last_device": "cpu", "ms": 5.7366, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 645.9400, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 523.2757, "status": "success"}
+  ],
+  "note": "4096-row gather from 1e5x768: CPU wins. Accelerated path exists (FORCE_NPU/GPU last_device matches)."
+}

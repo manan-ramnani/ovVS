@@ -26,22 +26,34 @@ def l2sq(a, b, dim):
 
 def main() -> int:
     n, dim, k = 12, 4, 3
-    data = array.array("f", [((i * 17) % 100) / 50.0 - 1.0 for i in range(n * dim)])
-    q = array.array("f", [0.1, -0.2, 0.3, 0.0])
+    try:
+        import numpy as np
+
+        data = np.array([((i * 17) % 100) / 50.0 - 1.0 for i in range(n * dim)], dtype=np.float32).reshape(
+            n, dim
+        )
+        q = np.array([[0.1, -0.2, 0.3, 0.0]], dtype=np.float32)
+        use_np = True
+    except ImportError:
+        data = array.array("f", [((i * 17) % 100) / 50.0 - 1.0 for i in range(n * dim)])
+        q = array.array("f", [0.1, -0.2, 0.3, 0.0])
+        use_np = False
     res = iovs.Resources()
     idx = iovs.neighbors.brute_force.build(data, dim=dim, resources=res)
     nb, ds = idx.search(q, k=k)
     # oracle
     dists = []
+    qrow = q[0] if use_np else q
     for i in range(n):
-        row = data[i * dim : (i + 1) * dim]
-        dists.append((l2sq(q, row, dim), i))
+        row = data[i] if use_np else data[i * dim : (i + 1) * dim]
+        dists.append((l2sq(qrow, row, dim), i))
     dists.sort()
     truth = [i for _, i in dists[:k]]
-    if list(nb[:k]) != truth:
-        print("mismatch", nb[:k], truth, file=sys.stderr)
+    got = list(nb.ravel()[:k]) if hasattr(nb, "ravel") else list(nb[:k])
+    if got != truth:
+        print("mismatch", got, truth, file=sys.stderr)
         return 1
-    print("python consumer ok neighbors", list(nb[:k]), "version", iovs.version())
+    print("python consumer ok neighbors", got, "version", iovs.version(), "numpy", use_np)
     return 0
 
 

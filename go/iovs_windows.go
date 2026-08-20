@@ -9,11 +9,14 @@ import (
 )
 
 var (
-	mod      = syscall.NewLazyDLL("iovs.dll")
-	procVer  = mod.NewProc("iovsGetVersion")
-	procCre  = mod.NewProc("iovsResourcesCreate")
-	procDes  = mod.NewProc("iovsResourcesDestroy")
-	procGemm = mod.NewProc("iovsGemm")
+	mod         = syscall.NewLazyDLL("iovs.dll")
+	procVer     = mod.NewProc("iovsGetVersion")
+	procCre     = mod.NewProc("iovsResourcesCreate")
+	procDes     = mod.NewProc("iovsResourcesDestroy")
+	procGemm    = mod.NewProc("iovsGemm")
+	procBfBuild = mod.NewProc("iovsBruteForceBuild")
+	procBfSearch = mod.NewProc("iovsBruteForceSearch")
+	procBfDes   = mod.NewProc("iovsBruteForceDestroy")
 )
 
 func windowsCString(p uintptr) string {
@@ -57,4 +60,39 @@ func Gemm(a, b []float32, m, n, k int) ([]float32, error) {
 		return nil, errors.New("gemm")
 	}
 	return out, nil
+}
+
+func BruteSearch(data []float32, n, dim int, query []float32, k int) ([]int64, []float32, error) {
+	var res uintptr
+	st, _, _ := procCre.Call(uintptr(unsafe.Pointer(&res)))
+	if st != 0 {
+		return nil, nil, errors.New("resources")
+	}
+	defer procDes.Call(res)
+	var ix uintptr
+	metric := 0
+	st, _, _ = procBfBuild.Call(
+		res,
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(n), uintptr(dim), uintptr(metric),
+		uintptr(unsafe.Pointer(&ix)),
+	)
+	if st != 0 {
+		return nil, nil, errors.New("build")
+	}
+	defer procBfDes.Call(ix)
+	nb := make([]int64, k)
+	ds := make([]float32, k)
+	st, _, _ = procBfSearch.Call(
+		res,
+		ix,
+		uintptr(unsafe.Pointer(&query[0])),
+		uintptr(1), uintptr(k), 0,
+		uintptr(unsafe.Pointer(&nb[0])),
+		uintptr(unsafe.Pointer(&ds[0])),
+	)
+	if st != 0 {
+		return nil, nil, errors.New("search")
+	}
+	return nb, ds, nil
 }

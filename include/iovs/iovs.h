@@ -44,6 +44,12 @@ typedef enum iovsDType {
   IOVS_DTYPE_U8 = 3
 } iovsDType;
 
+typedef enum iovsCagraBuildAlgo {
+  IOVS_CAGRA_BUILD_NN_DESCENT = 0,
+  IOVS_CAGRA_BUILD_IVF_PQ = 1,
+  IOVS_CAGRA_BUILD_ITERATIVE = 2
+} iovsCagraBuildAlgo;
+
 typedef struct iovsResourcesImpl* iovsResources_t;
 typedef struct iovsBruteForceIndexImpl* iovsBruteForceIndex_t;
 typedef struct iovsIvfFlatIndexImpl* iovsIvfFlatIndex_t;
@@ -61,6 +67,8 @@ typedef struct iovsPcaModelImpl* iovsPcaModel_t;
 typedef struct iovsPqModelImpl* iovsPqModel_t;
 typedef struct iovsSqModelImpl* iovsSqModel_t;
 typedef struct iovsBinaryQuantizerImpl* iovsBinaryQuantizer_t;
+typedef struct iovsSpectralEmbedImpl* iovsSpectralEmbed_t;
+typedef struct iovsBatcherImpl* iovsBatcher_t;
 
 IOVS_API const char* iovsGetVersion(void);
 IOVS_API const char* iovsStatusString(iovsStatus status);
@@ -75,6 +83,8 @@ IOVS_API iovsStatus iovsResourcesSku(iovsResources_t res, char* buf, int32_t len
 IOVS_API iovsStatus iovsResourcesNpuCompileFails(iovsResources_t res, int32_t* count);
 IOVS_API iovsStatus iovsResourcesNpuFallbacks(iovsResources_t res, int32_t* count);
 IOVS_API iovsStatus iovsResourcesLastDevice(iovsResources_t res, iovsDevice* device);
+IOVS_API iovsStatus iovsResourcesSetNpuBusy(iovsResources_t res, int32_t busy);
+IOVS_API int32_t iovsSyclEnabled(void);
 
 IOVS_API void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,
                                     float* val);
@@ -99,6 +109,9 @@ IOVS_API iovsStatus iovsKSelection(iovsResources_t res, const float* scores, int
 /* Brute-force */
 IOVS_API iovsStatus iovsBruteForceBuild(iovsResources_t res, const float* dataset, int64_t n,
                                         int64_t dim, iovsMetric metric, iovsBruteForceIndex_t* index);
+IOVS_API iovsStatus iovsBruteForceBuildTyped(iovsResources_t res, const void* dataset, int64_t n,
+                                             int64_t dim, iovsMetric metric, iovsDType dtype,
+                                             iovsBruteForceIndex_t* index);
 IOVS_API iovsStatus iovsBruteForceSearch(iovsResources_t res, iovsBruteForceIndex_t index,
                                          const float* queries, int64_t nq, int64_t k,
                                          const uint8_t* bitset, int64_t* neighbors, float* distances);
@@ -110,6 +123,11 @@ IOVS_API iovsStatus iovsIvfFlatBuild(iovsResources_t res, const float* dataset, 
 IOVS_API iovsStatus iovsIvfFlatSearch(iovsResources_t res, iovsIvfFlatIndex_t index,
                                       const float* queries, int64_t nq, int64_t k, int32_t nprobe,
                                       const uint8_t* bitset, int64_t* neighbors, float* distances);
+IOVS_API iovsStatus iovsIvfFlatSerialize(iovsIvfFlatIndex_t index, const char* path);
+IOVS_API iovsStatus iovsIvfFlatDeserialize(iovsResources_t res, const char* path,
+                                           iovsIvfFlatIndex_t* index);
+IOVS_API iovsStatus iovsIvfFlatExtend(iovsResources_t res, iovsIvfFlatIndex_t index, const float* extra,
+                                      int64_t nextra);
 IOVS_API iovsStatus iovsIvfFlatDestroy(iovsIvfFlatIndex_t index);
 
 /* IVF-PQ */
@@ -142,10 +160,19 @@ IOVS_API iovsStatus iovsNnDescentDestroy(iovsNnDescentGraph_t graph);
 IOVS_API iovsStatus iovsCagraBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
                                    iovsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
                                    iovsCagraIndex_t* index);
+IOVS_API iovsStatus iovsCagraBuildEx(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                                     iovsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
+                                     iovsCagraBuildAlgo algo, iovsCagraIndex_t* index);
 IOVS_API iovsStatus iovsCagraSearch(iovsResources_t res, iovsCagraIndex_t index, const float* queries,
                                     int64_t nq, int64_t k, int32_t itopk_size, int32_t search_width,
                                     const uint8_t* bitset, int64_t* neighbors, float* distances);
+IOVS_API iovsStatus iovsCagraQuantize(iovsResources_t res, iovsCagraIndex_t index, int32_t pq_m,
+                                      int32_t pq_nbits);
+IOVS_API iovsStatus iovsCagraDetachDataset(iovsCagraIndex_t index);
+IOVS_API iovsStatus iovsCagraAttachDataset(iovsCagraIndex_t index, const float* dataset, int64_t n,
+                                           int64_t dim);
 IOVS_API iovsStatus iovsCagraSerialize(iovsCagraIndex_t index, const char* path);
+IOVS_API iovsStatus iovsCagraSerializeEx(iovsCagraIndex_t index, const char* path, int32_t include_dataset);
 IOVS_API iovsStatus iovsCagraDeserialize(iovsResources_t res, const char* path, iovsCagraIndex_t* index);
 IOVS_API iovsStatus iovsCagraExtend(iovsResources_t res, iovsCagraIndex_t index, const float* extra,
                                     int64_t nextra);
@@ -156,6 +183,7 @@ IOVS_API iovsStatus iovsHnswFromCagra(iovsResources_t res, iovsCagraIndex_t cagr
 IOVS_API iovsStatus iovsHnswSearch(iovsResources_t res, iovsHnswIndex_t index, const float* queries,
                                    int64_t nq, int64_t k, int32_t ef, int64_t* neighbors, float* distances);
 IOVS_API iovsStatus iovsHnswSerialize(iovsHnswIndex_t index, const char* path);
+IOVS_API iovsStatus iovsHnswDeserialize(iovsResources_t res, const char* path, iovsHnswIndex_t* index);
 IOVS_API iovsStatus iovsHnswDestroy(iovsHnswIndex_t index);
 
 /* Vamana */
@@ -165,6 +193,9 @@ IOVS_API iovsStatus iovsVamanaBuild(iovsResources_t res, const float* dataset, i
 IOVS_API iovsStatus iovsVamanaSearch(iovsResources_t res, iovsVamanaIndex_t index, const float* queries,
                                      int64_t nq, int64_t k, int32_t beam, const uint8_t* bitset,
                                      int64_t* neighbors, float* distances);
+IOVS_API iovsStatus iovsVamanaSerialize(iovsVamanaIndex_t index, const char* path);
+IOVS_API iovsStatus iovsVamanaDeserialize(iovsResources_t res, const char* path, iovsVamanaIndex_t* index);
+IOVS_API iovsStatus iovsVamanaMmap(iovsResources_t res, const char* path, iovsVamanaIndex_t* index);
 IOVS_API iovsStatus iovsVamanaDestroy(iovsVamanaIndex_t index);
 
 /* ScaNN-like */
@@ -222,6 +253,20 @@ IOVS_API iovsStatus iovsPcaFit(iovsResources_t res, const float* dataset, int64_
                                int32_t ncomp, iovsPcaModel_t* model);
 IOVS_API iovsStatus iovsPcaTransform(iovsPcaModel_t model, const float* x, int64_t n, float* out);
 IOVS_API iovsStatus iovsPcaDestroy(iovsPcaModel_t model);
+
+/* Spectral embedding (preprocess); SpectralFit remains clustering on the embedding. */
+IOVS_API iovsStatus iovsSpectralEmbedFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                                         int32_t ncomp, int32_t knn, iovsSpectralEmbed_t* model);
+IOVS_API iovsStatus iovsSpectralEmbedData(iovsSpectralEmbed_t model, const float** data, int64_t* n,
+                                          int32_t* ncomp);
+IOVS_API iovsStatus iovsSpectralEmbedDestroy(iovsSpectralEmbed_t model);
+
+/* Dynamic batcher over a brute-force index: coalesces small queries up to max_batch / max_wait_ms. */
+IOVS_API iovsStatus iovsBatcherCreate(iovsResources_t res, iovsBruteForceIndex_t index, int32_t max_batch,
+                                      int32_t max_wait_ms, iovsBatcher_t* out);
+IOVS_API iovsStatus iovsBatcherSearch(iovsBatcher_t batcher, const float* queries, int64_t nq, int64_t k,
+                                      int64_t* neighbors, float* distances);
+IOVS_API iovsStatus iovsBatcherDestroy(iovsBatcher_t batcher);
 
 #ifdef __cplusplus
 }

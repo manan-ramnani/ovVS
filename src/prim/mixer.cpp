@@ -25,7 +25,7 @@ iovsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elem
   const bool npu_shaped =
       std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0 ||
       std::strcmp(op, "topk") == 0 || std::strcmp(op, "gather") == 0;
-  if (r.npu_available && npu_shaped && flops_or_elems >= 256 * 256 * 32) {
+  if (r.npu_available && !r.npu_busy && npu_shaped && flops_or_elems >= 256 * 256 * 32) {
     return IOVS_DEVICE_NPU;
   }
   if (r.gpu_available && flops_or_elems >= 64 * 64) {
@@ -144,6 +144,108 @@ iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, in
   }
   cpu_pairwise(metric, x, nx, y, ny, dim, out, metric_arg);
   r.last_device = IOVS_DEVICE_CPU;
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                           iovsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
+                           int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
+                           const uint8_t* bitset, int64_t* neighbors, float* distances) {
+  if (r.policy != IOVS_POLICY_FORCE_CPU && r.policy != IOVS_POLICY_FORCE_NPU) {
+    if (gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width,
+                       bitset, neighbors, distances)) {
+      r.last_device = IOVS_DEVICE_GPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_GPU && !gpu_available()) return IOVS_STATUS_DEVICE_UNAVAILABLE;
+  }
+
+  itopk = std::max(itopk, static_cast<int32_t>(k));
+  search_width = std::max(1, search_width);
+  struct Node {
+    float d;
+    int64_t id;
+  };
+  auto score_ids = [&](const float* query, const std::vector<int64_t>& ids, std::vector<float>& sc) -> iovsStatus {
+    if (ids.empty()) return IOVS_STATUS_SUCCESS;
+    std::vector<float> gathered(ids.size() * static_cast<size_t>(dim));
+    sc.assign(ids.size(), kInf);
+    const iovsStatus gs =
+        prim_gather_rows(r, dataset, n, dim, ids.data(), static_cast<int64_t>(ids.size()), gathered.data());
+    if (gs != IOVS_STATUS_SUCCESS) return gs;
+    return prim_pairwise(r, metric, query, 1, gathered.data(), static_cast<int64_t>(ids.size()), dim,
+                         sc.data(), 2.f);
+  };
+  for (int64_t q = 0; q < nq; ++q) {
+    const float* query = queries + q * dim;
+    std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
+    std::vector<char> expanded(static_cast<size_t>(n), 0);
+    std::vector<Node> cand;
+    std::vector<int64_t> seed_ids;
+    const int64_t nseeds = std::min<int64_t>(search_width, n);
+    for (int64_t s = 0; s < nseeds; ++s) {
+      int64_t id = (s * 9973 + q * 13) % n;
+      if (!allowed(bitset, id) || seen[static_cast<size_t>(id)]) continue;
+      seen[static_cast<size_t>(id)] = 1;
+      seed_ids.push_back(id);
+    }
+    std::vector<float> seed_sc;
+    const iovsStatus ss = score_ids(query, seed_ids, seed_sc);
+    if (ss != IOVS_STATUS_SUCCESS) return ss;
+    for (size_t i = 0; i < seed_ids.size(); ++i) cand.push_back({seed_sc[i], seed_ids[i]});
+    if (cand.empty()) {
+      for (int64_t t = 0; t < k; ++t) {
+        neighbors[q * k + t] = -1;
+        distances[q * k + t] = kInf;
+      }
+      continue;
+    }
+    int iters = 0;
+    const int max_iters = std::max(24, itopk * 6);
+    while (iters++ < max_iters) {
+      int64_t pick = -1;
+      float pick_d = kInf;
+      for (const auto& c : cand) {
+        if (!expanded[static_cast<size_t>(c.id)] && c.d < pick_d) {
+          pick_d = c.d;
+          pick = c.id;
+        }
+      }
+      if (pick < 0) break;
+      expanded[static_cast<size_t>(pick)] = 1;
+      std::vector<int64_t> batch;
+      const int32_t* nbrs = graph + pick * degree;
+      for (int32_t e = 0; e < degree; ++e) {
+        const int32_t nb = nbrs[e];
+        if (nb < 0 || static_cast<int64_t>(nb) >= n) continue;
+        if (seen[static_cast<size_t>(nb)]) continue;
+        if (!allowed(bitset, nb)) continue;
+        seen[static_cast<size_t>(nb)] = 1;
+        batch.push_back(nb);
+      }
+      std::vector<float> bsc;
+      const iovsStatus bs = score_ids(query, batch, bsc);
+      if (bs != IOVS_STATUS_SUCCESS) return bs;
+      for (size_t i = 0; i < batch.size(); ++i) cand.push_back({bsc[i], batch[i]});
+      if (static_cast<int32_t>(cand.size()) > itopk * 4) {
+        std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
+                         [](const Node& a, const Node& b) { return a.d < b.d; });
+        cand.resize(static_cast<size_t>(itopk));
+      }
+    }
+    std::sort(cand.begin(), cand.end(), [](const Node& a, const Node& b) { return a.d < b.d; });
+    for (int64_t t = 0; t < k; ++t) {
+      if (t < static_cast<int64_t>(cand.size())) {
+        neighbors[q * k + t] = cand[static_cast<size_t>(t)].id;
+        float d = cand[static_cast<size_t>(t)].d;
+        if (metric == IOVS_METRIC_INNER_PRODUCT) d = -d;
+        distances[q * k + t] = d;
+      } else {
+        neighbors[q * k + t] = -1;
+        distances[q * k + t] = kInf;
+      }
+    }
+  }
   return IOVS_STATUS_SUCCESS;
 }
 

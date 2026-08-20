@@ -44,6 +44,12 @@ struct CagraIndex {
   Dataset ds;
   int32_t degree = 0;
   std::vector<int32_t> graph;
+  bool has_dataset = true;
+  int32_t pq_m = 0;
+  int32_t pq_ks = 0;
+  int32_t dsub = 0;
+  std::vector<float> codebooks;
+  std::vector<uint8_t> codes;
 };
 
 struct HnswIndex {
@@ -59,6 +65,18 @@ struct VamanaIndex {
   Dataset ds;
   int32_t degree = 0;
   std::vector<int32_t> graph;
+  const int32_t* graph_view = nullptr;
+  const float* x_view = nullptr;
+  bool mmapped = false;
+#ifdef _WIN32
+  HANDLE file_handle = INVALID_HANDLE_VALUE;
+  HANDLE map_handle = nullptr;
+  void* view = nullptr;
+#else
+  int fd = -1;
+  void* view = nullptr;
+  size_t map_size = 0;
+#endif
 };
 
 struct ScannIndex {
@@ -225,42 +243,63 @@ void graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim
                   const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                   int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                   float* distances) {
+  prim_graph_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width, bitset,
+                  neighbors, distances);
+}
+
+void pq_encode_rows(const float* x, int64_t n, int64_t dim, int32_t pq_m, int32_t ks, int32_t dsub,
+                    const float* codebooks, uint8_t* codes) {
+  for (int64_t i = 0; i < n; ++i) {
+    for (int32_t m = 0; m < pq_m; ++m) {
+      const float* sub = x + i * dim + static_cast<int64_t>(m) * dsub;
+      const float* cb = codebooks + static_cast<size_t>(m) * ks * dsub;
+      int best = 0;
+      float bd = kInf;
+      for (int32_t c = 0; c < ks; ++c) {
+        const float d = l2sq(sub, cb + c * dsub, dsub);
+        if (d < bd) {
+          bd = d;
+          best = c;
+        }
+      }
+      codes[i * pq_m + m] = static_cast<uint8_t>(best);
+    }
+  }
+}
+
+float pq_adc(const float* query, int64_t dim, const uint8_t* code, int32_t pq_m, int32_t ks, int32_t dsub,
+             const float* codebooks) {
+  float s = 0.f;
+  for (int32_t m = 0; m < pq_m; ++m) {
+    const float* sub = query + static_cast<int64_t>(m) * dsub;
+    const float* cb = codebooks + (static_cast<size_t>(m) * ks + code[m]) * dsub;
+    s += l2sq(sub, cb, dsub);
+  }
+  (void)dim;
+  return s;
+}
+
+void graph_search_pq(const float* query_ds, int64_t n, int64_t dim, const int32_t* graph, int32_t degree,
+                     const uint8_t* codes, int32_t pq_m, int32_t ks, int32_t dsub, const float* codebooks,
+                     const float* queries, int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
+                     const uint8_t* bitset, int64_t* neighbors, float* distances) {
   itopk = std::max(itopk, static_cast<int32_t>(k));
   search_width = std::max(1, search_width);
   struct Node {
     float d;
     int64_t id;
   };
-  auto score_ids = [&](const float* query, const std::vector<int64_t>& ids, std::vector<float>& sc) {
-    if (ids.empty()) return;
-    std::vector<float> gathered(ids.size() * static_cast<size_t>(dim));
-    sc.assign(ids.size(), kInf);
-    prim_gather_rows(r, dataset, n, dim, ids.data(), static_cast<int64_t>(ids.size()), gathered.data());
-    prim_pairwise(r, metric, query, 1, gathered.data(), static_cast<int64_t>(ids.size()), dim, sc.data(),
-                  2.f);
-  };
   for (int64_t q = 0; q < nq; ++q) {
     const float* query = queries + q * dim;
     std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
     std::vector<char> expanded(static_cast<size_t>(n), 0);
     std::vector<Node> cand;
-    std::vector<int64_t> seed_ids;
     const int64_t nseeds = std::min<int64_t>(search_width, n);
     for (int64_t s = 0; s < nseeds; ++s) {
       int64_t id = (s * 9973 + q * 13) % n;
       if (!allowed(bitset, id) || seen[static_cast<size_t>(id)]) continue;
       seen[static_cast<size_t>(id)] = 1;
-      seed_ids.push_back(id);
-    }
-    std::vector<float> seed_sc;
-    score_ids(query, seed_ids, seed_sc);
-    for (size_t i = 0; i < seed_ids.size(); ++i) cand.push_back({seed_sc[i], seed_ids[i]});
-    if (cand.empty()) {
-      for (int64_t t = 0; t < k; ++t) {
-        neighbors[q * k + t] = -1;
-        distances[q * k + t] = kInf;
-      }
-      continue;
+      cand.push_back({pq_adc(query, dim, codes + id * pq_m, pq_m, ks, dsub, codebooks), id});
     }
     int iters = 0;
     const int max_iters = std::max(24, itopk * 6);
@@ -275,7 +314,6 @@ void graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim
       }
       if (pick < 0) break;
       expanded[static_cast<size_t>(pick)] = 1;
-      std::vector<int64_t> batch;
       const int32_t* nbrs = graph + pick * degree;
       for (int32_t e = 0; e < degree; ++e) {
         const int32_t nb = nbrs[e];
@@ -283,11 +321,9 @@ void graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim
         if (seen[static_cast<size_t>(nb)]) continue;
         if (!allowed(bitset, nb)) continue;
         seen[static_cast<size_t>(nb)] = 1;
-        batch.push_back(nb);
+        cand.push_back({pq_adc(query, dim, codes + static_cast<int64_t>(nb) * pq_m, pq_m, ks, dsub, codebooks),
+                        nb});
       }
-      std::vector<float> bsc;
-      score_ids(query, batch, bsc);
-      for (size_t i = 0; i < batch.size(); ++i) cand.push_back({bsc[i], batch[i]});
       if (static_cast<int32_t>(cand.size()) > itopk * 4) {
         std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
                          [](const Node& a, const Node& b) { return a.d < b.d; });
@@ -298,14 +334,101 @@ void graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim
     for (int64_t t = 0; t < k; ++t) {
       if (t < static_cast<int64_t>(cand.size())) {
         neighbors[q * k + t] = cand[static_cast<size_t>(t)].id;
-        float d = cand[static_cast<size_t>(t)].d;
-        if (metric == IOVS_METRIC_INNER_PRODUCT) d = -d;
-        distances[q * k + t] = d;
+        distances[q * k + t] = cand[static_cast<size_t>(t)].d;
       } else {
         neighbors[q * k + t] = -1;
         distances[q * k + t] = kInf;
       }
     }
+  }
+  (void)query_ds;
+}
+
+void cagra_init_ivfpq(ResourcesData& r, const float* x, int64_t n, int64_t dim, iovsMetric metric,
+                      int32_t degree, std::vector<int32_t>& graph) {
+  iovsIvfPqIndex_t pq = nullptr;
+  const int32_t nlist = std::max(2, std::min(8, static_cast<int32_t>(n / 4)));
+  int32_t pq_m = 1;
+  for (int32_t c = std::min(4, static_cast<int32_t>(dim)); c >= 1; --c) {
+    if (dim % c == 0) {
+      pq_m = c;
+      break;
+    }
+  }
+  auto* res = reinterpret_cast<iovsResources_t>(&r);
+  if (iovsIvfPqBuild(res, x, n, dim, metric, nlist, pq_m, 8, &pq) != IOVS_STATUS_SUCCESS) {
+    nndescent_build(r, x, n, dim, metric, degree, 6, graph);
+    return;
+  }
+  graph.assign(static_cast<size_t>(n) * static_cast<size_t>(degree), -1);
+  std::vector<int64_t> nb(static_cast<size_t>(degree) + 1);
+  std::vector<float> ds(static_cast<size_t>(degree) + 1);
+  for (int64_t i = 0; i < n; ++i) {
+    iovsIvfPqSearch(res, pq, x + i * dim, 1, degree + 1, nlist, static_cast<int32_t>(degree) + 1, nullptr,
+                    nb.data(), ds.data());
+    int filled = 0;
+    for (int32_t t = 0; t < degree + 1 && filled < degree; ++t) {
+      if (nb[static_cast<size_t>(t)] == i || nb[static_cast<size_t>(t)] < 0) continue;
+      graph[static_cast<size_t>(i * degree + filled)] = static_cast<int32_t>(nb[static_cast<size_t>(t)]);
+      ++filled;
+    }
+  }
+  iovsIvfPqDestroy(pq);
+}
+
+void cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int64_t dim, iovsMetric metric,
+                          int32_t degree, std::vector<int32_t>& graph) {
+  nndescent_build(r, x, n, dim, metric, degree, 4, graph);
+  std::vector<int32_t> next = graph;
+  std::vector<int64_t> nb(static_cast<size_t>(degree));
+  std::vector<float> ds(static_cast<size_t>(degree));
+  for (int it = 0; it < 2; ++it) {
+    for (int64_t i = 0; i < n; ++i) {
+      graph_search(r, x, n, dim, metric, graph.data(), degree, x + i * dim, 1, degree, degree * 2, 2,
+                   nullptr, nb.data(), ds.data());
+      int filled = 0;
+      for (int32_t t = 0; t < degree && filled < degree; ++t) {
+        if (nb[static_cast<size_t>(t)] == i || nb[static_cast<size_t>(t)] < 0) continue;
+        next[static_cast<size_t>(i * degree + filled)] = static_cast<int32_t>(nb[static_cast<size_t>(t)]);
+        ++filled;
+      }
+      while (filled < degree) {
+        next[static_cast<size_t>(i * degree + filled)] = -1;
+        ++filled;
+      }
+    }
+    graph.swap(next);
+  }
+}
+
+void robust_prune(const float* x, int64_t dim, iovsMetric metric, int64_t p, std::vector<int32_t>& cand,
+                  int32_t degree, float alpha, int32_t* out_row);
+
+void cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec) {
+  const int64_t old_n = ix->ds.n;
+  const int64_t dim = ix->ds.dim;
+  ix->ds.x.insert(ix->ds.x.end(), vec, vec + dim);
+  ix->ds.n = old_n + 1;
+  std::vector<int64_t> nb(static_cast<size_t>(ix->degree));
+  std::vector<float> ds(static_cast<size_t>(ix->degree));
+  graph_search(r, ix->ds.x.data(), old_n, dim, ix->ds.metric, ix->graph.data(), ix->degree, vec, 1,
+               ix->degree, ix->degree * 2, 2, nullptr, nb.data(), ds.data());
+  ix->graph.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree), -1);
+  for (int32_t t = 0; t < ix->degree; ++t) {
+    ix->graph[static_cast<size_t>(old_n * ix->degree + t)] =
+        t < static_cast<int32_t>(nb.size()) ? static_cast<int32_t>(nb[static_cast<size_t>(t)]) : -1;
+  }
+  for (int32_t t = 0; t < ix->degree; ++t) {
+    const int32_t u = ix->graph[static_cast<size_t>(old_n * ix->degree + t)];
+    if (u < 0) continue;
+    std::vector<int32_t> cand;
+    for (int32_t e = 0; e < ix->degree; ++e) {
+      const int32_t v = ix->graph[static_cast<size_t>(static_cast<int64_t>(u) * ix->degree + e)];
+      if (v >= 0) cand.push_back(v);
+    }
+    cand.push_back(static_cast<int32_t>(old_n));
+    robust_prune(ix->ds.x.data(), dim, ix->ds.metric, u, cand, ix->degree, 1.2f,
+                 ix->graph.data() + static_cast<int64_t>(u) * ix->degree);
   }
 }
 
@@ -481,20 +604,34 @@ iovsStatus iovsNnDescentDestroy(iovsNnDescentGraph_t graph) {
   return IOVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsCagraBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                          iovsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
-                          iovsCagraIndex_t* index) {
+iovsStatus iovsCagraBuildEx(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                            iovsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
+                            iovsCagraBuildAlgo algo, iovsCagraIndex_t* index) {
   if (!res || !dataset || !index || n <= 1 || dim <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
   graph_degree = std::max(1, std::min(graph_degree, static_cast<int32_t>(n - 1)));
   intermediate_degree = std::max(graph_degree, std::min(intermediate_degree, static_cast<int32_t>(n - 1)));
   auto* ix = new CagraIndex();
   copy_ds(ix->ds, dataset, n, dim, metric);
   ix->degree = graph_degree;
+  ix->has_dataset = true;
   std::vector<int32_t> init;
-  nndescent_build(*rd(res), dataset, n, dim, metric, intermediate_degree, 6, init);
+  if (algo == IOVS_CAGRA_BUILD_IVF_PQ) {
+    cagra_init_ivfpq(*rd(res), dataset, n, dim, metric, intermediate_degree, init);
+  } else if (algo == IOVS_CAGRA_BUILD_ITERATIVE) {
+    cagra_init_iterative(*rd(res), dataset, n, dim, metric, intermediate_degree, init);
+  } else {
+    nndescent_build(*rd(res), dataset, n, dim, metric, intermediate_degree, 6, init);
+  }
   prune_graph(dataset, n, dim, metric, init.data(), intermediate_degree, graph_degree, ix->graph);
   *index = reinterpret_cast<iovsCagraIndex_t>(ix);
   return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsCagraBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                          iovsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
+                          iovsCagraIndex_t* index) {
+  return iovsCagraBuildEx(res, dataset, n, dim, metric, graph_degree, intermediate_degree,
+                          IOVS_CAGRA_BUILD_NN_DESCENT, index);
 }
 
 iovsStatus iovsCagraSearch(iovsResources_t res, iovsCagraIndex_t index, const float* queries,
@@ -502,19 +639,60 @@ iovsStatus iovsCagraSearch(iovsResources_t res, iovsCagraIndex_t index, const fl
                            const uint8_t* bitset, int64_t* neighbors, float* distances) {
   if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
-  graph_search(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
-               ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
-  return IOVS_STATUS_SUCCESS;
+  if (ix->pq_m > 0 && !ix->codes.empty()) {
+    graph_search_pq(ix->ds.x.empty() ? nullptr : ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->graph.data(),
+                    ix->degree, ix->codes.data(), ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
+                    queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
+    if (ix->has_dataset && !ix->ds.x.empty()) {
+      const int64_t dim = ix->ds.dim;
+      for (int64_t q = 0; q < nq; ++q) {
+        std::vector<int64_t> cand(static_cast<size_t>(k));
+        int64_t nc = 0;
+        for (int64_t t = 0; t < k; ++t) {
+          if (neighbors[q * k + t] >= 0) cand[static_cast<size_t>(nc++)] = neighbors[q * k + t];
+        }
+        if (nc == 0) continue;
+        std::vector<float> gathered(static_cast<size_t>(nc) * static_cast<size_t>(dim));
+        prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim, cand.data(), nc, gathered.data());
+        std::vector<float> sc(static_cast<size_t>(nc));
+        prim_pairwise(*rd(res), ix->ds.metric, queries + q * dim, 1, gathered.data(), nc, dim, sc.data(),
+                      2.f);
+        std::vector<int64_t> fi(static_cast<size_t>(nc));
+        std::vector<float> fv(static_cast<size_t>(nc));
+        prim_topk(*rd(res), sc.data(), 1, nc, nc, fi.data(), fv.data(), metric_largest(ix->ds.metric));
+        for (int64_t t = 0; t < k; ++t) {
+          if (t < nc) {
+            neighbors[q * k + t] = cand[static_cast<size_t>(fi[static_cast<size_t>(t)])];
+            float d = fv[static_cast<size_t>(t)];
+            if (ix->ds.metric == IOVS_METRIC_INNER_PRODUCT) d = -d;
+            distances[q * k + t] = d;
+          } else {
+            neighbors[q * k + t] = -1;
+            distances[q * k + t] = kInf;
+          }
+        }
+      }
+    }
+    return IOVS_STATUS_SUCCESS;
+  }
+  if (!ix->has_dataset || ix->ds.x.empty()) return IOVS_STATUS_INVALID_ARGUMENT;
+  return prim_graph_walk(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+                         ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors,
+                         distances);
 }
 
-iovsStatus iovsCagraSerialize(iovsCagraIndex_t index, const char* path) {
+iovsStatus iovsCagraSerializeEx(iovsCagraIndex_t index, const char* path, int32_t include_dataset) {
   if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
   std::ofstream f(path, std::ios::binary);
   if (!f) return IOVS_STATUS_IO;
   f.write(reinterpret_cast<const char*>(&kCagraMagic), 4);
-  int32_t ver = 1;
+  int32_t ver = 2;
   f.write(reinterpret_cast<const char*>(&ver), 4);
+  int32_t flags = 0;
+  if (include_dataset && ix->has_dataset && !ix->ds.x.empty()) flags |= 1;
+  if (ix->pq_m > 0 && !ix->codes.empty()) flags |= 2;
+  f.write(reinterpret_cast<const char*>(&flags), 4);
   f.write(reinterpret_cast<const char*>(&ix->ds.n), 8);
   f.write(reinterpret_cast<const char*>(&ix->ds.dim), 8);
   f.write(reinterpret_cast<const char*>(&ix->degree), 4);
@@ -522,9 +700,24 @@ iovsStatus iovsCagraSerialize(iovsCagraIndex_t index, const char* path) {
   f.write(reinterpret_cast<const char*>(&metric), 4);
   f.write(reinterpret_cast<const char*>(ix->graph.data()),
           static_cast<std::streamsize>(ix->graph.size() * sizeof(int32_t)));
-  f.write(reinterpret_cast<const char*>(ix->ds.x.data()),
-          static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  if (flags & 1) {
+    f.write(reinterpret_cast<const char*>(ix->ds.x.data()),
+            static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  }
+  if (flags & 2) {
+    f.write(reinterpret_cast<const char*>(&ix->pq_m), 4);
+    f.write(reinterpret_cast<const char*>(&ix->pq_ks), 4);
+    f.write(reinterpret_cast<const char*>(&ix->dsub), 4);
+    f.write(reinterpret_cast<const char*>(ix->codebooks.data()),
+            static_cast<std::streamsize>(ix->codebooks.size() * sizeof(float)));
+    f.write(reinterpret_cast<const char*>(ix->codes.data()),
+            static_cast<std::streamsize>(ix->codes.size()));
+  }
   return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+}
+
+iovsStatus iovsCagraSerialize(iovsCagraIndex_t index, const char* path) {
+  return iovsCagraSerializeEx(index, path, 1);
 }
 
 iovsStatus iovsCagraDeserialize(iovsResources_t res, const char* path, iovsCagraIndex_t* index) {
@@ -537,6 +730,8 @@ iovsStatus iovsCagraDeserialize(iovsResources_t res, const char* path, iovsCagra
   int32_t ver = 0;
   f.read(reinterpret_cast<char*>(&ver), 4);
   auto* ix = new CagraIndex();
+  int32_t flags = 1;
+  if (ver >= 2) f.read(reinterpret_cast<char*>(&flags), 4);
   f.read(reinterpret_cast<char*>(&ix->ds.n), 8);
   f.read(reinterpret_cast<char*>(&ix->ds.dim), 8);
   f.read(reinterpret_cast<char*>(&ix->degree), 4);
@@ -544,11 +739,26 @@ iovsStatus iovsCagraDeserialize(iovsResources_t res, const char* path, iovsCagra
   f.read(reinterpret_cast<char*>(&metric), 4);
   ix->ds.metric = static_cast<iovsMetric>(metric);
   ix->graph.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree));
-  ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
   f.read(reinterpret_cast<char*>(ix->graph.data()),
          static_cast<std::streamsize>(ix->graph.size() * sizeof(int32_t)));
-  f.read(reinterpret_cast<char*>(ix->ds.x.data()),
-         static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  if (flags & 1) {
+    ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
+    f.read(reinterpret_cast<char*>(ix->ds.x.data()),
+           static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+    ix->has_dataset = true;
+  } else {
+    ix->has_dataset = false;
+  }
+  if (flags & 2) {
+    f.read(reinterpret_cast<char*>(&ix->pq_m), 4);
+    f.read(reinterpret_cast<char*>(&ix->pq_ks), 4);
+    f.read(reinterpret_cast<char*>(&ix->dsub), 4);
+    ix->codebooks.resize(static_cast<size_t>(ix->pq_m) * ix->pq_ks * ix->dsub);
+    ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+    f.read(reinterpret_cast<char*>(ix->codebooks.data()),
+           static_cast<std::streamsize>(ix->codebooks.size() * sizeof(float)));
+    f.read(reinterpret_cast<char*>(ix->codes.data()), static_cast<std::streamsize>(ix->codes.size()));
+  }
   if (!f) {
     delete ix;
     return IOVS_STATUS_IO;
@@ -561,16 +771,58 @@ iovsStatus iovsCagraExtend(iovsResources_t res, iovsCagraIndex_t index, const fl
                            int64_t nextra) {
   if (!res || !index || !extra || nextra <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
-  const int64_t old_n = ix->ds.n;
+  if (!ix->has_dataset || ix->ds.x.empty()) return IOVS_STATUS_INVALID_ARGUMENT;
   const int64_t dim = ix->ds.dim;
-  ix->ds.x.insert(ix->ds.x.end(), extra, extra + nextra * dim);
-  ix->ds.n += nextra;
-  std::vector<int32_t> rebuilt;
-  nndescent_build(*rd(res), ix->ds.x.data(), ix->ds.n, dim, ix->ds.metric,
-                  std::max(ix->degree * 2, ix->degree), 4, rebuilt);
-  prune_graph(ix->ds.x.data(), ix->ds.n, dim, ix->ds.metric, rebuilt.data(),
-              std::max(ix->degree * 2, ix->degree), ix->degree, ix->graph);
-  (void)old_n;
+  for (int64_t i = 0; i < nextra; ++i) cagra_insert_one(ix, *rd(res), extra + i * dim);
+  if (ix->pq_m > 0) {
+    ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+    pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
+                   ix->codes.data());
+  }
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsCagraQuantize(iovsResources_t res, iovsCagraIndex_t index, int32_t pq_m, int32_t pq_nbits) {
+  if (!res || !index || pq_m <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  if (!ix->has_dataset || ix->ds.x.empty()) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (ix->ds.dim % pq_m != 0) return IOVS_STATUS_SHAPE_MISMATCH;
+  ix->pq_m = pq_m;
+  ix->pq_ks = 1 << std::min(std::max(pq_nbits, 4), 8);
+  ix->dsub = static_cast<int32_t>(ix->ds.dim / pq_m);
+  ix->codebooks.assign(static_cast<size_t>(ix->pq_m) * ix->pq_ks * ix->dsub, 0.f);
+  std::vector<float> sub(static_cast<size_t>(ix->ds.n) * ix->dsub);
+  for (int32_t m = 0; m < ix->pq_m; ++m) {
+    for (int64_t i = 0; i < ix->ds.n; ++i) {
+      std::memcpy(sub.data() + i * ix->dsub, ix->ds.x.data() + i * ix->ds.dim + static_cast<int64_t>(m) * ix->dsub,
+                  static_cast<size_t>(ix->dsub) * sizeof(float));
+    }
+    std::vector<float> cents;
+    kmeans_fit_impl(*rd(res), sub.data(), ix->ds.n, ix->dsub, ix->pq_ks, 8, cents);
+    std::memcpy(ix->codebooks.data() + static_cast<size_t>(m) * ix->pq_ks * ix->dsub, cents.data(),
+                cents.size() * sizeof(float));
+  }
+  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+  pq_encode_rows(ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
+                 ix->codes.data());
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsCagraDetachDataset(iovsCagraIndex_t index) {
+  if (!index) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  ix->ds.x.clear();
+  ix->ds.x.shrink_to_fit();
+  ix->has_dataset = false;
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsCagraAttachDataset(iovsCagraIndex_t index, const float* dataset, int64_t n, int64_t dim) {
+  if (!index || !dataset || n <= 0 || dim <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  if (n != ix->ds.n || dim != ix->ds.dim) return IOVS_STATUS_SHAPE_MISMATCH;
+  ix->ds.x.assign(dataset, dataset + n * dim);
+  ix->has_dataset = true;
   return IOVS_STATUS_SUCCESS;
 }
 
@@ -614,23 +866,126 @@ iovsStatus iovsHnswSearch(iovsResources_t res, iovsHnswIndex_t index, const floa
   return IOVS_STATUS_SUCCESS;
 }
 
+namespace {
+template <typename T>
+void write_pod(std::ostream& f, const T& v) {
+  f.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+template <typename T>
+void read_pod(std::istream& f, T& v) {
+  f.read(reinterpret_cast<char*>(&v), sizeof(T));
+}
+}  // namespace
+
 iovsStatus iovsHnswSerialize(iovsHnswIndex_t index, const char* path) {
+  /* hnswlib Index::saveIndex layout (little-endian host). Documented in docs/devices.md. */
   if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* hx = reinterpret_cast<HnswIndex*>(index);
   std::ofstream f(path, std::ios::binary);
   if (!f) return IOVS_STATUS_IO;
-  const char mag[8] = {'H', 'N', 'S', 'W', 'I', 'O', 'V', 'S'};
-  f.write(mag, 8);
-  f.write(reinterpret_cast<const char*>(&hx->ds.n), 8);
-  f.write(reinterpret_cast<const char*>(&hx->ds.dim), 8);
-  f.write(reinterpret_cast<const char*>(&hx->degree), 4);
-  f.write(reinterpret_cast<const char*>(hx->graph.data()),
-          static_cast<std::streamsize>(hx->graph.size() * sizeof(int32_t)));
-  f.write(reinterpret_cast<const char*>(hx->level.data()),
-          static_cast<std::streamsize>(hx->level.size() * sizeof(int32_t)));
-  f.write(reinterpret_cast<const char*>(hx->ds.x.data()),
-          static_cast<std::streamsize>(hx->ds.x.size() * sizeof(float)));
+  const size_t M = static_cast<size_t>(hx->degree);
+  const size_t maxM0 = M;
+  const size_t maxM = M;
+  const size_t n = static_cast<size_t>(hx->ds.n);
+  const size_t dim = static_cast<size_t>(hx->ds.dim);
+  const size_t size_links_level0 = sizeof(unsigned int) + maxM0 * sizeof(unsigned int);
+  const size_t data_size = dim * sizeof(float);
+  const size_t offsetLevel0 = 0;
+  const size_t offsetData = size_links_level0;
+  const size_t label_offset = size_links_level0 + data_size;
+  const size_t size_data_per_element = label_offset + sizeof(size_t);
+  const int maxlevel = hx->max_level;
+  const unsigned int enter = static_cast<unsigned int>(hx->enter);
+  const double mult = 1.0 / std::log(static_cast<double>(std::max<size_t>(M, 2)));
+  const size_t ef_construction = 200;
+  write_pod(f, offsetLevel0);
+  write_pod(f, n); /* max_elements */
+  write_pod(f, n); /* cur_element_count */
+  write_pod(f, size_data_per_element);
+  write_pod(f, label_offset);
+  write_pod(f, offsetData);
+  write_pod(f, maxlevel);
+  write_pod(f, enter);
+  write_pod(f, maxM);
+  write_pod(f, maxM0);
+  write_pod(f, M);
+  write_pod(f, mult);
+  write_pod(f, ef_construction);
+  std::vector<char> row(size_data_per_element, 0);
+  for (size_t i = 0; i < n; ++i) {
+    std::fill(row.begin(), row.end(), 0);
+    unsigned int links = 0;
+    auto* linkp = reinterpret_cast<unsigned int*>(row.data() + sizeof(unsigned int));
+    for (int32_t t = 0; t < hx->degree; ++t) {
+      const int32_t nb = hx->graph[i * static_cast<size_t>(hx->degree) + static_cast<size_t>(t)];
+      if (nb < 0) continue;
+      linkp[links++] = static_cast<unsigned int>(nb);
+    }
+    std::memcpy(row.data(), &links, sizeof(unsigned int));
+    std::memcpy(row.data() + offsetData, hx->ds.x.data() + i * dim, data_size);
+    const size_t label = i;
+    std::memcpy(row.data() + label_offset, &label, sizeof(size_t));
+    f.write(row.data(), static_cast<std::streamsize>(size_data_per_element));
+  }
+  for (size_t i = 0; i < n; ++i) {
+    const unsigned int linkListSize = 0; /* single-layer CAGRA export */
+    write_pod(f, linkListSize);
+  }
   return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+}
+
+iovsStatus iovsHnswDeserialize(iovsResources_t res, const char* path, iovsHnswIndex_t* index) {
+  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  size_t offsetLevel0 = 0, max_elements = 0, cur = 0, size_data = 0, label_off = 0, offsetData = 0;
+  int maxlevel = 0;
+  unsigned int enter = 0;
+  size_t maxM = 0, maxM0 = 0, M = 0, efc = 0;
+  double mult = 0;
+  read_pod(f, offsetLevel0);
+  read_pod(f, max_elements);
+  read_pod(f, cur);
+  read_pod(f, size_data);
+  read_pod(f, label_off);
+  read_pod(f, offsetData);
+  read_pod(f, maxlevel);
+  read_pod(f, enter);
+  read_pod(f, maxM);
+  read_pod(f, maxM0);
+  read_pod(f, M);
+  read_pod(f, mult);
+  read_pod(f, efc);
+  if (!f || cur == 0 || size_data < offsetData) return IOVS_STATUS_IO;
+  const size_t dim = (label_off > offsetData) ? (label_off - offsetData) / sizeof(float) : 0;
+  if (dim == 0 || dim > 4096) return IOVS_STATUS_IO;
+  auto* hx = new HnswIndex();
+  hx->ds.n = static_cast<int64_t>(cur);
+  hx->ds.dim = static_cast<int64_t>(dim);
+  hx->ds.metric = IOVS_METRIC_L2_EXPANDED;
+  hx->degree = static_cast<int32_t>(maxM0);
+  hx->max_level = maxlevel;
+  hx->enter = enter;
+  hx->graph.assign(cur * maxM0, -1);
+  hx->level.assign(cur, 0);
+  hx->ds.x.resize(cur * dim);
+  std::vector<char> row(size_data);
+  for (size_t i = 0; i < cur; ++i) {
+    f.read(row.data(), static_cast<std::streamsize>(size_data));
+    if (!f) {
+      delete hx;
+      return IOVS_STATUS_IO;
+    }
+    unsigned int links = 0;
+    std::memcpy(&links, row.data(), sizeof(unsigned int));
+    const auto* linkp = reinterpret_cast<const unsigned int*>(row.data() + sizeof(unsigned int));
+    for (unsigned int t = 0; t < links && t < maxM0; ++t) {
+      hx->graph[i * maxM0 + t] = static_cast<int32_t>(linkp[t]);
+    }
+    std::memcpy(hx->ds.x.data() + i * dim, row.data() + offsetData, dim * sizeof(float));
+  }
+  *index = reinterpret_cast<iovsHnswIndex_t>(hx);
+  return IOVS_STATUS_SUCCESS;
 }
 
 iovsStatus iovsHnswDestroy(iovsHnswIndex_t index) {
@@ -668,14 +1023,165 @@ iovsStatus iovsVamanaSearch(iovsResources_t res, iovsVamanaIndex_t index, const 
                             int64_t* neighbors, float* distances) {
   if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<VamanaIndex*>(index);
-  graph_search(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
-               ix->degree, queries, nq, k, std::max(beam, static_cast<int32_t>(k)), 1, bitset, neighbors,
-               distances);
+  const float* x = ix->x_view ? ix->x_view : ix->ds.x.data();
+  const int32_t* g = ix->graph_view ? ix->graph_view : ix->graph.data();
+  return prim_graph_walk(*rd(res), x, ix->ds.n, ix->ds.dim, ix->ds.metric, g, ix->degree, queries, nq, k,
+                         std::max(beam, static_cast<int32_t>(k)), 1, bitset, neighbors, distances);
+}
+
+constexpr uint32_t kVamanaMagic = 0x314D4156u; /* 'VAM1' */
+
+iovsStatus iovsVamanaSerialize(iovsVamanaIndex_t index, const char* path) {
+  if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<VamanaIndex*>(index);
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  f.write(reinterpret_cast<const char*>(&kVamanaMagic), 4);
+  int32_t ver = 1;
+  f.write(reinterpret_cast<const char*>(&ver), 4);
+  f.write(reinterpret_cast<const char*>(&ix->ds.n), 8);
+  f.write(reinterpret_cast<const char*>(&ix->ds.dim), 8);
+  f.write(reinterpret_cast<const char*>(&ix->degree), 4);
+  int32_t metric = static_cast<int32_t>(ix->ds.metric);
+  f.write(reinterpret_cast<const char*>(&metric), 4);
+  const int32_t* g = ix->graph_view ? ix->graph_view : ix->graph.data();
+  const float* x = ix->x_view ? ix->x_view : ix->ds.x.data();
+  f.write(reinterpret_cast<const char*>(g),
+          static_cast<std::streamsize>(static_cast<size_t>(ix->ds.n * ix->degree) * sizeof(int32_t)));
+  f.write(reinterpret_cast<const char*>(x),
+          static_cast<std::streamsize>(static_cast<size_t>(ix->ds.n * ix->ds.dim) * sizeof(float)));
+  return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+}
+
+iovsStatus iovsVamanaDeserialize(iovsResources_t res, const char* path, iovsVamanaIndex_t* index) {
+  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  uint32_t magic = 0;
+  f.read(reinterpret_cast<char*>(&magic), 4);
+  if (magic != kVamanaMagic) return IOVS_STATUS_IO;
+  int32_t ver = 0;
+  f.read(reinterpret_cast<char*>(&ver), 4);
+  auto* ix = new VamanaIndex();
+  f.read(reinterpret_cast<char*>(&ix->ds.n), 8);
+  f.read(reinterpret_cast<char*>(&ix->ds.dim), 8);
+  f.read(reinterpret_cast<char*>(&ix->degree), 4);
+  int32_t metric = 0;
+  f.read(reinterpret_cast<char*>(&metric), 4);
+  ix->ds.metric = static_cast<iovsMetric>(metric);
+  ix->graph.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree));
+  ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
+  f.read(reinterpret_cast<char*>(ix->graph.data()),
+         static_cast<std::streamsize>(ix->graph.size() * sizeof(int32_t)));
+  f.read(reinterpret_cast<char*>(ix->ds.x.data()),
+         static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  if (!f) {
+    delete ix;
+    return IOVS_STATUS_IO;
+  }
+  *index = reinterpret_cast<iovsVamanaIndex_t>(ix);
   return IOVS_STATUS_SUCCESS;
 }
 
+iovsStatus iovsVamanaMmap(iovsResources_t res, const char* path, iovsVamanaIndex_t* index) {
+  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+#ifdef _WIN32
+  HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (fh == INVALID_HANDLE_VALUE) return IOVS_STATUS_IO;
+  LARGE_INTEGER sz;
+  if (!GetFileSizeEx(fh, &sz) || sz.QuadPart < 32) {
+    CloseHandle(fh);
+    return IOVS_STATUS_IO;
+  }
+  HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (!mh) {
+    CloseHandle(fh);
+    return IOVS_STATUS_IO;
+  }
+  void* view = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+  if (!view) {
+    CloseHandle(mh);
+    CloseHandle(fh);
+    return IOVS_STATUS_IO;
+  }
+  const auto* p = static_cast<const uint8_t*>(view);
+  uint32_t magic = 0;
+  std::memcpy(&magic, p, 4);
+  if (magic != kVamanaMagic) {
+    UnmapViewOfFile(view);
+    CloseHandle(mh);
+    CloseHandle(fh);
+    return IOVS_STATUS_IO;
+  }
+  auto* ix = new VamanaIndex();
+  std::memcpy(&ix->ds.n, p + 8, 8);
+  std::memcpy(&ix->ds.dim, p + 16, 8);
+  std::memcpy(&ix->degree, p + 24, 4);
+  int32_t metric = 0;
+  std::memcpy(&metric, p + 28, 4);
+  ix->ds.metric = static_cast<iovsMetric>(metric);
+  const size_t gsz = static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree) * sizeof(int32_t);
+  ix->graph_view = reinterpret_cast<const int32_t*>(p + 32);
+  ix->x_view = reinterpret_cast<const float*>(p + 32 + gsz);
+  ix->mmapped = true;
+  ix->file_handle = fh;
+  ix->map_handle = mh;
+  ix->view = view;
+  *index = reinterpret_cast<iovsVamanaIndex_t>(ix);
+  return IOVS_STATUS_SUCCESS;
+#else
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return IOVS_STATUS_IO;
+  struct stat st {};
+  if (fstat(fd, &st) != 0 || st.st_size < 32) {
+    close(fd);
+    return IOVS_STATUS_IO;
+  }
+  void* view = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+  if (view == MAP_FAILED) {
+    close(fd);
+    return IOVS_STATUS_IO;
+  }
+  const auto* p = static_cast<const uint8_t*>(view);
+  uint32_t magic = 0;
+  std::memcpy(&magic, p, 4);
+  if (magic != kVamanaMagic) {
+    munmap(view, static_cast<size_t>(st.st_size));
+    close(fd);
+    return IOVS_STATUS_IO;
+  }
+  auto* ix = new VamanaIndex();
+  std::memcpy(&ix->ds.n, p + 8, 8);
+  std::memcpy(&ix->ds.dim, p + 16, 8);
+  std::memcpy(&ix->degree, p + 24, 4);
+  int32_t metric = 0;
+  std::memcpy(&metric, p + 28, 4);
+  ix->ds.metric = static_cast<iovsMetric>(metric);
+  const size_t gsz = static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree) * sizeof(int32_t);
+  ix->graph_view = reinterpret_cast<const int32_t*>(p + 32);
+  ix->x_view = reinterpret_cast<const float*>(p + 32 + gsz);
+  ix->mmapped = true;
+  ix->fd = fd;
+  ix->view = view;
+  ix->map_size = static_cast<size_t>(st.st_size);
+  *index = reinterpret_cast<iovsVamanaIndex_t>(ix);
+  return IOVS_STATUS_SUCCESS;
+#endif
+}
+
 iovsStatus iovsVamanaDestroy(iovsVamanaIndex_t index) {
-  delete reinterpret_cast<VamanaIndex*>(index);
+  auto* ix = reinterpret_cast<VamanaIndex*>(index);
+  if (!ix) return IOVS_STATUS_SUCCESS;
+#ifdef _WIN32
+  if (ix->view) UnmapViewOfFile(ix->view);
+  if (ix->map_handle) CloseHandle(ix->map_handle);
+  if (ix->file_handle != INVALID_HANDLE_VALUE) CloseHandle(ix->file_handle);
+#else
+  if (ix->view && ix->view != MAP_FAILED) munmap(ix->view, ix->map_size);
+  if (ix->fd >= 0) close(ix->fd);
+#endif
+  delete ix;
   return IOVS_STATUS_SUCCESS;
 }
 

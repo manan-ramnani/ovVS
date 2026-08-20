@@ -197,5 +197,203 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
 #endif
 }
 
+int32_t sycl_enabled() {
+#if defined(IOVS_WITH_SYCL)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, iovsMetric metric,
+                    const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
+                    int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
+                    float* distances) {
+#if defined(IOVS_WITH_SYCL)
+  /* Fused iGPU walk: one work-item per query, SLM itopk + visited hashmap, in-kernel L2. */
+  if (!gpu_available()) return false;
+  try {
+    auto& q = gpu_queue();
+    itopk = std::max(itopk, static_cast<int32_t>(k));
+    itopk = std::min(itopk, 64);
+    search_width = std::max(1, search_width);
+    const size_t N = static_cast<size_t>(n);
+    const size_t D = static_cast<size_t>(dim);
+    const size_t NQ = static_cast<size_t>(nq);
+    const size_t DEG = static_cast<size_t>(degree);
+    const size_t KK = static_cast<size_t>(k);
+    const size_t IT = static_cast<size_t>(itopk);
+    const size_t SW = static_cast<size_t>(search_width);
+    const int met = static_cast<int>(metric);
+    sycl::buffer<float, 1> bds(const_cast<float*>(dataset), sycl::range<1>(N * D));
+    sycl::buffer<int32_t, 1> bg(const_cast<int32_t*>(graph), sycl::range<1>(N * DEG));
+    sycl::buffer<float, 1> bq(const_cast<float*>(queries), sycl::range<1>(NQ * D));
+    sycl::buffer<int64_t, 1> bn(neighbors, sycl::range<1>(NQ * KK));
+    sycl::buffer<float, 1> bd(distances, sycl::range<1>(NQ * KK));
+    const uint8_t* bits = bitset;
+    std::vector<uint8_t> all_one;
+    if (!bits) {
+      all_one.assign((N + 7) / 8, 0xff);
+      bits = all_one.data();
+    }
+    sycl::buffer<uint8_t, 1> bb(const_cast<uint8_t*>(bits), sycl::range<1>((N + 7) / 8));
+    q.submit([&](sycl::handler& h) {
+      auto DS = bds.get_access<sycl::access::mode::read>(h);
+      auto G = bg.get_access<sycl::access::mode::read>(h);
+      auto Q = bq.get_access<sycl::access::mode::read>(h);
+      auto OUTI = bn.get_access<sycl::access::mode::write>(h);
+      auto OUTD = bd.get_access<sycl::access::mode::write>(h);
+      auto BS = bb.get_access<sycl::access::mode::read>(h);
+      sycl::local_accessor<float, 1> slm_d(sycl::range<1>(64), h);
+      sycl::local_accessor<int64_t, 1> slm_id(sycl::range<1>(64), h);
+      h.parallel_for(sycl::nd_range<1>(sycl::range<1>(NQ), sycl::range<1>(1)), [=](sycl::nd_item<1> itm) {
+        const size_t qi = itm.get_global_id(0);
+        auto dist_one = [&](size_t id) {
+          float s = 0.f;
+          float ip = 0.f, nx = 0.f, ny = 0.f;
+          for (size_t d = 0; d < D; ++d) {
+            const float a = Q[qi * D + d];
+            const float b = DS[id * D + d];
+            const float t = a - b;
+            s += t * t;
+            ip += a * b;
+            nx += a * a;
+            ny += b * b;
+          }
+          if (met == 2) return -ip;
+          if (met == 3) {
+            const float den = sycl::sqrt(nx) * sycl::sqrt(ny);
+            return 1.f - ip / (den > 1e-12f ? den : 1e-12f);
+          }
+          return s;
+        };
+        auto allowed_id = [&](size_t id) {
+          return (BS[id >> 3] >> (id & 7)) & 1;
+        };
+        /* tiny hashmap: 256-slot open address of seen ids */
+        int32_t seen[256];
+        for (int i = 0; i < 256; ++i) seen[i] = -1;
+        auto mark = [&](int32_t id) {
+          uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
+          for (int p = 0; p < 256; ++p) {
+            uint32_t s = (h + static_cast<uint32_t>(p)) & 255u;
+            if (seen[s] == -1 || seen[s] == id) {
+              seen[s] = id;
+              return;
+            }
+          }
+        };
+        auto was = [&](int32_t id) {
+          uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
+          for (int p = 0; p < 256; ++p) {
+            uint32_t s = (h + static_cast<uint32_t>(p)) & 255u;
+            if (seen[s] == -1) return false;
+            if (seen[s] == id) return true;
+          }
+          return true;
+        };
+        int nkeep = 0;
+        for (size_t s = 0; s < SW && s < N; ++s) {
+          int64_t id = static_cast<int64_t>((s * 9973 + qi * 13) % N);
+          if (!allowed_id(static_cast<size_t>(id)) || was(static_cast<int32_t>(id))) continue;
+          mark(static_cast<int32_t>(id));
+          slm_id[nkeep] = id;
+          slm_d[nkeep] = dist_one(static_cast<size_t>(id));
+          ++nkeep;
+        }
+        char expd[4096];
+        const size_t expn = N < 4096 ? N : 4096;
+        for (size_t i = 0; i < expn; ++i) expd[i] = 0;
+        const int max_iters = itopk * 6 > 24 ? itopk * 6 : 24;
+        for (int iter = 0; iter < max_iters; ++iter) {
+          int pick = -1;
+          float best = 1e30f;
+          for (int i = 0; i < nkeep; ++i) {
+            const int64_t id = slm_id[i];
+            if (id < 0 || static_cast<size_t>(id) >= expn) continue;
+            if (!expd[id] && slm_d[i] < best) {
+              best = slm_d[i];
+              pick = i;
+            }
+          }
+          if (pick < 0) break;
+          const int64_t pid = slm_id[pick];
+          expd[pid] = 1;
+          for (size_t e = 0; e < DEG; ++e) {
+            const int32_t nb = G[static_cast<size_t>(pid) * DEG + e];
+            if (nb < 0 || static_cast<size_t>(nb) >= N) continue;
+            if (!allowed_id(static_cast<size_t>(nb)) || was(nb)) continue;
+            mark(nb);
+            const float dv = dist_one(static_cast<size_t>(nb));
+            if (nkeep < static_cast<int>(IT)) {
+              slm_id[nkeep] = nb;
+              slm_d[nkeep] = dv;
+              ++nkeep;
+            } else {
+              int wi = 0;
+              float wv = slm_d[0];
+              for (int i = 1; i < nkeep; ++i) {
+                if (slm_d[i] > wv) {
+                  wv = slm_d[i];
+                  wi = i;
+                }
+              }
+              if (dv < wv) {
+                slm_id[wi] = nb;
+                slm_d[wi] = dv;
+              }
+            }
+          }
+        }
+        for (int a = 0; a < nkeep; ++a) {
+          int best = a;
+          for (int b = a + 1; b < nkeep; ++b)
+            if (slm_d[b] < slm_d[best]) best = b;
+          const float td = slm_d[a];
+          const int64_t ti = slm_id[a];
+          slm_d[a] = slm_d[best];
+          slm_id[a] = slm_id[best];
+          slm_d[best] = td;
+          slm_id[best] = ti;
+        }
+        for (size_t t = 0; t < KK; ++t) {
+          if (t < static_cast<size_t>(nkeep)) {
+            OUTI[qi * KK + t] = slm_id[t];
+            float d = slm_d[t];
+            if (met == 2) d = -d;
+            OUTD[qi * KK + t] = d;
+          } else {
+            OUTI[qi * KK + t] = -1;
+            OUTD[qi * KK + t] = 3.4e38f;
+          }
+        }
+      });
+    });
+    q.wait();
+    (void)r;
+    return true;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)r;
+  (void)dataset;
+  (void)n;
+  (void)dim;
+  (void)metric;
+  (void)graph;
+  (void)degree;
+  (void)queries;
+  (void)nq;
+  (void)k;
+  (void)itopk;
+  (void)search_width;
+  (void)bitset;
+  (void)neighbors;
+  (void)distances;
+  return false;
+#endif
+}
+
 }  // namespace impl
 }  // namespace iovs

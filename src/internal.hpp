@@ -17,6 +17,18 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace iovs {
 namespace impl {
 
@@ -116,6 +128,7 @@ struct ResourcesData {
   std::string cache_dir;
   int32_t npu_compile_fails = 0;
   int32_t npu_fallbacks = 0;
+  bool npu_busy = false;
   std::vector<float> scratch;
 
   float* scratch_f(size_t n) {
@@ -152,6 +165,11 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out);
 bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n);
+bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, iovsMetric metric,
+                    const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
+                    int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
+                    float* distances);
+int32_t sycl_enabled();
 
 void cpu_gemm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
               bool trans_b);
@@ -172,6 +190,70 @@ iovsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows
                             const int64_t* idx, int64_t nidx, float* out);
 iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx,
                          const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
+iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                           iovsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
+                           int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
+                           const uint8_t* bitset, int64_t* neighbors, float* distances);
+
+inline float f16_to_f32(uint16_t h) {
+  const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
+  const uint32_t exp = (h >> 10) & 0x1fu;
+  uint32_t man = h & 0x3ffu;
+  uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;
+    } else {
+      int32_t e = 127 - 15 + 1;
+      while ((man & 0x400u) == 0) {
+        man <<= 1;
+        --e;
+      }
+      man &= 0x3ffu;
+      bits = sign | (static_cast<uint32_t>(e) << 23) | (man << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7f800000u | (man << 13);
+  } else {
+    bits = sign | ((exp + (127 - 15)) << 23) | (man << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+inline uint16_t f32_to_f16(float f) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &f, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const int32_t exp = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
+  const uint32_t man = bits & 0x7fffffu;
+  if (exp <= 0) return static_cast<uint16_t>(sign);
+  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (man >> 13));
+}
+
+inline void convert_to_f32(iovsDType dtype, const void* src, int64_t n, int64_t dim,
+                           std::vector<float>& out) {
+  const int64_t cells = n * dim;
+  out.resize(static_cast<size_t>(cells));
+  if (dtype == IOVS_DTYPE_F32) {
+    std::memcpy(out.data(), src, static_cast<size_t>(cells) * sizeof(float));
+    return;
+  }
+  if (dtype == IOVS_DTYPE_F16) {
+    const auto* h = static_cast<const uint16_t*>(src);
+    for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = f16_to_f32(h[i]);
+    return;
+  }
+  if (dtype == IOVS_DTYPE_I8) {
+    const auto* p = static_cast<const int8_t*>(src);
+    for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = static_cast<float>(p[i]);
+    return;
+  }
+  const auto* p = static_cast<const uint8_t*>(src);
+  for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = static_cast<float>(p[i]);
+}
 
 void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                        const float* queries, int64_t nq, iovsMetric metric, int64_t k,

@@ -1,14 +1,13 @@
 {
   "sku": "arrow-lake",
-  "cpu": "Intel(R) Core(TM) Ultra 7 265K",
   "op": "gemm",
-  "npu_available": true,
-  "gpu_available": true,
+  "shape": [64, 128, 32],
+  "npu": true,
+  "gpu": true,
+  "sycl": false,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 0.0516, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 7.0740, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 29.6389, "status": "success"}
-  ],
-  "winner_this_shape": "cpu",
-  "note": "FORCE_NPU/GPU run OpenVINO MatMul on that device (last_device). Tiny 64x128x32 stays CPU under AUTO."
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0529, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 7.3244, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 24.0031, "status": "success"}
+  ]
 }

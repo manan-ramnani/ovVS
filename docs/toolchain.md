@@ -4,7 +4,7 @@
 |---|---|---|
 | Host compiler | MSVC 14.44 (VS 2022 Build Tools) or clang-cl | GCC 11+ / clang 16+ |
 | CMake | 3.20+ (VS bundle or distro) | 3.20+ |
-| SYCL / iGPU | Intel oneAPI DPC++ (`icpx`), Level Zero GPU | same + intel-compute-runtime |
+| SYCL / iGPU | Intel oneAPI DPC++ (`icpx`), Level Zero GPU. On this Arrow Lake host, `winget install Intel.OneAPI.BaseToolkit` 2025.1.3.8 required UAC and was canceled (`0x800704c7`); OpenVINO GPU plugin is the iGPU path until icpx is installed. | same + intel-compute-runtime |
 | NPU | OpenVINO with NPU plugin + Intel NPU driver | OpenVINO + linux-npu-driver |
 | Python | 3.10–3.13 | 3.10–3.13 |
 

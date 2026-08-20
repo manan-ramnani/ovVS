@@ -218,6 +218,34 @@ IOVS_TEST(gather_rows_matches_index) {
   }
 }
 
+IOVS_TEST(force_devices_last_device_honest) {
+  Res res;
+  const int64_t m = 8, n = 8, k = 8;
+  auto A = make_data(m, k, 5);
+  auto B = make_data(n, k, 6);
+  std::vector<float> C(static_cast<size_t>(m * n));
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  expect_status(iovsGemm(res.r, A.data(), B.data(), C.data(), m, n, k, 1), "cpu");
+  iovsDevice last = IOVS_DEVICE_AUTO;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last == IOVS_DEVICE_CPU, "force cpu last");
+  int32_t npu = 0, gpu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (npu) {
+    iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_NPU);
+    expect_status(iovsGemm(res.r, A.data(), B.data(), C.data(), m, n, k, 1), "npu");
+    iovsResourcesLastDevice(res.r, &last);
+    expect(last == IOVS_DEVICE_NPU, "force npu last");
+  }
+  if (gpu) {
+    iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+    expect_status(iovsGemm(res.r, A.data(), B.data(), C.data(), m, n, k, 1), "gpu");
+    iovsResourcesLastDevice(res.r, &last);
+    expect(last == IOVS_DEVICE_GPU, "force gpu last");
+  }
+}
+
 IOVS_TEST(pairwise_l2_matches_definition) {
   Res res;
   const int64_t nx = 3, ny = 4, dim = 5;

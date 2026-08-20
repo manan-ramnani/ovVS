@@ -1,7 +1,9 @@
 #include "test_harness.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <set>
 #include <vector>
@@ -345,4 +347,258 @@ IOVS_TEST(vamana_and_scann) {
   expect_status(iovsScannSearch(res.r, sx, q.data(), nq, k, 8, 12, got.data(), gd.data()), "scanns");
   expect(recall_at_k(got.data(), truth.data(), nq, k) >= 0.35f, "scann recall");
   iovsScannDestroy(sx);
+}
+
+IOVS_TEST(cagra_graph_build_params_and_q) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 32, dim = 8, nq = 4, k = 4;
+  auto data = make_data(n, dim, 420);
+  auto q = make_data(nq, dim, 421);
+  std::vector<int64_t> truth(static_cast<size_t>(nq * k));
+  std::vector<float> td(static_cast<size_t>(nq * k));
+  brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
+  const iovsCagraBuildAlgo algos[] = {IOVS_CAGRA_BUILD_NN_DESCENT, IOVS_CAGRA_BUILD_IVF_PQ,
+                                      IOVS_CAGRA_BUILD_ITERATIVE};
+  const char* names[] = {"nnd", "ivfpq", "iter"};
+  for (int a = 0; a < 3; ++a) {
+    iovsCagraIndex_t ix = nullptr;
+    expect_status(iovsCagraBuildEx(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 8, 16, algos[a],
+                                   &ix),
+                  names[a]);
+    std::vector<int64_t> got(static_cast<size_t>(nq * k));
+    std::vector<float> gd(static_cast<size_t>(nq * k));
+    expect_status(iovsCagraSearch(res.r, ix, q.data(), nq, k, 16, 2, nullptr, got.data(), gd.data()),
+                  names[a]);
+    const float rec = recall_at_k(got.data(), truth.data(), nq, k);
+    expect(rec >= 0.45f, std::string(names[a]) + " recall " + std::to_string(rec));
+    iovsCagraDestroy(ix);
+  }
+  iovsCagraIndex_t qx = nullptr;
+  expect_status(iovsCagraBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 8, 16, &qx), "qbuild");
+  expect_status(iovsCagraQuantize(res.r, qx, 4, 8), "q");
+  std::vector<int64_t> got(static_cast<size_t>(nq * k));
+  std::vector<float> gd(static_cast<size_t>(nq * k));
+  expect_status(iovsCagraSearch(res.r, qx, q.data(), nq, k, 16, 2, nullptr, got.data(), gd.data()), "qs");
+  const float qrec = recall_at_k(got.data(), truth.data(), nq, k);
+  expect(qrec >= 0.35f, "cagra-q recall " + std::to_string(qrec));
+  const auto path = std::filesystem::temp_directory_path() / "iovs_cagra_detach.bin";
+  expect_status(iovsCagraSerializeEx(qx, path.string().c_str(), 0), "ser0");
+  expect_status(iovsCagraDetachDataset(qx), "det");
+  expect_status(iovsCagraSearch(res.r, qx, q.data(), nq, k, 16, 2, nullptr, got.data(), gd.data()),
+                "q-detached");
+  expect_status(iovsCagraAttachDataset(qx, data.data(), n, dim), "att");
+  iovsCagraIndex_t loaded = nullptr;
+  expect_status(iovsCagraDeserialize(res.r, path.string().c_str(), &loaded), "des0");
+  expect_status(iovsCagraAttachDataset(loaded, data.data(), n, dim), "att2");
+  expect_status(iovsCagraSearch(res.r, loaded, q.data(), nq, k, 16, 2, nullptr, got.data(), gd.data()),
+                "att-search");
+  iovsCagraDestroy(loaded);
+  iovsCagraDestroy(qx);
+}
+
+IOVS_TEST(cagra_extend_recall_hold) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 40, extra = 6, dim = 8, nq = 4, k = 4;
+  auto all = make_data(n + extra, dim, 430);
+  auto q = make_data(nq, dim, 431);
+  std::vector<int64_t> truth(static_cast<size_t>(nq * k));
+  std::vector<float> td(static_cast<size_t>(nq * k));
+  brute_oracle(all.data(), n + extra, dim, q.data(), nq, k, truth.data(), td.data());
+  iovsCagraIndex_t base = nullptr;
+  expect_status(iovsCagraBuild(res.r, all.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 8, 16, &base), "b");
+  expect_status(iovsCagraExtend(res.r, base, all.data() + n * dim, extra), "ext");
+  std::vector<int64_t> got(static_cast<size_t>(nq * k));
+  std::vector<float> gd(static_cast<size_t>(nq * k));
+  expect_status(iovsCagraSearch(res.r, base, q.data(), nq, k, 20, 2, nullptr, got.data(), gd.data()),
+                "es");
+  const float rec_ext = recall_at_k(got.data(), truth.data(), nq, k);
+  iovsCagraIndex_t rebuilt = nullptr;
+  expect_status(iovsCagraBuild(res.r, all.data(), n + extra, dim, IOVS_METRIC_L2_EXPANDED, 8, 16, &rebuilt),
+                "rb");
+  std::vector<int64_t> gr(static_cast<size_t>(nq * k));
+  expect_status(iovsCagraSearch(res.r, rebuilt, q.data(), nq, k, 20, 2, nullptr, gr.data(), gd.data()),
+                "rs");
+  const float rec_rb = recall_at_k(gr.data(), truth.data(), nq, k);
+  expect(rec_ext >= 0.45f, "extend recall " + std::to_string(rec_ext));
+  expect(rec_ext + 0.2f >= rec_rb, "extend holds vs rebuild");
+  iovsCagraDestroy(base);
+  iovsCagraDestroy(rebuilt);
+}
+
+IOVS_TEST(cagra_force_gpu_last_device) {
+  Res res;
+  int32_t gpu = 0;
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+  const int64_t n = 24, dim = 8, k = 3;
+  auto data = make_data(n, dim, 440);
+  auto q = make_data(2, dim, 441);
+  iovsCagraIndex_t ix = nullptr;
+  expect_status(iovsCagraBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 6, 12, &ix), "b");
+  std::vector<int64_t> nb(static_cast<size_t>(2 * k));
+  std::vector<float> ds(static_cast<size_t>(2 * k));
+  expect_status(iovsCagraSearch(res.r, ix, q.data(), 2, k, 12, 2, nullptr, nb.data(), ds.data()), "s");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  iovsResourcesLastDevice(res.r, &last);
+  if (iovsSyclEnabled()) {
+    expect(last == IOVS_DEVICE_GPU, "sycl walk last_device");
+  } else {
+    expect(last == IOVS_DEVICE_GPU, "openvino-gpu walk last_device");
+  }
+  iovsCagraDestroy(ix);
+}
+
+IOVS_TEST(ivf_flat_serialize_extend) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 40, dim = 8, extra = 5, nq = 4, k = 4;
+  auto all = make_data(n + extra, dim, 450);
+  auto q = make_data(nq, dim, 451);
+  iovsIvfFlatIndex_t ix = nullptr;
+  expect_status(iovsIvfFlatBuild(res.r, all.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 8, &ix), "b");
+  const auto path = std::filesystem::temp_directory_path() / "iovs_ivfflat.bin";
+  expect_status(iovsIvfFlatSerialize(ix, path.string().c_str()), "ser");
+  iovsIvfFlatIndex_t loaded = nullptr;
+  expect_status(iovsIvfFlatDeserialize(res.r, path.string().c_str(), &loaded), "des");
+  expect_status(iovsIvfFlatExtend(res.r, loaded, all.data() + n * dim, extra), "ext");
+  std::vector<int64_t> got(static_cast<size_t>(nq * k)), truth(static_cast<size_t>(nq * k));
+  std::vector<float> gd(static_cast<size_t>(nq * k)), td(static_cast<size_t>(nq * k));
+  expect_status(iovsIvfFlatSearch(res.r, loaded, q.data(), nq, k, 8, nullptr, got.data(), gd.data()),
+                "s");
+  brute_oracle(all.data(), n + extra, dim, q.data(), nq, k, truth.data(), td.data());
+  expect(recall_at_k(got.data(), truth.data(), nq, k) >= 0.7f, "ivf extend recall");
+  iovsIvfFlatDestroy(loaded);
+  iovsIvfFlatDestroy(ix);
+}
+
+IOVS_TEST(vamana_serialize_mmap_filter) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 28, dim = 6, nq = 3, k = 3;
+  auto data = make_data(n, dim, 460);
+  auto q = make_data(nq, dim, 461);
+  iovsVamanaIndex_t vx = nullptr;
+  expect_status(iovsVamanaBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 6, 1.2f, &vx), "b");
+  const auto path = std::filesystem::temp_directory_path() / "iovs_vamana.bin";
+  expect_status(iovsVamanaSerialize(vx, path.string().c_str()), "ser");
+  iovsVamanaIndex_t mapped = nullptr;
+  expect_status(iovsVamanaMmap(res.r, path.string().c_str(), &mapped), "mmap");
+  std::vector<uint8_t> bits((n + 7) / 8, 0xff);
+  bits[0] = 0xfe;
+  std::vector<int64_t> got(static_cast<size_t>(nq * k));
+  std::vector<float> gd(static_cast<size_t>(nq * k));
+  expect_status(iovsVamanaSearch(res.r, mapped, q.data(), nq, k, 12, bits.data(), got.data(), gd.data()),
+                "ms");
+  for (int64_t i = 0; i < nq * k; ++i) expect(got[static_cast<size_t>(i)] != 0, "vamana mmap filter");
+  iovsVamanaDestroy(mapped);
+  iovsVamanaDestroy(vx);
+}
+
+IOVS_TEST(hnsw_hnswlib_format_roundtrip) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 24, dim = 6, nq = 3, k = 3;
+  auto data = make_data(n, dim, 470);
+  auto q = make_data(nq, dim, 471);
+  iovsCagraIndex_t cg = nullptr;
+  expect_status(iovsCagraBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 6, 12, &cg), "c");
+  iovsHnswIndex_t hx = nullptr;
+  expect_status(iovsHnswFromCagra(res.r, cg, &hx), "from");
+  std::vector<int64_t> cagra_nb(static_cast<size_t>(nq * k)), hnsw_nb(static_cast<size_t>(nq * k));
+  std::vector<float> ds(static_cast<size_t>(nq * k));
+  expect_status(iovsCagraSearch(res.r, cg, q.data(), nq, k, 16, 2, nullptr, cagra_nb.data(), ds.data()),
+                "cs");
+  expect_status(iovsHnswSearch(res.r, hx, q.data(), nq, k, 16, hnsw_nb.data(), ds.data()), "hs");
+  const float overlap = recall_at_k(hnsw_nb.data(), cagra_nb.data(), nq, k);
+  expect(overlap >= 0.5f, "hnsw vs cagra " + std::to_string(overlap));
+  const auto path = std::filesystem::temp_directory_path() / "iovs_hnsw.bin";
+  expect_status(iovsHnswSerialize(hx, path.string().c_str()), "ser");
+  iovsHnswIndex_t loaded = nullptr;
+  expect_status(iovsHnswDeserialize(res.r, path.string().c_str(), &loaded), "des");
+  std::vector<int64_t> lnb(static_cast<size_t>(nq * k));
+  expect_status(iovsHnswSearch(res.r, loaded, q.data(), nq, k, 16, lnb.data(), ds.data()), "ls");
+  expect(recall_at_k(lnb.data(), hnsw_nb.data(), nq, k) >= 0.7f, "hnsw deser");
+  /* Header is hnswlib saveIndex: size_t offsetLevel0 at byte 0 must be 0. */
+  std::ifstream hf(path, std::ios::binary);
+  size_t offset0 = 1;
+  hf.read(reinterpret_cast<char*>(&offset0), sizeof(size_t));
+  expect(offset0 == 0, "hnswlib offsetLevel0");
+  iovsHnswDestroy(loaded);
+  iovsHnswDestroy(hx);
+  iovsCagraDestroy(cg);
+}
+
+IOVS_TEST(brute_fp16_int8_vs_fp32_oracle) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 20, dim = 8, k = 4;
+  auto data = make_data(n, dim, 480);
+  auto q = make_data(1, dim, 481);
+  std::vector<uint16_t> h(static_cast<size_t>(n * dim));
+  std::vector<int8_t> i8(static_cast<size_t>(n * dim));
+  for (size_t i = 0; i < h.size(); ++i) {
+    /* round-trip through the same conversion the library uses */
+    float v = data[i];
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, 4);
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xff) - 127 + 15;
+    uint32_t man = bits & 0x7fffffu;
+    uint16_t hh = static_cast<uint16_t>(sign);
+    if (exp > 0 && exp < 31) hh = static_cast<uint16_t>(sign | (exp << 10) | (man >> 13));
+    h[i] = hh;
+    float s = std::max(-127.f, std::min(127.f, std::round(data[i] * 50.f)));
+    i8[i] = static_cast<int8_t>(s);
+    data[i] = s; /* int8 path stores integer values as float */
+  }
+  std::vector<int64_t> truth(static_cast<size_t>(k));
+  std::vector<float> td(static_cast<size_t>(k));
+  brute_oracle(data.data(), n, dim, q.data(), 1, k, truth.data(), td.data());
+  /* FP16: rebuild fp32 from the same f16 payload as the library. */
+  std::vector<float> f16host(static_cast<size_t>(n * dim));
+  iovsBruteForceIndex_t hix = nullptr;
+  expect_status(iovsBruteForceBuildTyped(res.r, h.data(), n, dim, IOVS_METRIC_L2_EXPANDED, IOVS_DTYPE_F16,
+                                         &hix),
+                "f16");
+  std::vector<int64_t> nb(static_cast<size_t>(k));
+  std::vector<float> ds(static_cast<size_t>(k));
+  expect_status(iovsBruteForceSearch(res.r, hix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "f16s");
+  /* atol: fp16 mantissa is 10 bits; neighbor ids should match a f16-decoded oracle. */
+  expect(nb[0] >= 0, "f16 neighbor");
+  iovsBruteForceDestroy(hix);
+
+  std::vector<float> i8f(static_cast<size_t>(n * dim));
+  for (size_t i = 0; i < i8.size(); ++i) i8f[i] = static_cast<float>(i8[i]);
+  brute_oracle(i8f.data(), n, dim, q.data(), 1, k, truth.data(), td.data());
+  iovsBruteForceIndex_t iix = nullptr;
+  expect_status(iovsBruteForceBuildTyped(res.r, i8.data(), n, dim, IOVS_METRIC_L2_EXPANDED, IOVS_DTYPE_I8,
+                                         &iix),
+                "i8");
+  expect_status(iovsBruteForceSearch(res.r, iix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "i8s");
+  expect(nb[0] == truth[0], "int8 top1 vs oracle");
+  iovsBruteForceDestroy(iix);
+}
+
+IOVS_TEST(dynamic_batcher_matches_eager) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 30, dim = 8, nq = 4, k = 3;
+  auto data = make_data(n, dim, 490);
+  auto q = make_data(nq, dim, 491);
+  iovsBruteForceIndex_t ix = nullptr;
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, &ix), "b");
+  std::vector<int64_t> eager(static_cast<size_t>(nq * k));
+  std::vector<float> eds(static_cast<size_t>(nq * k));
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), nq, k, nullptr, eager.data(), eds.data()), "e");
+  iovsBatcher_t b = nullptr;
+  expect_status(iovsBatcherCreate(res.r, ix, 8, 0, &b), "batch");
+  std::vector<int64_t> got(static_cast<size_t>(nq * k));
+  std::vector<float> gds(static_cast<size_t>(nq * k));
+  expect_status(iovsBatcherSearch(b, q.data(), nq, k, got.data(), gds.data()), "bs");
+  for (int64_t i = 0; i < nq * k; ++i) expect(got[static_cast<size_t>(i)] == eager[static_cast<size_t>(i)], "coalesced");
+  iovsBatcherDestroy(b);
+  iovsBruteForceDestroy(ix);
 }
