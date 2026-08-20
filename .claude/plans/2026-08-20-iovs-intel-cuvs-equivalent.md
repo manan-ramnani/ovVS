@@ -832,7 +832,7 @@ Filled in as installs finish. Placeholder until toolchain logs land:
 - **SHAVE ELF on NPU silicon:** `npu_compiler` cloned at `6761af885b8ff54ddf0da5bf8ad44e30746b2f62` with `sw_runtime_kernels`. No SHAVE C compiler/firmware path to load unsigned ELF on this Windows NPU. Running path: host-linked `shave/*.c` + OpenVINO NPU TopK/Gather/MatMul + HostCompile M=256 GEMM tiles. Park only “SHAVE ELF on NPU silicon”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.
 - **Energy/RAPL:** not wired if no counter after trying; search still works.
-- **git push:** park only if `gh repo create` / `git remote` fail after trying.
+- **git push:** `gh repo create manan-ramnani/ioVS` succeeded. First `git push` of full history was rejected: OAuth token lacks `workflow` scope (`.github/workflows/ci.yml`). Pushed a workflow-free snapshot as `origin/main` (`0a111b6`). Local `main` keeps full history including the workflow file (`a52ea83`). Re-push of CI requires a token with the `workflow` scope.
 - **FAISS/hnswlib pip:** park comparator only after retries on this Python; still emit ioVS bench numbers.
 
 ---
