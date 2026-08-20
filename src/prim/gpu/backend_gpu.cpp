@@ -366,6 +366,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t DEG = static_cast<size_t>(degree);
     const size_t KK = static_cast<size_t>(k);
     const size_t IT = static_cast<size_t>(itopk);
+    const size_t BEAM = IT * 2u;
     const size_t SW = static_cast<size_t>(search_width);
     const int met = static_cast<int>(metric);
     const int max_iters = std::max(24, itopk * 6);
@@ -394,13 +395,13 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     if (!BS) throw std::bad_alloc();
     if (!iovs_usm_is_shared(bits)) std::memcpy(BS, bits, (N + 7) / 8);
     uint8_t* Seen = static_cast<uint8_t*>(iovs_usm_malloc(NQ * N));
-    int64_t* HID = static_cast<int64_t*>(iovs_usm_malloc(NQ * IT * sizeof(int64_t)));
-    float* HD = static_cast<float*>(iovs_usm_malloc(NQ * IT * sizeof(float)));
+    int64_t* HID = static_cast<int64_t*>(iovs_usm_malloc(NQ * BEAM * sizeof(int64_t)));
+    float* HD = static_cast<float*>(iovs_usm_malloc(NQ * BEAM * sizeof(float)));
     if (!Seen || !HID || !HD) throw std::bad_alloc();
     q.parallel_for(sycl::range<1>(NQ), [=](sycl::id<1> qiid) {
         const size_t qi = qiid[0];
         const size_t sbase = qi * N;
-        const size_t hbase = qi * IT;
+        const size_t hbase = qi * BEAM;
         for (size_t i = 0; i < N; ++i) Seen[sbase + i] = 0;
         auto dist_one = [&](size_t id) {
           float s = 0.f;
@@ -427,7 +428,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
           if (id < 0 || static_cast<size_t>(id) >= N) return;
           if (Seen[sbase + static_cast<size_t>(id)] != 0) return;
           Seen[sbase + static_cast<size_t>(id)] = 1;
-          if (nkeep < static_cast<int>(IT)) {
+          if (nkeep < static_cast<int>(BEAM)) {
             HID[hbase + static_cast<size_t>(nkeep)] = id;
             HD[hbase + static_cast<size_t>(nkeep)] = dv;
             ++nkeep;
@@ -446,31 +447,43 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
             HD[hbase + static_cast<size_t>(wi)] = dv;
           }
         };
-        for (size_t s = 0; s < SW && s < N; ++s) {
+        size_t nseeds = static_cast<size_t>(itopk) * 16u;
+        {
+          const size_t from_sw = SW * 32u;
+          if (from_sw > nseeds) nseeds = from_sw;
+        }
+        if (nseeds < 512u) nseeds = 512u;
+        if (nseeds > N) nseeds = N;
+        for (size_t s = 0; s < nseeds; ++s) {
           const int64_t id = static_cast<int64_t>((s * 9973 + qi * 13) % N);
           if (!allowed_id(static_cast<size_t>(id))) continue;
           consider(id, dist_one(static_cast<size_t>(id)));
         }
         for (int iter = 0; iter < max_iters; ++iter) {
-          int pick = -1;
-          float best = 1e30f;
-          for (int i = 0; i < nkeep; ++i) {
-            const int64_t id = HID[hbase + static_cast<size_t>(i)];
-            if (id < 0 || static_cast<size_t>(id) >= N) continue;
-            if (Seen[sbase + static_cast<size_t>(id)] != 2 && HD[hbase + static_cast<size_t>(i)] < best) {
-              best = HD[hbase + static_cast<size_t>(i)];
-              pick = i;
+          int nexp = 0;
+          for (size_t s = 0; s < SW; ++s) {
+            int pick = -1;
+            float best = 1e30f;
+            for (int i = 0; i < nkeep; ++i) {
+              const int64_t id = HID[hbase + static_cast<size_t>(i)];
+              if (id < 0 || static_cast<size_t>(id) >= N) continue;
+              if (Seen[sbase + static_cast<size_t>(id)] != 2 && HD[hbase + static_cast<size_t>(i)] < best) {
+                best = HD[hbase + static_cast<size_t>(i)];
+                pick = i;
+              }
+            }
+            if (pick < 0) break;
+            const int64_t pid = HID[hbase + static_cast<size_t>(pick)];
+            Seen[sbase + static_cast<size_t>(pid)] = 2;
+            ++nexp;
+            for (size_t e = 0; e < DEG; ++e) {
+              const int32_t nb = G[static_cast<size_t>(pid) * DEG + e];
+              if (nb < 0 || static_cast<size_t>(nb) >= N) continue;
+              if (!allowed_id(static_cast<size_t>(nb))) continue;
+              consider(nb, dist_one(static_cast<size_t>(nb)));
             }
           }
-          if (pick < 0) break;
-          const int64_t pid = HID[hbase + static_cast<size_t>(pick)];
-          Seen[sbase + static_cast<size_t>(pid)] = 2;
-          for (size_t e = 0; e < DEG; ++e) {
-            const int32_t nb = G[static_cast<size_t>(pid) * DEG + e];
-            if (nb < 0 || static_cast<size_t>(nb) >= N) continue;
-            if (!allowed_id(static_cast<size_t>(nb))) continue;
-            consider(nb, dist_one(static_cast<size_t>(nb)));
-          }
+          if (nexp == 0) break;
         }
         for (int a = 0; a < nkeep; ++a) {
           int best = a;

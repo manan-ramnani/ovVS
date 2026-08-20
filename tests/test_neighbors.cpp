@@ -500,7 +500,7 @@ IOVS_TEST(cagra_build_search_filter_serialize) {
                 "cags");
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   const float rec = recall_at_k(got.data(), truth.data(), nq, k);
-  expect(rec >= 0.7f, "cagra recall " + std::to_string(rec));
+  expect(rec >= 0.9f, "cagra recall " + std::to_string(rec));
 
   std::vector<uint8_t> bits((n + 7) / 8, 0xff);
   bits[0] = 0xfe; /* drop id 0 */

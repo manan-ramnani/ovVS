@@ -10,31 +10,35 @@ from pathlib import Path
 
 
 def _load():
-    env = os.environ.get("IOVS_LIBRARY")
-    names = []
-    if env:
-        names.append(Path(env))
     here = Path(__file__).resolve().parent
-    roots = [
-        here,
-        here.parent,
-        here.parent.parent / "build" / "bin",
-        here.parent.parent / "build-sycl" / "bin",
-        here.parent.parent / "build-icpx" / "bin",
-        here.parent.parent / "build" / "Release",
-        here.parent.parent / "build" / "Debug",
-    ]
     if sys.platform.startswith("win"):
         fnames = ["iovs.dll"]
     elif sys.platform == "darwin":
         fnames = ["libiovs.dylib"]
     else:
         fnames = ["libiovs.so"]
+    candidates = []
+    env = os.environ.get("IOVS_LIBRARY")
+    if env:
+        candidates.append(Path(env))
+    roots = [
+        here,
+        here.parent,
+        here.parent.parent / "build-icpx" / "bin",
+        here.parent.parent / "build-sycl" / "bin",
+        here.parent.parent / "build" / "bin",
+        here.parent.parent / "build" / "Release",
+        here.parent.parent / "build" / "Debug",
+    ]
     for root in roots:
         for fn in fnames:
-            p = root / fn
-            if p.exists():
-                return ctypes.CDLL(str(p))
+            candidates.append(root / fn)
+    for p in candidates:
+        if p.exists():
+            p = p.resolve()
+            if sys.platform.startswith("win"):
+                os.add_dll_directory(str(p.parent))
+            return ctypes.CDLL(str(p))
     raise FileNotFoundError("libiovs not found; set IOVS_LIBRARY or build the C++ library")
 
 

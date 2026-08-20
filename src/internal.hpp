@@ -245,6 +245,18 @@ iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances);
 
+/* CAGRA is single-layer: random itopk seeds land too far in high-d for greedy routing
+   on graph_degree=16. Score a larger sample, then keep itopk. */
+inline int64_t cagra_seed_count(int64_t n, int32_t itopk, int32_t search_width) {
+  int64_t seeds = static_cast<int64_t>(std::max(1, itopk)) * 16;
+  const int64_t from_sw = static_cast<int64_t>(std::max(1, search_width)) * 32;
+  if (from_sw > seeds) seeds = from_sw;
+  if (seeds < 512) seeds = 512;
+  if (n > 0 && seeds > n) seeds = n;
+  if (seeds < 1) seeds = n > 0 ? 1 : 0;
+  return seeds;
+}
+
 inline float f16_to_f32(uint16_t h) {
   const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
   const uint32_t exp = (h >> 10) & 0x1fu;

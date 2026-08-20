@@ -139,7 +139,8 @@ void knn_graph_brute(ResourcesData& r, const float* x, int64_t n, int64_t dim, i
 void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, iovsMetric metric,
                      int32_t degree, int32_t iters, std::vector<int32_t>& graph) {
   degree = std::min(degree, static_cast<int32_t>(std::max<int64_t>(1, n - 1)));
-  if (n * n < 160000) {
+  /* Exact kNN is cheap through prim_pairwise while n^2 scores fit in ~64MiB. */
+  if (n <= 4096) {
     knn_graph_brute(r, x, n, dim, metric, degree, graph);
     return;
   }
@@ -156,6 +157,7 @@ void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, i
     }
     std::memcpy(graph.data() + i * degree, row.data(), static_cast<size_t>(degree) * sizeof(int32_t));
   }
+  iters = std::max(iters, 10);
   for (int it = 0; it < iters; ++it) {
     for (int64_t i = 0; i < n; ++i) {
       std::vector<int64_t> cands;
@@ -196,7 +198,18 @@ void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, i
 
 void prune_graph(const float* x, int64_t n, int64_t dim, iovsMetric metric, const int32_t* in,
                  int32_t in_deg, int32_t out_deg, std::vector<int32_t>& out) {
+  /* Symmetrized kNN truncated to out_deg. RNG occlusion at graph_degree=16 drops reverse
+     edges that greedy routing needs in high-d; keep the nearest knn∪reverse instead. */
   out.assign(static_cast<size_t>(n) * static_cast<size_t>(out_deg), -1);
+  std::vector<std::vector<int32_t>> rev(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    for (int32_t t = 0; t < in_deg; ++t) {
+      const int32_t nb = in[i * in_deg + t];
+      if (nb >= 0 && nb != static_cast<int32_t>(i) && static_cast<int64_t>(nb) < n) {
+        rev[static_cast<size_t>(nb)].push_back(static_cast<int32_t>(i));
+      }
+    }
+  }
   std::vector<int32_t> cand;
   for (int64_t i = 0; i < n; ++i) {
     cand.clear();
@@ -204,38 +217,16 @@ void prune_graph(const float* x, int64_t n, int64_t dim, iovsMetric metric, cons
       const int32_t nb = in[i * in_deg + t];
       if (nb >= 0 && nb != static_cast<int32_t>(i)) cand.push_back(nb);
     }
-    for (int64_t j = 0; j < n && n <= 4096; ++j) {
-      if (j == i) continue;
-      for (int32_t t = 0; t < in_deg; ++t) {
-        if (in[j * in_deg + t] == static_cast<int32_t>(i)) {
-          cand.push_back(static_cast<int32_t>(j));
-          break;
-        }
-      }
-    }
+    cand.insert(cand.end(), rev[static_cast<size_t>(i)].begin(), rev[static_cast<size_t>(i)].end());
     std::sort(cand.begin(), cand.end());
     cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
     std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) {
       return distance_one(metric, x + i * dim, x + static_cast<int64_t>(a) * dim, dim, 2.f) <
              distance_one(metric, x + i * dim, x + static_cast<int64_t>(b) * dim, dim, 2.f);
     });
-    std::vector<int32_t> kept;
-    for (int32_t v : cand) {
-      bool ok = true;
-      const float dv = distance_one(metric, x + i * dim, x + static_cast<int64_t>(v) * dim, dim, 2.f);
-      for (int32_t u : kept) {
-        const float duv = distance_one(metric, x + static_cast<int64_t>(u) * dim,
-                                       x + static_cast<int64_t>(v) * dim, dim, 2.f);
-        if (duv < dv) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) kept.push_back(v);
-      if (static_cast<int32_t>(kept.size()) >= out_deg) break;
-    }
-    for (size_t t = 0; t < kept.size() && t < static_cast<size_t>(out_deg); ++t) {
-      out[static_cast<size_t>(i * out_deg + static_cast<int64_t>(t))] = kept[t];
+    const int32_t keep = std::min(out_deg, static_cast<int32_t>(cand.size()));
+    for (int32_t t = 0; t < keep; ++t) {
+      out[static_cast<size_t>(i * out_deg + t)] = cand[static_cast<size_t>(t)];
     }
   }
 }
@@ -295,40 +286,63 @@ void graph_search_pq(const float* query_ds, int64_t n, int64_t dim, const int32_
     std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
     std::vector<char> expanded(static_cast<size_t>(n), 0);
     std::vector<Node> cand;
-    const int64_t nseeds = std::min<int64_t>(search_width, n);
+    const int64_t nseeds = cagra_seed_count(n, itopk, search_width);
     for (int64_t s = 0; s < nseeds; ++s) {
       int64_t id = (s * 9973 + q * 13) % n;
       if (!allowed(bitset, id) || seen[static_cast<size_t>(id)]) continue;
       seen[static_cast<size_t>(id)] = 1;
       cand.push_back({pq_adc(query, dim, codes + id * pq_m, pq_m, ks, dsub, codebooks), id});
     }
+    if (static_cast<int32_t>(cand.size()) > itopk) {
+      std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
+                       [](const Node& a, const Node& b) { return a.d < b.d; });
+      cand.resize(static_cast<size_t>(itopk));
+    }
     int iters = 0;
     const int max_iters = std::max(24, itopk * 6);
     while (iters++ < max_iters) {
-      int64_t pick = -1;
-      float pick_d = kInf;
-      for (const auto& c : cand) {
-        if (!expanded[static_cast<size_t>(c.id)] && c.d < pick_d) {
-          pick_d = c.d;
-          pick = c.id;
+      std::vector<int64_t> picks;
+      picks.reserve(static_cast<size_t>(search_width));
+      for (int s = 0; s < search_width; ++s) {
+        int64_t pick = -1;
+        float pick_d = kInf;
+        for (const auto& c : cand) {
+          if (expanded[static_cast<size_t>(c.id)]) continue;
+          bool already = false;
+          for (int64_t p : picks) {
+            if (p == c.id) {
+              already = true;
+              break;
+            }
+          }
+          if (already) continue;
+          if (c.d < pick_d) {
+            pick_d = c.d;
+            pick = c.id;
+          }
+        }
+        if (pick < 0) break;
+        picks.push_back(pick);
+      }
+      if (picks.empty()) break;
+      for (int64_t pick : picks) {
+        expanded[static_cast<size_t>(pick)] = 1;
+        const int32_t* nbrs = graph + pick * degree;
+        for (int32_t e = 0; e < degree; ++e) {
+          const int32_t nb = nbrs[e];
+          if (nb < 0 || static_cast<int64_t>(nb) >= n) continue;
+          if (seen[static_cast<size_t>(nb)]) continue;
+          if (!allowed(bitset, nb)) continue;
+          seen[static_cast<size_t>(nb)] = 1;
+          cand.push_back({pq_adc(query, dim, codes + static_cast<int64_t>(nb) * pq_m, pq_m, ks, dsub, codebooks),
+                          nb});
         }
       }
-      if (pick < 0) break;
-      expanded[static_cast<size_t>(pick)] = 1;
-      const int32_t* nbrs = graph + pick * degree;
-      for (int32_t e = 0; e < degree; ++e) {
-        const int32_t nb = nbrs[e];
-        if (nb < 0 || static_cast<int64_t>(nb) >= n) continue;
-        if (seen[static_cast<size_t>(nb)]) continue;
-        if (!allowed(bitset, nb)) continue;
-        seen[static_cast<size_t>(nb)] = 1;
-        cand.push_back({pq_adc(query, dim, codes + static_cast<int64_t>(nb) * pq_m, pq_m, ks, dsub, codebooks),
-                        nb});
-      }
-      if (static_cast<int32_t>(cand.size()) > itopk * 4) {
-        std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
+      const int32_t keep = itopk * 2;
+      if (static_cast<int32_t>(cand.size()) > keep) {
+        std::nth_element(cand.begin(), cand.begin() + keep, cand.end(),
                          [](const Node& a, const Node& b) { return a.d < b.d; });
-        cand.resize(static_cast<size_t>(itopk));
+        cand.resize(static_cast<size_t>(keep));
       }
     }
     std::sort(cand.begin(), cand.end(), [](const Node& a, const Node& b) { return a.d < b.d; });

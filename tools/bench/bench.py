@@ -13,11 +13,15 @@ sys.path.insert(0, str(ROOT / "python"))
 
 
 def load_iovs():
-    os.environ.setdefault("IOVS_LIBRARY", str(ROOT / "build" / "bin" / "iovs.dll"))
-    if not Path(os.environ["IOVS_LIBRARY"]).exists():
-        for p in (ROOT / "build" / "bin").glob("*.dll"):
-            if p.name.lower().startswith("iovs"):
-                os.environ["IOVS_LIBRARY"] = str(p)
+    if "IOVS_LIBRARY" not in os.environ:
+        for cand in (
+            ROOT / "build-icpx" / "bin" / "iovs.dll",
+            ROOT / "build-sycl" / "bin" / "iovs.dll",
+            ROOT / "build" / "bin" / "iovs.dll",
+        ):
+            if cand.exists():
+                os.environ["IOVS_LIBRARY"] = str(cand)
+                break
     import iovs as m
 
     return m

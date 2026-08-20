@@ -211,14 +211,16 @@ iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     int64_t id;
   };
   auto score_ids = [&](const float* query, const std::vector<int64_t>& ids, std::vector<float>& sc) -> iovsStatus {
-    if (ids.empty()) return IOVS_STATUS_SUCCESS;
-    std::vector<float> gathered(ids.size() * static_cast<size_t>(dim));
-    sc.assign(ids.size(), kInf);
-    const iovsStatus gs =
-        prim_gather_rows(r, dataset, n, dim, ids.data(), static_cast<int64_t>(ids.size()), gathered.data());
-    if (gs != IOVS_STATUS_SUCCESS) return gs;
-    return prim_pairwise(r, metric, query, 1, gathered.data(), static_cast<int64_t>(ids.size()), dim,
-                         sc.data(), 2.f);
+    sc.resize(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+      const int64_t id = ids[i];
+      if (id < 0 || id >= n) {
+        sc[i] = kInf;
+        continue;
+      }
+      sc[i] = distance_one(metric, query, dataset + id * dim, dim, 2.f);
+    }
+    return IOVS_STATUS_SUCCESS;
   };
   for (int64_t q = 0; q < nq; ++q) {
     const float* query = queries + q * dim;
@@ -226,7 +228,7 @@ iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     std::vector<char> expanded(static_cast<size_t>(n), 0);
     std::vector<Node> cand;
     std::vector<int64_t> seed_ids;
-    const int64_t nseeds = std::min<int64_t>(search_width, n);
+    const int64_t nseeds = cagra_seed_count(n, itopk, search_width);
     for (int64_t s = 0; s < nseeds; ++s) {
       int64_t id = (s * 9973 + q * 13) % n;
       if (!allowed(bitset, id) || seen[static_cast<size_t>(id)]) continue;
@@ -237,6 +239,11 @@ iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     const iovsStatus ss = score_ids(query, seed_ids, seed_sc);
     if (ss != IOVS_STATUS_SUCCESS) return ss;
     for (size_t i = 0; i < seed_ids.size(); ++i) cand.push_back({seed_sc[i], seed_ids[i]});
+    if (static_cast<int32_t>(cand.size()) > itopk) {
+      std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
+                       [](const Node& a, const Node& b) { return a.d < b.d; });
+      cand.resize(static_cast<size_t>(itopk));
+    }
     if (cand.empty()) {
       for (int64_t t = 0; t < k; ++t) {
         neighbors[q * k + t] = -1;
@@ -247,34 +254,52 @@ iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     int iters = 0;
     const int max_iters = std::max(24, itopk * 6);
     while (iters++ < max_iters) {
-      int64_t pick = -1;
-      float pick_d = kInf;
-      for (const auto& c : cand) {
-        if (!expanded[static_cast<size_t>(c.id)] && c.d < pick_d) {
-          pick_d = c.d;
-          pick = c.id;
+      std::vector<int64_t> picks;
+      picks.reserve(static_cast<size_t>(search_width));
+      for (int s = 0; s < search_width; ++s) {
+        int64_t pick = -1;
+        float pick_d = kInf;
+        for (const auto& c : cand) {
+          if (expanded[static_cast<size_t>(c.id)]) continue;
+          bool already = false;
+          for (int64_t p : picks) {
+            if (p == c.id) {
+              already = true;
+              break;
+            }
+          }
+          if (already) continue;
+          if (c.d < pick_d) {
+            pick_d = c.d;
+            pick = c.id;
+          }
         }
+        if (pick < 0) break;
+        picks.push_back(pick);
       }
-      if (pick < 0) break;
-      expanded[static_cast<size_t>(pick)] = 1;
+      if (picks.empty()) break;
       std::vector<int64_t> batch;
-      const int32_t* nbrs = graph + pick * degree;
-      for (int32_t e = 0; e < degree; ++e) {
-        const int32_t nb = nbrs[e];
-        if (nb < 0 || static_cast<int64_t>(nb) >= n) continue;
-        if (seen[static_cast<size_t>(nb)]) continue;
-        if (!allowed(bitset, nb)) continue;
-        seen[static_cast<size_t>(nb)] = 1;
-        batch.push_back(nb);
+      for (int64_t pick : picks) {
+        expanded[static_cast<size_t>(pick)] = 1;
+        const int32_t* nbrs = graph + pick * degree;
+        for (int32_t e = 0; e < degree; ++e) {
+          const int32_t nb = nbrs[e];
+          if (nb < 0 || static_cast<int64_t>(nb) >= n) continue;
+          if (seen[static_cast<size_t>(nb)]) continue;
+          if (!allowed(bitset, nb)) continue;
+          seen[static_cast<size_t>(nb)] = 1;
+          batch.push_back(nb);
+        }
       }
       std::vector<float> bsc;
       const iovsStatus bs = score_ids(query, batch, bsc);
       if (bs != IOVS_STATUS_SUCCESS) return bs;
       for (size_t i = 0; i < batch.size(); ++i) cand.push_back({bsc[i], batch[i]});
-      if (static_cast<int32_t>(cand.size()) > itopk * 4) {
-        std::nth_element(cand.begin(), cand.begin() + itopk, cand.end(),
+      const int32_t keep = itopk * 2;
+      if (static_cast<int32_t>(cand.size()) > keep) {
+        std::nth_element(cand.begin(), cand.begin() + keep, cand.end(),
                          [](const Node& a, const Node& b) { return a.d < b.d; });
-        cand.resize(static_cast<size_t>(itopk));
+        cand.resize(static_cast<size_t>(keep));
       }
     }
     std::sort(cand.begin(), cand.end(), [](const Node& a, const Node& b) { return a.d < b.d; });
