@@ -1,6 +1,7 @@
 #include "test_harness.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -299,6 +300,72 @@ IOVS_TEST(force_gpu_hamming_lp_vs_oracle) {
   pg = std::sqrt(pg);
   expect(std::fabs(pg - pbest) < 1e-4f, "lp min score");
   std::printf("    lp last_device=gpu\n");
+  (void)p;
+  iovsBruteForceDestroy(ix);
+}
+
+IOVS_TEST(force_npu_hamming_lp_vs_oracle) {
+  Res res;
+  int32_t npu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_NPU);
+  const int64_t n = 16, dim = 4, k = 3;
+  auto data = make_data(n, dim, 112);
+  auto q = make_data(1, dim, 113);
+  iovsBruteForceIndex_t ix = nullptr;
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_BITWISE_HAMMING, &ix), "ham");
+  std::vector<int64_t> nb(static_cast<size_t>(k));
+  std::vector<float> ds(static_cast<size_t>(k));
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "ham npu");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  expect_status(iovsResourcesLastDevice(res.r, &last), "last");
+  expect(last == IOVS_DEVICE_NPU, "FORCE_NPU hamming last_device");
+  std::printf("    hamming last_device=npu\n");
+  float hbest = 1e30f;
+  for (int64_t i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int64_t d = 0; d < dim; ++d) {
+      const uint32_t ax = data[static_cast<size_t>(i * dim + d)] >= 0.f;
+      const uint32_t ay = q[static_cast<size_t>(d)] >= 0.f;
+      s += static_cast<float>(ax ^ ay);
+    }
+    if (s < hbest) hbest = s;
+  }
+  expect(nb[0] >= 0 && nb[0] < n, "ham id");
+  float got = 0.f;
+  for (int64_t d = 0; d < dim; ++d) {
+    const uint32_t ax = data[static_cast<size_t>(nb[0] * dim + d)] >= 0.f;
+    const uint32_t ay = q[static_cast<size_t>(d)] >= 0.f;
+    got += static_cast<float>(ax ^ ay);
+  }
+  expect(got == hbest, "hamming min score npu");
+  iovsBruteForceDestroy(ix);
+
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_LP_UNEXPANDED, &ix), "lp");
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "lps npu");
+  expect_status(iovsResourcesLastDevice(res.r, &last), "lp last");
+  expect(last == IOVS_DEVICE_NPU, "FORCE_NPU lp last_device");
+  float pbest = 1e30f;
+  const float p = 2.f;
+  for (int64_t i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int64_t d = 0; d < dim; ++d) {
+      const float t = std::fabs(data[static_cast<size_t>(i * dim + d)] - q[static_cast<size_t>(d)]);
+      s += t * t;
+    }
+    s = std::sqrt(s);
+    if (s < pbest) pbest = s;
+  }
+  expect(nb[0] >= 0 && nb[0] < n, "lp id npu");
+  float pg = 0.f;
+  for (int64_t d = 0; d < dim; ++d) {
+    const float t = std::fabs(data[static_cast<size_t>(nb[0] * dim + d)] - q[static_cast<size_t>(d)]);
+    pg += t * t;
+  }
+  pg = std::sqrt(pg);
+  expect(std::fabs(pg - pbest) < 2e-2f, "lp min score npu");
+  std::printf("    lp last_device=npu\n");
   (void)p;
   iovsBruteForceDestroy(ix);
 }

@@ -1,10 +1,13 @@
 #include "test_harness.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <set>
+#include <string>
 #include <thread>
+#include <vector>
 
 IOVS_TEST(kmeans_inertia_drops) {
   Res res;
@@ -146,7 +149,56 @@ IOVS_TEST(energy_probe_does_not_crash) {
   int64_t uj = -1;
   const iovsStatus st = iovsResourcesEnergyUj(res.r, &uj);
   expect(st == IOVS_STATUS_SUCCESS || st == IOVS_STATUS_UNSUPPORTED, "energy status");
-  if (st == IOVS_STATUS_SUCCESS) expect(uj >= 0, "energy uj");
+  if (st == IOVS_STATUS_SUCCESS) expect(uj > 0, "energy uj");
+}
+
+IOVS_TEST(energy_package_uj_nondecreasing) {
+  Res res;
+  int64_t a = -1, b = -1;
+  const iovsStatus st0 = iovsResourcesEnergyUj(res.r, &a);
+  if (st0 == IOVS_STATUS_UNSUPPORTED) return;
+  expect_status(st0, "energy before");
+  std::vector<float> x(1 << 20, 1.f);
+  float s = 0.f;
+  const auto t0 = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(250)) {
+    for (float v : x) s += v * v;
+  }
+  expect(s > 0.f, "cpu work");
+  expect_status(iovsResourcesEnergyUj(res.r, &b), "energy after");
+  if (b <= a) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    for (float v : x) s += v * v;
+    expect_status(iovsResourcesEnergyUj(res.r, &b), "energy after wait");
+  }
+  expect(b > a, "package energy increased");
+}
+
+IOVS_TEST(probe_json_energy_and_shave_fields) {
+  std::vector<char> buf(32768, 0);
+  expect_status(iovsProbeJson(buf.data(), static_cast<int32_t>(buf.size())), "probe");
+  const std::string j(buf.data());
+  expect(j.find("\"energy_source\"") != std::string::npos, "energy_source field");
+  expect(j.find("\"shave_silicon_load\"") != std::string::npos, "shave_silicon_load field");
+  expect(j.find("\"shave_elf_inject_export\": true") == std::string::npos, "no fake elf inject export");
+#ifdef _WIN32
+  const bool emi = j.find("emi-intelppm") != std::string::npos;
+  const bool pdh = j.find("pdh-energy-meter") != std::string::npos;
+  const bool gadget = j.find("power-gadget") != std::string::npos;
+  const bool unsupported = j.find("\"energy_source\": \"unsupported\"") != std::string::npos;
+  expect(emi || pdh || gadget || unsupported, "known energy source");
+  if (emi || pdh) {
+    expect(j.find("RAPL_Package0_PKG") != std::string::npos, "package RAPL channel");
+  }
+  expect(j.find("unsupported_no_inject_api") != std::string::npos ||
+             j.find("unsupported_no_compiler") != std::string::npos ||
+             j.find("compiler_actshave") != std::string::npos,
+         "shave silicon load is honest");
+  if (j.find("\"npu_available\": true") != std::string::npos) {
+    expect(j.find("\"shave_unsigned_inject\": \"unsupported_no_inject_api\"") != std::string::npos,
+           "unsigned SHAVE inject still unsupported");
+  }
+#endif
 }
 
 IOVS_TEST(mixer_auto_completes_under_competing_npu) {

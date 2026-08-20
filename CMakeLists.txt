@@ -46,6 +46,7 @@ set(IOVS_SOURCES
   src/preprocess/preprocess.cpp
   src/rt/batcher.cpp
   src/rt/energy.cpp
+  src/rt/shave_elf.cpp
 )
 
 add_library(iovs SHARED ${IOVS_SOURCES})
@@ -60,7 +61,7 @@ target_include_directories(iovs
 target_compile_definitions(iovs PRIVATE IOVS_BUILD)
 
 if(WIN32)
-  target_link_libraries(iovs PRIVATE advapi32)
+  target_link_libraries(iovs PRIVATE advapi32 setupapi pdh)
 endif()
 
 if(IOVS_WITH_OPENVINO)

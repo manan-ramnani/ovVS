@@ -2,9 +2,16 @@
 
 #if defined(IOVS_WITH_OPENVINO)
 #include <openvino/openvino.hpp>
+#include <openvino/op/abs.hpp>
+#include <openvino/op/convert.hpp>
 #include <openvino/op/gather.hpp>
+#include <openvino/op/greater_eq.hpp>
+#include <openvino/op/logical_xor.hpp>
+#include <openvino/op/power.hpp>
 #include <openvino/op/reduce_sum.hpp>
+#include <openvino/op/subtract.hpp>
 #include <openvino/op/topk.hpp>
+#include <openvino/op/unsqueeze.hpp>
 #include <openvino/opsets/opset8.hpp>
 #endif
 
@@ -304,6 +311,147 @@ bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
   (void)codes;
   (void)ncodes;
   (void)out;
+  return false;
+#endif
+}
+
+bool ov_pairwise_npu(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+                     int64_t ny, int64_t dim, float* out, float metric_arg) {
+#if defined(IOVS_WITH_OPENVINO)
+  if (!ov_has_device("NPU")) return false;
+  if (metric != IOVS_METRIC_BITWISE_HAMMING && metric != IOVS_METRIC_LP_UNEXPANDED) return false;
+  try {
+    using namespace ov;
+    const float p = metric_arg > 0.f ? metric_arg : 2.f;
+    std::ostringstream key;
+    key << "NPU_pair_m" << static_cast<int>(metric) << "_nx" << nx << "_ny" << ny << "_d" << dim << "_p" << p;
+    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
+    auto it = cache.find(key.str());
+    if (it == cache.end()) {
+      auto pX = std::make_shared<opset8::Parameter>(element::f32,
+                                                    Shape{static_cast<size_t>(nx), static_cast<size_t>(dim)});
+      auto pY = std::make_shared<opset8::Parameter>(element::f32,
+                                                    Shape{static_cast<size_t>(ny), static_cast<size_t>(dim)});
+      auto uns1 = opset8::Constant::create(element::i64, Shape{1}, {1});
+      auto uns0 = opset8::Constant::create(element::i64, Shape{1}, {0});
+      auto x3 = std::make_shared<ov::op::v0::Unsqueeze>(pX, uns1);
+      auto y3 = std::make_shared<ov::op::v0::Unsqueeze>(pY, uns0);
+      auto axes = opset8::Constant::create(element::i64, Shape{1}, {2});
+      std::shared_ptr<ov::Node> scores;
+      if (metric == IOVS_METRIC_BITWISE_HAMMING) {
+        auto zero = opset8::Constant::create(element::f32, Shape{}, {0.f});
+        auto bx = std::make_shared<ov::op::v1::GreaterEqual>(x3, zero);
+        auto by = std::make_shared<ov::op::v1::GreaterEqual>(y3, zero);
+        auto lx = std::make_shared<ov::op::v1::LogicalXor>(bx, by);
+        auto fx = std::make_shared<ov::op::v0::Convert>(lx, element::f32);
+        scores = std::make_shared<ov::op::v1::ReduceSum>(fx, axes, false);
+      } else {
+        auto diff = std::make_shared<ov::op::v1::Subtract>(x3, y3);
+        auto ad = std::make_shared<ov::op::v0::Abs>(diff);
+        auto pconst = opset8::Constant::create(element::f32, Shape{}, {p});
+        auto pw = std::make_shared<ov::op::v1::Power>(ad, pconst);
+        auto sm = std::make_shared<ov::op::v1::ReduceSum>(pw, axes, false);
+        auto invp = opset8::Constant::create(element::f32, Shape{}, {1.f / p});
+        scores = std::make_shared<ov::op::v1::Power>(sm, invp);
+      }
+      auto model = std::make_shared<Model>(OutputVector{scores}, ParameterVector{pX, pY});
+      cache[key.str()] = ov_core().compile_model(model, "NPU");
+      it = cache.find(key.str());
+    }
+    auto req = it->second.create_infer_request();
+    Tensor tX(element::f32, Shape{static_cast<size_t>(nx), static_cast<size_t>(dim)}, const_cast<float*>(x));
+    Tensor tY(element::f32, Shape{static_cast<size_t>(ny), static_cast<size_t>(dim)}, const_cast<float*>(y));
+    req.set_input_tensor(0, tX);
+    req.set_input_tensor(1, tY);
+    req.infer();
+    Tensor tO = req.get_output_tensor();
+    const size_t nbytes = static_cast<size_t>(nx * ny) * sizeof(float);
+    if (tO.get_byte_size() < nbytes) return false;
+    std::memcpy(out, tO.data<float>(), nbytes);
+    return true;
+  } catch (...) {
+    ++r.npu_compile_fails;
+    return false;
+  }
+#else
+  (void)r;
+  (void)metric;
+  (void)x;
+  (void)nx;
+  (void)y;
+  (void)ny;
+  (void)dim;
+  (void)out;
+  (void)metric_arg;
+  return false;
+#endif
+}
+
+bool npu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+                  int64_t ny, int64_t dim, float* out, float metric_arg) {
+  if (ov_pairwise_npu(r, metric, x, nx, y, ny, dim, out, metric_arg)) return true;
+  constexpr int64_t kTile = 32;
+  if (nx <= kTile) return false;
+  for (int64_t i = 0; i < nx; i += kTile) {
+    const int64_t rows = std::min(kTile, nx - i);
+    if (!ov_pairwise_npu(r, metric, x + i * dim, rows, y, ny, dim, out + i * ny, metric_arg)) return false;
+  }
+  return true;
+}
+
+bool npu_shave_profile_adc(int* shave_tasks, int* dpu_tasks, std::vector<uint8_t>* blob,
+                           std::string* exec_types) {
+#if defined(IOVS_WITH_OPENVINO)
+  if (!ov_has_device("NPU")) return false;
+  try {
+    using namespace ov;
+    constexpr int32_t pq_m = 8, ks = 16, nn = 4;
+    const int64_t lut_n = static_cast<int64_t>(pq_m) * ks;
+    auto pLut = std::make_shared<opset8::Parameter>(element::f32, Shape{static_cast<size_t>(lut_n)});
+    auto pIdx = std::make_shared<opset8::Parameter>(
+        element::i32, Shape{static_cast<size_t>(nn), static_cast<size_t>(pq_m)});
+    auto axis = opset8::Constant::create(element::i64, Shape{}, {0});
+    auto g = std::make_shared<ov::op::v8::Gather>(pLut, pIdx, axis);
+    auto red_axes = opset8::Constant::create(element::i64, Shape{1}, {1});
+    auto red = std::make_shared<ov::op::v1::ReduceSum>(g, red_axes, false);
+    auto model = std::make_shared<Model>(OutputVector{red}, ParameterVector{pLut, pIdx});
+    auto compiled = ov_core().compile_model(model, "NPU", ov::AnyMap{{"PERF_COUNT", true}});
+    std::vector<float> lut(static_cast<size_t>(lut_n), 1.f);
+    std::vector<int32_t> idx(static_cast<size_t>(nn * pq_m), 0);
+    auto req = compiled.create_infer_request();
+    req.set_input_tensor(0, Tensor(element::f32, Shape{static_cast<size_t>(lut_n)}, lut.data()));
+    req.set_input_tensor(1, Tensor(element::i32, Shape{static_cast<size_t>(nn), static_cast<size_t>(pq_m)},
+                                   idx.data()));
+    req.infer();
+    int shave = 0, dpu = 0;
+    std::string types;
+    for (const auto& p : req.get_profiling_info()) {
+      if (!types.empty()) types += ",";
+      types += p.exec_type;
+      if (p.exec_type.find("have") != std::string::npos || p.exec_type.find("SHAVE") != std::string::npos) {
+        ++shave;
+      } else if (p.exec_type.find("DPU") != std::string::npos) {
+        ++dpu;
+      }
+    }
+    if (shave_tasks) *shave_tasks = shave;
+    if (dpu_tasks) *dpu_tasks = dpu;
+    if (exec_types) *exec_types = types;
+    if (blob) {
+      std::stringstream ss;
+      compiled.export_model(ss);
+      const std::string s = ss.str();
+      blob->assign(s.begin(), s.end());
+    }
+    return shave > 0;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)shave_tasks;
+  (void)dpu_tasks;
+  (void)blob;
+  (void)exec_types;
   return false;
 #endif
 }

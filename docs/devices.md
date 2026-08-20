@@ -17,7 +17,7 @@ ioVS picks a device per primitive (`gemm`, `topk`, `gather`, pairwise). Algorith
 
 Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>/gemm_large.json` when that file is found (`IOVS_TABLES` or `../../tables` from the binary). On Arrow Lake 265K that is GPU, then NPU, then CPU.
 
-`iovsResourcesEnergyUj` returns package microjoules from Linux RAPL sysfs or Intel Power Gadget on Windows. If neither exists, status is `unsupported` (no RAPL MSR/ETW energy counter on this host after probing Power Gadget DLLs and `GetSystemPowerStatus`).
+`iovsResourcesEnergyUj` returns package microjoules. On Windows the path is the inbox **Intel Processor** driver (`intelppm.sys` / `cpu.inf`) Energy Metering Interface (EMI v2, OEM `Microsoft` / model `PPM`) on the ACPI processor device, channel `RAPL_Package0_PKG`. Units are picowatt-hours → µJ via ×0.0036. Fallback is PDH `\Energy Meter(RAPL_Package0_PKG)\Energy` (same EMI channels), then Intel Power Gadget if installed. Linux uses RAPL sysfs. `GetSystemPowerStatus` is not a package counter. Intel IPF (`ipf_cpu`, PCI `8086:AD03`) and PMT (`IntcPMT`, PCI `8086:AD0D`) are present on this SKU but are DTT/telemetry, not the RAPL EMI publisher. Power Gadget is not required.
 
 ## This SKU
 
@@ -39,7 +39,7 @@ ScaNN-like indexes train IVF-PQ in anisotropic (per-dim std) space and **re-rank
 
 `iovsBitsetFromAllowList(n, ids, nids, bitset)` fills a `(n+7)/8` bitset for filtered search. IVF-PQ and IVF-RaBitQ support serialize/deserialize/extend like IVF-Flat.
 
-When `IOVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Dataset/graph allocations use shared USM so iGPU GEMM/TopK/Gather/CAGRA skip a host memcpy when the pointer is already shared. NPU still binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest). PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes.
+When `IOVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Dataset/graph allocations use shared USM so iGPU GEMM/TopK/Gather/CAGRA skip a host memcpy when the pointer is already shared. NPU still binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest) and an OpenVINO NPU graph (FORCE_NPU is honest): Hamming is GreaterEqual→LogicalXor→ReduceSum; Lp is Subtract→Abs→Power→ReduceSum→Power. Those lower to Intel ActShave (`eltwise_logical_xor`, `activation_abs`, …) plus DPU ReduceSum. PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes; `PERF_COUNT` shows those tiles run as ActShave + DPU (`shave_silicon_load: compiler_actshave`). A raw SHAVE ELF32 is not a firmware load object (`invalid_native_binary`); the compiler embeds kernel `.text` in a graph ELF64. See `compiler/shave/README.md`.
 
 NPU Gather/TopK HostCompile tiles rows (32) and gather indices (128) when a full-shape compile fails.
 

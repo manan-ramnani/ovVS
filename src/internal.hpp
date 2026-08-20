@@ -144,6 +144,10 @@ inline ResourcesData* rd(iovsResources_t r) { return reinterpret_cast<ResourcesD
 
 void probe_fill(ResourcesData& r);
 std::string probe_json();
+void append_energy_probe_json(std::ostringstream& o);
+void append_shave_elf_probe_json(std::ostringstream& o);
+bool npu_shave_profile_adc(int* shave_tasks, int* dpu_tasks, std::vector<uint8_t>* blob,
+                           std::string* exec_types);
 
 /* Shared USM (SYCL) or heap. Dataset/graph vectors use UsmAllocator so iGPU binds these pointers. */
 void* iovs_usm_malloc(size_t bytes);
@@ -206,6 +210,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances);
 bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+                  int64_t ny, int64_t dim, float* out, float metric_arg);
+bool npu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg);
 bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
                 int64_t ncodes, float* out);

@@ -160,6 +160,8 @@ std::string probe_json() {
     << "false"
 #endif
     << ",\n";
+  append_energy_probe_json(o);
+  append_shave_elf_probe_json(o);
   o << "  \"version\": \"" << IOVS_VERSION_STRING << "\"\n";
   o << "}\n";
   return o.str();

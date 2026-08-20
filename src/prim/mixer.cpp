@@ -146,7 +146,15 @@ iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, in
     }
     return IOVS_STATUS_SUCCESS;
   }
-  if (r.policy != IOVS_POLICY_FORCE_CPU) {
+  const iovsDevice d = choose_device(r, "pairwise", nx * ny * dim);
+  if (d == IOVS_DEVICE_NPU) {
+    if (npu_pairwise(r, metric, x, nx, y, ny, dim, out, metric_arg)) {
+      r.last_device = IOVS_DEVICE_NPU;
+      return IOVS_STATUS_SUCCESS;
+    }
+    if (r.policy == IOVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  }
+  if (d == IOVS_DEVICE_GPU || (d == IOVS_DEVICE_NPU && r.policy != IOVS_POLICY_FORCE_CPU)) {
     if (gpu_pairwise(r, metric, x, nx, y, ny, dim, out, metric_arg)) {
       r.last_device = IOVS_DEVICE_GPU;
       return IOVS_STATUS_SUCCESS;

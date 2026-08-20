@@ -85,7 +85,8 @@ IOVS_API iovsStatus iovsResourcesNpuFallbacks(iovsResources_t res, int32_t* coun
 IOVS_API iovsStatus iovsResourcesLastDevice(iovsResources_t res, iovsDevice* device);
 IOVS_API iovsStatus iovsResourcesSetNpuBusy(iovsResources_t res, int32_t busy);
 IOVS_API int32_t iovsSyclEnabled(void);
-/* Package energy in microjoules if RAPL/ETW/Power Gadget is present; else UNSUPPORTED. */
+/* Package energy in microjoules from Linux RAPL sysfs, Windows EMI (intelppm RAPL),
+   Energy Meter PDH, or Intel Power Gadget. Else UNSUPPORTED. `res` may be null. */
 IOVS_API iovsStatus iovsResourcesEnergyUj(iovsResources_t res, int64_t* uj);
 
 IOVS_API void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,

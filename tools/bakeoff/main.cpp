@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
       "\"gpu\": %s,\n  \"sycl\": %s,\n  \"energy_probe\": \"%s\",\n  \"runs\": [\n",
       sku, op.c_str(), static_cast<long long>(M), static_cast<long long>(N), static_cast<long long>(K),
       npu ? "true" : "false", gpu ? "true" : "false", iovsSyclEnabled() ? "true" : "false",
-      es0 == IOVS_STATUS_SUCCESS ? "rapl_or_gadget" : "unsupported");
+      es0 == IOVS_STATUS_SUCCESS ? "success" : "unsupported");
 
   const iovsPolicy policies[] = {IOVS_POLICY_FORCE_CPU, IOVS_POLICY_FORCE_NPU, IOVS_POLICY_FORCE_GPU};
   const char* names[] = {"cpu", "npu", "gpu"};
