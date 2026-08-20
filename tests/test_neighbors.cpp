@@ -1,6 +1,7 @@
 #include "test_harness.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -241,12 +242,14 @@ IOVS_TEST(force_gpu_hamming_lp_vs_oracle) {
   const iovsStatus st = iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data());
   if (st == IOVS_STATUS_DEVICE_UNAVAILABLE) {
     iovsBruteForceDestroy(ix);
+    expect(!iovsSyclEnabled(), "SYCL GPU Hamming DEVICE_UNAVAILABLE");
     return;
   }
   expect_status(st, "ham gpu");
   iovsDevice last = IOVS_DEVICE_CPU;
   expect_status(iovsResourcesLastDevice(res.r, &last), "last");
   expect(last == IOVS_DEVICE_GPU, "FORCE_GPU hamming last_device");
+  std::printf("    hamming last_device=gpu\n");
   float hbest = 1e30f;
   for (int64_t i = 0; i < n; ++i) {
     float s = 0.f;
@@ -295,6 +298,7 @@ IOVS_TEST(force_gpu_hamming_lp_vs_oracle) {
   }
   pg = std::sqrt(pg);
   expect(std::fabs(pg - pbest) < 1e-4f, "lp min score");
+  std::printf("    lp last_device=gpu\n");
   (void)p;
   iovsBruteForceDestroy(ix);
 }

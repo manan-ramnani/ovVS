@@ -1,6 +1,7 @@
 #include "test_harness.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <numeric>
 
 IOVS_TEST(gemm_matches_cpu_reference) {
@@ -111,6 +112,7 @@ IOVS_TEST(gemm_gpu_matches_ref_gemm) {
   iovsDevice last = IOVS_DEVICE_CPU;
   expect_status(iovsResourcesLastDevice(res.r, &last), "last");
   expect(last == IOVS_DEVICE_GPU, "FORCE_GPU last_device");
+  std::printf("    gemm_gpu_matches_ref_gemm last_device=gpu\n");
   for (size_t i = 0; i < g.size(); ++i) expect(std::fabs(g[i] - R[i]) < 2e-2f, "gpu vs ref_gemm");
 }
 
@@ -130,11 +132,12 @@ IOVS_TEST(npu_pq_adc_matches_shave_when_present) {
   iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_NPU);
   const iovsStatus st =
       iovsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes, npuo.data());
-  if (st == IOVS_STATUS_DEVICE_UNAVAILABLE) return;
+  expect(st != IOVS_STATUS_DEVICE_UNAVAILABLE, "NPU present but PQ ADC DEVICE_UNAVAILABLE");
   expect_status(st, "npu adc");
   iovsDevice last = IOVS_DEVICE_CPU;
   expect_status(iovsResourcesLastDevice(res.r, &last), "adc last");
   expect(last == IOVS_DEVICE_NPU, "FORCE_NPU adc last_device");
+  std::printf("    npu_pq_adc last_device=npu\n");
   for (int64_t i = 0; i < ncodes; ++i) {
     expect(std::fabs(host[static_cast<size_t>(i)] - npuo[static_cast<size_t>(i)]) < 2e-2f, "adc vs shave");
   }
