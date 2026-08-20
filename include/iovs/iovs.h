@@ -266,6 +266,7 @@ IOVS_API iovsStatus iovsBatcherCreate(iovsResources_t res, iovsBruteForceIndex_t
                                       int32_t max_wait_ms, iovsBatcher_t* out);
 IOVS_API iovsStatus iovsBatcherSearch(iovsBatcher_t batcher, const float* queries, int64_t nq, int64_t k,
                                       int64_t* neighbors, float* distances);
+IOVS_API iovsStatus iovsBatcherLastBatchSize(iovsBatcher_t batcher, int32_t* nq);
 IOVS_API iovsStatus iovsBatcherDestroy(iovsBatcher_t batcher);
 
 #ifdef __cplusplus

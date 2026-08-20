@@ -262,6 +262,8 @@ void brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_
 void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
                      int32_t iters, std::vector<float>& centroids);
 
+int64_t brute_force_dim(iovsBruteForceIndex_t index);
+
 inline uint32_t fnv1a(const void* data, size_t n) {
   const auto* p = static_cast<const uint8_t*>(data);
   uint32_t h = 2166136261u;

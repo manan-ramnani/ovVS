@@ -103,6 +103,30 @@ _lib.iovsIvfFlatSearch.argtypes = [
     POINTER(c_float),
 ]
 _lib.iovsIvfFlatDestroy.argtypes = [c_void_p]
+_lib.iovsIvfPqBuild.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_int32,
+    c_int32,
+    POINTER(c_void_p),
+]
+_lib.iovsIvfPqSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_void_p,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.iovsIvfPqDestroy.argtypes = [c_void_p]
 _lib.iovsGemm.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -274,6 +298,28 @@ class IvfFlatIndex(_Index):
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
 
+class IvfPqIndex(_Index):
+    def search(self, queries, k=10, nprobe=8, krefine=32):
+        qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        nb = (c_int64 * (nq * k))()
+        ds = (c_float * (nq * k))()
+        rc = _lib.iovsIvfPqSearch(
+            self._res._h,
+            self._h,
+            qptr,
+            c_int64(nq),
+            c_int64(k),
+            c_int32(nprobe),
+            c_int32(krefine),
+            None,
+            nb,
+            ds,
+        )
+        if rc != 0:
+            raise RuntimeError("ivf-pq search failed")
+        return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+
 def _query_ptr(queries, dim):
     try:
         import numpy as np
@@ -372,5 +418,26 @@ class neighbors:
             if rc != 0:
                 raise RuntimeError("ivf_flat.build failed")
             return IvfFlatIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfFlatDestroy)
+
+    class ivf_pq:
+        @staticmethod
+        def build(dataset, dim=None, metric=0, nlist=8, pq_m=8, pq_nbits=8, resources=None):
+            res = resources or Resources()
+            keep, ptr, n, d = _dataset_ptr(dataset, dim)
+            ix = c_void_p()
+            rc = _lib.iovsIvfPqBuild(
+                res._h,
+                ptr,
+                c_int64(n),
+                c_int64(d),
+                c_int32(metric),
+                c_int32(nlist),
+                c_int32(pq_m),
+                c_int32(pq_nbits),
+                ctypes.byref(ix),
+            )
+            if rc != 0:
+                raise RuntimeError("ivf_pq.build failed")
+            return IvfPqIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfPqDestroy)
 
     build = brute_force.build

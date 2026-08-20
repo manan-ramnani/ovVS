@@ -83,6 +83,24 @@ def main() -> int:
         t1 = time.perf_counter()
         rec_i = recall_at_k(np.asarray(inb).reshape(-1), Iivf.reshape(-1), nq, k)
         print(f"iovs ivf-flat ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_i:.3f}")
+        pq_m, nbits, krefine = 8, 8, 32
+        quant_pq = faiss.IndexFlatL2(dim)
+        faiss_pq = faiss.IndexIVFPQ(quant_pq, dim, nlist, pq_m, nbits)
+        faiss_pq.train(data)
+        faiss_pq.add(data)
+        faiss_pq.nprobe = nprobe
+        t0 = time.perf_counter()
+        _, Ipq = faiss_pq.search(queries, k)
+        t1 = time.perf_counter()
+        print(f"faiss ivf-pq nlist={nlist} nprobe={nprobe} M={pq_m} nbits={nbits} ms={(t1 - t0) * 1000:.3f}")
+        pq_ix = lib.neighbors.ivf_pq.build(
+            data, dim=dim, nlist=nlist, pq_m=pq_m, pq_nbits=nbits, resources=res
+        )
+        t0 = time.perf_counter()
+        pnb, _ = pq_ix.search(queries, k=k, nprobe=nprobe, krefine=krefine)
+        t1 = time.perf_counter()
+        rec_p = recall_at_k(np.asarray(pnb).reshape(-1), Ipq.reshape(-1), nq, k)
+        print(f"iovs ivf-pq ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_p:.3f}")
         faiss_ok = True
     except Exception as e:
         print(f"faiss unavailable: {e}")

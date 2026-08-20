@@ -4,8 +4,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 #include <numeric>
 #include <set>
+#include <thread>
 #include <vector>
 
 static float oracle_dot(const float* a, const float* b, int64_t d) {
@@ -531,6 +533,45 @@ IOVS_TEST(hnsw_hnswlib_format_roundtrip) {
   iovsCagraDestroy(cg);
 }
 
+/* Independent IEEE-754 binary16 decoder (not libiovs). Search is compared to L2 on these floats. */
+static float oracle_f16_to_f32(uint16_t h) {
+  const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u) << 16);
+  const uint32_t exp = (h >> 10) & 0x1fu;
+  uint32_t man = h & 0x3ffu;
+  uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;
+    } else {
+      int32_t e = 127 - 15 + 1;
+      while ((man & 0x400u) == 0) {
+        man <<= 1;
+        --e;
+      }
+      man &= 0x3ffu;
+      bits = sign | (static_cast<uint32_t>(e) << 23) | (man << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7f800000u | (man << 13);
+  } else {
+    bits = sign | ((exp + (127 - 15)) << 23) | (man << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+static uint16_t oracle_f32_to_f16(float f) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &f, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const int32_t exp = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
+  const uint32_t man = bits & 0x7fffffu;
+  if (exp <= 0) return static_cast<uint16_t>(sign);
+  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (man >> 13));
+}
+
 IOVS_TEST(brute_fp16_int8_vs_fp32_oracle) {
   Res res;
   iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
@@ -539,26 +580,16 @@ IOVS_TEST(brute_fp16_int8_vs_fp32_oracle) {
   auto q = make_data(1, dim, 481);
   std::vector<uint16_t> h(static_cast<size_t>(n * dim));
   std::vector<int8_t> i8(static_cast<size_t>(n * dim));
+  std::vector<float> f16host(static_cast<size_t>(n * dim));
   for (size_t i = 0; i < h.size(); ++i) {
-    /* round-trip through the same conversion the library uses */
-    float v = data[i];
-    uint32_t bits = 0;
-    std::memcpy(&bits, &v, 4);
-    uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xff) - 127 + 15;
-    uint32_t man = bits & 0x7fffffu;
-    uint16_t hh = static_cast<uint16_t>(sign);
-    if (exp > 0 && exp < 31) hh = static_cast<uint16_t>(sign | (exp << 10) | (man >> 13));
-    h[i] = hh;
+    h[i] = oracle_f32_to_f16(data[i]);
+    f16host[i] = oracle_f16_to_f32(h[i]);
     float s = std::max(-127.f, std::min(127.f, std::round(data[i] * 50.f)));
     i8[i] = static_cast<int8_t>(s);
-    data[i] = s; /* int8 path stores integer values as float */
   }
   std::vector<int64_t> truth(static_cast<size_t>(k));
   std::vector<float> td(static_cast<size_t>(k));
-  brute_oracle(data.data(), n, dim, q.data(), 1, k, truth.data(), td.data());
-  /* FP16: rebuild fp32 from the same f16 payload as the library. */
-  std::vector<float> f16host(static_cast<size_t>(n * dim));
+  brute_oracle(f16host.data(), n, dim, q.data(), 1, k, truth.data(), td.data());
   iovsBruteForceIndex_t hix = nullptr;
   expect_status(iovsBruteForceBuildTyped(res.r, h.data(), n, dim, IOVS_METRIC_L2_EXPANDED, IOVS_DTYPE_F16,
                                          &hix),
@@ -566,8 +597,13 @@ IOVS_TEST(brute_fp16_int8_vs_fp32_oracle) {
   std::vector<int64_t> nb(static_cast<size_t>(k));
   std::vector<float> ds(static_cast<size_t>(k));
   expect_status(iovsBruteForceSearch(res.r, hix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "f16s");
-  /* atol: fp16 mantissa is 10 bits; neighbor ids should match a f16-decoded oracle. */
-  expect(nb[0] >= 0, "f16 neighbor");
+  /* Distances are L2(query_f32, decode(f16(dataset))). Ids must match that oracle.
+     Atol 2e-2 covers binary16 mantissa (~1e-3) accumulated over dim=8. */
+  constexpr float kF16DistAtol = 2e-2f;
+  for (int64_t t = 0; t < k; ++t) {
+    expect(nb[static_cast<size_t>(t)] == truth[static_cast<size_t>(t)], "f16 neighbor id");
+    expect(std::fabs(ds[static_cast<size_t>(t)] - td[static_cast<size_t>(t)]) < kF16DistAtol, "f16 dist");
+  }
   iovsBruteForceDestroy(hix);
 
   std::vector<float> i8f(static_cast<size_t>(n * dim));
@@ -578,7 +614,7 @@ IOVS_TEST(brute_fp16_int8_vs_fp32_oracle) {
                                          &iix),
                 "i8");
   expect_status(iovsBruteForceSearch(res.r, iix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "i8s");
-  expect(nb[0] == truth[0], "int8 top1 vs oracle");
+  for (int64_t t = 0; t < k; ++t) expect(nb[static_cast<size_t>(t)] == truth[static_cast<size_t>(t)], "i8 id");
   iovsBruteForceDestroy(iix);
 }
 
@@ -593,12 +629,30 @@ IOVS_TEST(dynamic_batcher_matches_eager) {
   std::vector<int64_t> eager(static_cast<size_t>(nq * k));
   std::vector<float> eds(static_cast<size_t>(nq * k));
   expect_status(iovsBruteForceSearch(res.r, ix, q.data(), nq, k, nullptr, eager.data(), eds.data()), "e");
+
+  /* Concurrent nq=1 submits: max_batch=4, max_wait=250ms so they merge into one prim search. */
   iovsBatcher_t b = nullptr;
-  expect_status(iovsBatcherCreate(res.r, ix, 8, 0, &b), "batch");
-  std::vector<int64_t> got(static_cast<size_t>(nq * k));
-  std::vector<float> gds(static_cast<size_t>(nq * k));
-  expect_status(iovsBatcherSearch(b, q.data(), nq, k, got.data(), gds.data()), "bs");
-  for (int64_t i = 0; i < nq * k; ++i) expect(got[static_cast<size_t>(i)] == eager[static_cast<size_t>(i)], "coalesced");
+  expect_status(iovsBatcherCreate(res.r, ix, 4, 250, &b), "batch");
+  std::vector<int64_t> got(static_cast<size_t>(nq * k), -1);
+  std::vector<float> gds(static_cast<size_t>(nq * k), 0.f);
+  std::vector<iovsStatus> sts(static_cast<size_t>(nq), IOVS_STATUS_ERROR);
+  std::latch go(static_cast<std::ptrdiff_t>(nq));
+  std::vector<std::thread> th;
+  th.reserve(static_cast<size_t>(nq));
+  for (int64_t i = 0; i < nq; ++i) {
+    th.emplace_back([&, i] {
+      go.arrive_and_wait();
+      sts[static_cast<size_t>(i)] = iovsBatcherSearch(b, q.data() + i * dim, 1, k,
+                                                      got.data() + i * k, gds.data() + i * k);
+    });
+  }
+  for (auto& t : th) t.join();
+  for (int64_t i = 0; i < nq; ++i) expect_status(sts[static_cast<size_t>(i)], "thread search");
+  int32_t coalesced = 0;
+  expect_status(iovsBatcherLastBatchSize(b, &coalesced), "last batch");
+  expect(coalesced == static_cast<int32_t>(nq), "concurrent queries must coalesce");
+  for (int64_t i = 0; i < nq * k; ++i)
+    expect(got[static_cast<size_t>(i)] == eager[static_cast<size_t>(i)], "coalesced vs eager");
   iovsBatcherDestroy(b);
   iovsBruteForceDestroy(ix);
 }

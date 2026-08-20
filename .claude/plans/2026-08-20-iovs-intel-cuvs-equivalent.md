@@ -821,6 +821,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | HostCompile | NPU GEMM tiles of M=256 when a full-shape compile fails | in `npu_gemm`; SHAVE C still host-linked until unsigned ELF is loadable |
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
 | Mixer v2 | `iovsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
+| Dynamic batcher | thread-safe waiter queue; flush at max_B or max_wait; `iovsBatcherLastBatchSize` | concurrent nq=1 submits coalesce; results match eager brute |
 
 ---
 

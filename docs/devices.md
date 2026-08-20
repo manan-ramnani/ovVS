@@ -27,7 +27,7 @@ Search is `prim_graph_walk`: fused SYCL iGPU kernel when `IOVS_WITH_SYCL=ON`, ot
 
 ## FP16 / INT8
 
-`iovsBruteForceBuildTyped` converts F16 (IEEE) or I8 (value as float) into the fp32 workspace used by prims. Compare I8 search to an oracle on the same integer-valued floats. F16 neighbor ids match a dequantized-fp16 oracle; expect ~1e-3 distance atol vs true fp32.
+`iovsBruteForceBuildTyped` converts F16 (IEEE) or I8 (value as float) into the fp32 workspace used by prims. I8 search ids match an independent L2 oracle on the same integer-valued floats. F16 search ids match an independent L2 oracle on IEEE-decoded binary16 vectors (not the original fp32 dataset); L2 distances use atol **2e-2** (binary16 mantissa ~1e-3, accumulated over typical test `dim`).
 
 ## HNSW file
 

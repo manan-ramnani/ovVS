@@ -128,6 +128,15 @@ iovsStatus iovsBruteForceDestroy(iovsBruteForceIndex_t index) {
   return IOVS_STATUS_SUCCESS;
 }
 
+namespace iovs {
+namespace impl {
+int64_t brute_force_dim(iovsBruteForceIndex_t index) {
+  if (!index) return 0;
+  return reinterpret_cast<BruteIndex*>(index)->dim;
+}
+}  // namespace impl
+}  // namespace iovs
+
 /* ---------------- IVF-Flat ---------------- */
 
 iovsStatus iovsIvfFlatBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
