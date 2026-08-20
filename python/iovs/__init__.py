@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-from ctypes import POINTER, c_char_p, c_float, c_int32, c_int64, c_void_p
+from ctypes import POINTER, c_char_p, c_float, c_int32, c_int64, c_uint8, c_void_p
 from pathlib import Path
 
 
@@ -19,6 +19,8 @@ def _load():
         here,
         here.parent,
         here.parent.parent / "build" / "bin",
+        here.parent.parent / "build-sycl" / "bin",
+        here.parent.parent / "build-icpx" / "bin",
         here.parent.parent / "build" / "Release",
         here.parent.parent / "build" / "Debug",
     ]
@@ -158,6 +160,44 @@ _lib.iovsGatherRows.argtypes = [
 ]
 _lib.iovsResourcesSetPolicy.argtypes = [c_void_p, c_int32]
 _lib.iovsResourcesLastDevice.argtypes = [c_void_p, POINTER(c_int32)]
+_lib.iovsBitsetFromAllowList.argtypes = [c_int64, POINTER(c_int64), c_int64, POINTER(c_uint8)]
+_lib.iovsIvfPqSerialize.argtypes = [c_void_p, c_char_p]
+_lib.iovsIvfPqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
+_lib.iovsIvfPqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
+_lib.iovsIvfRabitqBuild.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    POINTER(c_void_p),
+]
+_lib.iovsIvfRabitqSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_void_p,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.iovsIvfRabitqDestroy.argtypes = [c_void_p]
+_lib.iovsIvfRabitqSerialize.argtypes = [c_void_p, c_char_p]
+_lib.iovsIvfRabitqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
+_lib.iovsIvfRabitqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
+_lib.iovsSyclEnabled.restype = c_int32
+_lib.iovsSyclEnabled.argtypes = []
+
+METRIC_L2 = 0
+METRIC_L2_SQRT = 1
+METRIC_INNER_PRODUCT = 2
+METRIC_COSINE = 3
+METRIC_HAMMING = 4
+METRIC_LP = 5
 
 
 def _as_f32(arr):
@@ -175,6 +215,10 @@ def _as_f32(arr):
 
 def version() -> str:
     return _lib.iovsGetVersion().decode()
+
+
+def sycl_enabled() -> bool:
+    return bool(_lib.iovsSyclEnabled())
 
 
 class Resources:
@@ -230,11 +274,47 @@ class Resources:
         self.close()
 
 
+def bitset_from_allow_list(n, ids):
+    n = int(n)
+    seq = list(ids)
+    nids = len(seq)
+    nbytes = (n + 7) // 8
+    buf = (c_uint8 * max(nbytes, 1))()
+    ip = (c_int64 * max(nids, 1))(*([int(x) for x in seq] if nids else []))
+    rc = _lib.iovsBitsetFromAllowList(
+        c_int64(n), ip if nids else None, c_int64(nids), buf
+    )
+    if rc != 0:
+        raise RuntimeError("iovsBitsetFromAllowList failed")
+    return buf
+
+
+def _bitset_ptr(n, bitset=None, allow_list=None):
+    if allow_list is not None:
+        buf = bitset_from_allow_list(n, allow_list)
+        return buf, ctypes.cast(buf, c_void_p)
+    if bitset is None:
+        return None, None
+    try:
+        import numpy as np
+
+        if isinstance(bitset, np.ndarray):
+            a = np.ascontiguousarray(bitset, dtype=np.uint8)
+            return a, a.ctypes.data_as(c_void_p)
+    except ImportError:
+        pass
+    if isinstance(bitset, (bytes, bytearray)):
+        buf = (c_uint8 * len(bitset)).from_buffer_copy(bitset)
+        return buf, ctypes.cast(buf, c_void_p)
+    return bitset, ctypes.cast(bitset, c_void_p)
+
+
 class _Index:
-    def __init__(self, res, handle, dim, own_res, destroy):
+    def __init__(self, res, handle, dim, own_res, destroy, n=0):
         self._res = res
         self._h = handle
         self.dim = dim
+        self.n = n
         self._own = own_res
         self._destroy = destroy
 
@@ -251,12 +331,13 @@ class _Index:
 
 
 class BruteIndex(_Index):
-    def search(self, queries, k=10):
+    def search(self, queries, k=10, bitset=None, allow_list=None):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
         rc = _lib.iovsBruteForceSearch(
-            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), None, nb, ds
+            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), bsp, nb, ds
         )
         if rc != 0:
             raise RuntimeError("search failed")
@@ -264,8 +345,9 @@ class BruteIndex(_Index):
 
 
 class CagraIndex(_Index):
-    def search(self, queries, k=10, itopk_size=32, search_width=2):
+    def search(self, queries, k=10, itopk_size=32, search_width=2, bitset=None, allow_list=None):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
         rc = _lib.iovsCagraSearch(
@@ -276,7 +358,7 @@ class CagraIndex(_Index):
             c_int64(k),
             c_int32(itopk_size),
             c_int32(search_width),
-            None,
+            bsp,
             nb,
             ds,
         )
@@ -286,12 +368,13 @@ class CagraIndex(_Index):
 
 
 class IvfFlatIndex(_Index):
-    def search(self, queries, k=10, nprobe=8):
+    def search(self, queries, k=10, nprobe=8, bitset=None, allow_list=None):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
         rc = _lib.iovsIvfFlatSearch(
-            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(nprobe), None, nb, ds
+            self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(nprobe), bsp, nb, ds
         )
         if rc != 0:
             raise RuntimeError("ivf search failed")
@@ -299,8 +382,9 @@ class IvfFlatIndex(_Index):
 
 
 class IvfPqIndex(_Index):
-    def search(self, queries, k=10, nprobe=8, krefine=32):
+    def search(self, queries, k=10, nprobe=8, krefine=32, bitset=None, allow_list=None):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
         rc = _lib.iovsIvfPqSearch(
@@ -311,13 +395,62 @@ class IvfPqIndex(_Index):
             c_int64(k),
             c_int32(nprobe),
             c_int32(krefine),
-            None,
+            bsp,
             nb,
             ds,
         )
         if rc != 0:
             raise RuntimeError("ivf-pq search failed")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+    def serialize(self, path):
+        rc = _lib.iovsIvfPqSerialize(self._h, str(path).encode())
+        if rc != 0:
+            raise RuntimeError("ivf-pq serialize failed")
+
+    def extend(self, extra):
+        keep, ptr, n, _d = _dataset_ptr(extra, self.dim)
+        rc = _lib.iovsIvfPqExtend(self._res._h, self._h, ptr, c_int64(n))
+        if rc != 0:
+            raise RuntimeError("ivf-pq extend failed")
+        self.n += n
+        return keep
+
+
+class IvfRabitqIndex(_Index):
+    def search(self, queries, k=10, nprobe=8, krefine=32, bitset=None, allow_list=None):
+        qkeep, qptr, nq = _query_ptr(queries, self.dim)
+        bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
+        nb = (c_int64 * (nq * k))()
+        ds = (c_float * (nq * k))()
+        rc = _lib.iovsIvfRabitqSearch(
+            self._res._h,
+            self._h,
+            qptr,
+            c_int64(nq),
+            c_int64(k),
+            c_int32(nprobe),
+            c_int32(krefine),
+            bsp,
+            nb,
+            ds,
+        )
+        if rc != 0:
+            raise RuntimeError("ivf-rabitq search failed")
+        return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+    def serialize(self, path):
+        rc = _lib.iovsIvfRabitqSerialize(self._h, str(path).encode())
+        if rc != 0:
+            raise RuntimeError("ivf-rabitq serialize failed")
+
+    def extend(self, extra):
+        keep, ptr, n, _d = _dataset_ptr(extra, self.dim)
+        rc = _lib.iovsIvfRabitqExtend(self._res._h, self._h, ptr, c_int64(n))
+        if rc != 0:
+            raise RuntimeError("ivf-rabitq extend failed")
+        self.n += n
+        return keep
 
 
 def _from_dlpack(obj):
@@ -402,7 +535,7 @@ class neighbors:
             rc = _lib.iovsBruteForceBuild(res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), ctypes.byref(ix))
             if rc != 0:
                 raise RuntimeError("brute_force.build failed")
-            return BruteIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsBruteForceDestroy)
+            return BruteIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsBruteForceDestroy, n=n)
 
     class cagra:
         @staticmethod
@@ -422,7 +555,7 @@ class neighbors:
             )
             if rc != 0:
                 raise RuntimeError("cagra.build failed")
-            return CagraIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsCagraDestroy)
+            return CagraIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsCagraDestroy, n=n)
 
     class ivf_flat:
         @staticmethod
@@ -435,7 +568,7 @@ class neighbors:
             )
             if rc != 0:
                 raise RuntimeError("ivf_flat.build failed")
-            return IvfFlatIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfFlatDestroy)
+            return IvfFlatIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfFlatDestroy, n=n)
 
     class ivf_pq:
         @staticmethod
@@ -456,6 +589,21 @@ class neighbors:
             )
             if rc != 0:
                 raise RuntimeError("ivf_pq.build failed")
-            return IvfPqIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfPqDestroy)
+            return IvfPqIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfPqDestroy, n=n)
+
+    class ivf_rabitq:
+        @staticmethod
+        def build(dataset, dim=None, metric=0, nlist=8, resources=None):
+            res = resources or Resources()
+            keep, ptr, n, d = _dataset_ptr(dataset, dim)
+            ix = c_void_p()
+            rc = _lib.iovsIvfRabitqBuild(
+                res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(nlist), ctypes.byref(ix)
+            )
+            if rc != 0:
+                raise RuntimeError("ivf_rabitq.build failed")
+            return IvfRabitqIndex(
+                res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfRabitqDestroy, n=n
+            )
 
     build = brute_force.build

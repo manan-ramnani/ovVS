@@ -139,6 +139,10 @@ IOVS_API iovsStatus iovsIvfPqBuild(iovsResources_t res, const float* dataset, in
 IOVS_API iovsStatus iovsIvfPqSearch(iovsResources_t res, iovsIvfPqIndex_t index, const float* queries,
                                     int64_t nq, int64_t k, int32_t nprobe, int32_t krefine,
                                     const uint8_t* bitset, int64_t* neighbors, float* distances);
+IOVS_API iovsStatus iovsIvfPqSerialize(iovsIvfPqIndex_t index, const char* path);
+IOVS_API iovsStatus iovsIvfPqDeserialize(iovsResources_t res, const char* path, iovsIvfPqIndex_t* index);
+IOVS_API iovsStatus iovsIvfPqExtend(iovsResources_t res, iovsIvfPqIndex_t index, const float* extra,
+                                    int64_t nextra);
 IOVS_API iovsStatus iovsIvfPqDestroy(iovsIvfPqIndex_t index);
 
 /* IVF-RaBitQ */
@@ -148,6 +152,11 @@ IOVS_API iovsStatus iovsIvfRabitqSearch(iovsResources_t res, iovsIvfRabitqIndex_
                                         const float* queries, int64_t nq, int64_t k, int32_t nprobe,
                                         int32_t krefine, const uint8_t* bitset, int64_t* neighbors,
                                         float* distances);
+IOVS_API iovsStatus iovsIvfRabitqSerialize(iovsIvfRabitqIndex_t index, const char* path);
+IOVS_API iovsStatus iovsIvfRabitqDeserialize(iovsResources_t res, const char* path,
+                                             iovsIvfRabitqIndex_t* index);
+IOVS_API iovsStatus iovsIvfRabitqExtend(iovsResources_t res, iovsIvfRabitqIndex_t index, const float* extra,
+                                        int64_t nextra);
 IOVS_API iovsStatus iovsIvfRabitqDestroy(iovsIvfRabitqIndex_t index);
 
 /* NN-Descent */
@@ -211,6 +220,9 @@ IOVS_API iovsStatus iovsScannDestroy(iovsScannIndex_t index);
 /* All-neighbors */
 IOVS_API iovsStatus iovsAllNeighbors(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
                                      iovsMetric metric, int32_t k, int64_t* neighbors, float* distances);
+
+/* Allow-list → bitset of length (n+7)/8. Missing ids are filtered out (bit 0). */
+IOVS_API iovsStatus iovsBitsetFromAllowList(int64_t n, const int64_t* ids, int64_t nids, uint8_t* bitset);
 
 /* K-means */
 IOVS_API iovsStatus iovsKMeansFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,

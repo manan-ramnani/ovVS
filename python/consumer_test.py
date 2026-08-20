@@ -65,6 +65,38 @@ def main() -> int:
             print("dlpack mismatch", got2, truth, file=sys.stderr)
             return 1
         print("python consumer dlpack ok neighbors", got2)
+
+    even = [i for i in range(n) if i % 2 == 0]
+    nb3, _ = idx.search(q, k=k, allow_list=even)
+    got3 = list(nb3.ravel()[:k]) if hasattr(nb3, "ravel") else list(nb3[:k])
+    if any(g % 2 != 0 for g in got3):
+        print("allow-list mismatch", got3, file=sys.stderr)
+        return 1
+    print("python consumer allow-list ok neighbors", got3)
+
+    idxh = iovs.neighbors.brute_force.build(data, dim=dim, metric=iovs.METRIC_HAMMING, resources=res)
+    nbh, _ = idxh.search(q, k=1)
+    got_h = int(nbh.ravel()[0] if hasattr(nbh, "ravel") else nbh[0])
+    hbest, htruth = 1e30, -1
+    for i in range(n):
+        s = 0.0
+        row = data[i] if use_np else data[i * dim : (i + 1) * dim]
+        for d in range(dim):
+            ax = 1 if row[d] >= 0.0 else 0
+            ay = 1 if qrow[d] >= 0.0 else 0
+            s += ax ^ ay
+        if s < hbest:
+            hbest, htruth = s, i
+    got_h_score = 0.0
+    rowh = data[got_h] if use_np else data[got_h * dim : (got_h + 1) * dim]
+    for d in range(dim):
+        ax = 1 if rowh[d] >= 0.0 else 0
+        ay = 1 if qrow[d] >= 0.0 else 0
+        got_h_score += ax ^ ay
+    if got_h_score != hbest:
+        print("hamming mismatch", got_h, got_h_score, htruth, hbest, file=sys.stderr)
+        return 1
+    print("python consumer hamming ok neighbor", got_h)
     return 0
 
 

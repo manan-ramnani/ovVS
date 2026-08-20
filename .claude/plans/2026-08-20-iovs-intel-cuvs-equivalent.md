@@ -813,17 +813,20 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | CPU role | control, tiny-B, HostCompile, HNSW export | not the library’s identity |
 | SVS | competitor / idea source | no proprietary blob in core |
 | Equivalence | API + algorithms + quality knobs | not CUDA kernel isomorphism |
-| iGPU GEMM without DPC++ | OpenVINO GPU plugin | DPC++ not on this host; SYCL sources still required for icpx builds |
+| iGPU GEMM without DPC++ | OpenVINO GPU plugin | historical; official oneAPI `icx` 2025.1.1 is the Windows Ninja compiler. SYCL-first USM is the default iGPU path when `IOVS_WITH_SYCL=ON`; OpenVINO GPU remains fallback |
 | First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
 | FORCE_* honesty | DEVICE_UNAVAILABLE if the requested device did not run | bakeoff last_device must match requested device on success |
 | iGPU topk/gather without DPC++ | OpenVINO TopK/Gather on GPU plugin | SYCL kernels remain for icpx |
 | CAGRA walk | `prim_graph_walk`: fused SYCL if `IOVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | Heaps/seen sized to real `itopk`/`n` (not SLM-64 / expd-4096). Refuse SYCL only if itopk>4096 or seen bytes>64MiB, then host prim walk. `cagra_sycl_walk_n_over_4096` FORCE_GPU n=4200 vs independent L2. |
-| HostCompile | NPU GEMM tiles of M=256 when a full-shape compile fails | in `npu_gemm`; SHAVE C still host-linked until unsigned ELF is loadable |
+| HostCompile | NPU GEMM tiles of M=256, TopK rows of 32, Gather nidx of 128 when full-shape compile fails | in `npu_gemm` / `npu_topk` / `npu_gather_rows`; SHAVE ADC/TopK C still host-linked until unsigned ELF is loadable |
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
 | Mixer v2 | `iovsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
 | Dynamic batcher | thread-safe waiter queue; flush at max_B or max_wait; `iovsBatcherLastBatchSize` | concurrent nq=1 submits coalesce; results match eager brute |
 | ScaNN | anisotropic IVF-PQ + original-space refine | nprobe=all + krefine=n matches brute L2 |
-| Python tensors | NumPy + DLPack (`np.from_dlpack` / `__dlpack__`) | consumer searches from DLPack views |
+| Python tensors | NumPy + DLPack (`np.from_dlpack` / `__dlpack__`) | consumer searches from DLPack views; `allow_list=` / `bitset_from_allow_list` |
+| C++ API | header wrappers beyond brute-force | IVF-Flat / IVF-PQ / IVF-RaBitQ / CAGRA + serialize/extend in `iovs.hpp` |
+| Allow-list filter | `iovsBitsetFromAllowList` | fills `(n+7)/8` bitset; missing ids stay 0 |
+| IVF-PQ / RaBitQ persist | magic `IPQ1` / `RQB1` | serialize/deserialize/extend encode residuals into existing codebooks |
 | Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake winner is GPU |
 
 ---
@@ -832,7 +835,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 
 Filled in as installs finish. Placeholder until toolchain logs land:
 
-- **SYCL/icpx (oneAPI toolkit):** `winget install Intel.OneAPI.BaseToolkit` 2025.1.3.8 needs admin (`0x800704c7`). `--scope user` has no installer. Silent install to `%USERPROFILE%\intel\oneapi` still requires elevation. `icpx` from that toolkit is not on PATH.
+- **SYCL/oneAPI toolkit:** elevated offline installer `intel-oneapi-base-toolkit-2025.1.3.8_offline.exe` exit 0. `icpx`/`icx` 2025.1.1 at `C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin\`. On Windows Ninja, **`icx` for both C and CXX** (`icpx` is GNU-like; CMake then passes `/nologo /EHsc` and the compiler test fails). `build-icpx` with `-DIOVS_WITH_SYCL=ON -DIOVS_WITH_OPENVINO=ON` links `sycl8.dll` and passes 45/45 plus C++/C consumers, including `cagra_sycl_walk_n_over_4096`. `intel/llvm` nightly `clang++ -fsycl` remains a fallback (`build-sycl`).
 - **SYCL fused CAGRA walk (enabled):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ioVS with `-DIOVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (fused iGPU walk). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed).
 - **SHAVE ELF on NPU silicon:** `npu_compiler` cloned at `6761af885b8ff54ddf0da5bf8ad44e30746b2f62` with `sw_runtime_kernels`. No SHAVE C compiler/firmware path to load unsigned ELF on this Windows NPU. Running path: host-linked `shave/*.c` + OpenVINO NPU TopK/Gather/MatMul + HostCompile M=256 GEMM tiles. Park only “SHAVE ELF on NPU silicon”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.

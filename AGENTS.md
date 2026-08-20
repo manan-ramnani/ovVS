@@ -70,9 +70,11 @@ Phase 23 (npu_compiler / SHAVE) is a **parallel** track from Phase 4 onward, not
 ## Commands (once the tree exists)
 
 ```text
-cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DIOVS_WITH_SYCL=ON
 cmake --build build
 ctest --test-dir build -L cpu
+# Windows oneAPI: call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" then icx (MSVC-like). icpx is GNU-like and breaks Ninja+MSVC flags.
+# Fallback: intel/llvm nightly clang++ -fsycl at %USERPROFILE%\intel\sycl-nightly
 tools/probe > probe.json
 tools/bakeoff gemm --sku auto
 ```

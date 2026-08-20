@@ -118,6 +118,19 @@ iovsStatus iovsKSelection(iovsResources_t res, const float* scores, int64_t rows
   return iovsTopk(res, scores, rows, cols, k, indices, values, largest);
 }
 
+iovsStatus iovsBitsetFromAllowList(int64_t n, const int64_t* ids, int64_t nids, uint8_t* bitset) {
+  if (!bitset || n <= 0 || nids < 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  const int64_t nbytes = (n + 7) / 8;
+  std::memset(bitset, 0, static_cast<size_t>(nbytes));
+  if (!ids || nids == 0) return IOVS_STATUS_SUCCESS;
+  for (int64_t i = 0; i < nids; ++i) {
+    const int64_t id = ids[i];
+    if (id < 0 || id >= n) continue;
+    bitset[id >> 3] = static_cast<uint8_t>(bitset[id >> 3] | (1u << (id & 7)));
+  }
+  return IOVS_STATUS_SUCCESS;
+}
+
 #include "iovs_shave.h"
 
 void iovsShaveTopkSmallest(const float* scores, int32_t cols, int32_t k, int32_t* idx, float* val) {

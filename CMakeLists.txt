@@ -66,9 +66,17 @@ if(IOVS_WITH_OPENVINO)
   find_package(OpenVINO REQUIRED COMPONENTS Runtime)
   target_link_libraries(iovs PRIVATE openvino::runtime)
   target_compile_definitions(iovs PRIVATE IOVS_WITH_OPENVINO)
+  if(WIN32)
+    add_custom_command(TARGET iovs POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:openvino::runtime>
+        $<TARGET_FILE_DIR:iovs>
+      COMMENT "Copy OpenVINO runtime next to iovs")
+  endif()
 endif()
 
 if(IOVS_WITH_SYCL)
+  # Windows oneAPI: configure with icx (MSVC-like). icpx is GNU-like and fails CMake MSVC flags.
   target_compile_definitions(iovs PRIVATE IOVS_WITH_SYCL)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
     target_compile_options(iovs PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsycl>)

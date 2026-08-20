@@ -37,6 +37,12 @@ Python `neighbors.*.build/search` accept NumPy arrays and DLPack exporters (`np.
 
 ScaNN-like indexes train IVF-PQ in anisotropic (per-dim std) space and **re-rank candidates on the original unscaled vectors**.
 
+`iovsBitsetFromAllowList(n, ids, nids, bitset)` fills a `(n+7)/8` bitset for filtered search. IVF-PQ and IVF-RaBitQ support serialize/deserialize/extend like IVF-Flat.
+
+When `IOVS_WITH_SYCL=ON`, GEMM/TopK/Gather run on SYCL **USM shared** scratch first, then fall back to the OpenVINO GPU plugin. NPU Gather/TopK HostCompile tiles rows (32) and gather indices (128) when a full-shape compile fails.
+
+C++ wrappers cover brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, and CAGRA (`include/iovs/iovs.hpp`), including serialize/extend. Python `search(..., allow_list=ids)` builds the filter bitset via `iovsBitsetFromAllowList`.
+
 ## HNSW file
 
 `iovsHnswSerialize` writes the [hnswlib](https://github.com/nmslib/hnswlib) `saveIndex` layout (size_t header, then per-element level-0 links + float data + label). Load with `hnswlib.Index(space='l2', dim=D).load_index(path)` when the package is installed, or `iovsHnswDeserialize`.

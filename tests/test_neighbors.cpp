@@ -169,6 +169,62 @@ IOVS_TEST(ivf_pq_cosine_refine_vs_oracle) {
   iovsIvfPqDestroy(ix);
 }
 
+IOVS_TEST(allow_list_bitset_and_hamming_lp) {
+  Res res;
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  const int64_t n = 16, dim = 4, k = 3;
+  auto data = make_data(n, dim, 112);
+  auto q = make_data(1, dim, 113);
+  const int64_t allow[4] = {2, 5, 9, 12};
+  std::vector<uint8_t> bits(static_cast<size_t>((n + 7) / 8), 0);
+  expect_status(iovsBitsetFromAllowList(n, allow, 4, bits.data()), "allow");
+  expect((bits[2 >> 3] & (1u << (2 & 7))) != 0, "bit 2");
+  expect((bits[0] & 1u) == 0, "bit 0 off");
+  iovsBruteForceIndex_t ix = nullptr;
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, &ix), "bf");
+  std::vector<int64_t> nb(static_cast<size_t>(k));
+  std::vector<float> ds(static_cast<size_t>(k));
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), 1, k, bits.data(), nb.data(), ds.data()), "s");
+  for (int64_t t = 0; t < k; ++t) {
+    bool ok = false;
+    for (int64_t a : allow)
+      if (nb[static_cast<size_t>(t)] == a) ok = true;
+    expect(ok, "allow-list neighbor");
+  }
+  iovsBruteForceDestroy(ix);
+
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_BITWISE_HAMMING, &ix), "ham");
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "hams");
+  int64_t truth[3] = {-1, -1, -1};
+  float td[3] = {1e30f, 1e30f, 1e30f};
+  for (int64_t i = 0; i < n; ++i) {
+    float s = 0.f;
+    for (int64_t d = 0; d < dim; ++d) {
+      const uint32_t ax = data[static_cast<size_t>(i * dim + d)] >= 0.f;
+      const uint32_t ay = q[static_cast<size_t>(d)] >= 0.f;
+      s += static_cast<float>(ax ^ ay);
+    }
+    for (int t = 0; t < 3; ++t) {
+      if (s < td[t]) {
+        for (int u = 2; u > t; --u) {
+          td[u] = td[u - 1];
+          truth[u] = truth[u - 1];
+        }
+        td[t] = s;
+        truth[t] = i;
+        break;
+      }
+    }
+  }
+  expect(nb[0] == truth[0], "hamming top1");
+  iovsBruteForceDestroy(ix);
+
+  expect_status(iovsBruteForceBuild(res.r, data.data(), n, dim, IOVS_METRIC_LP_UNEXPANDED, &ix), "lp");
+  expect_status(iovsBruteForceSearch(res.r, ix, q.data(), 1, k, nullptr, nb.data(), ds.data()), "lps");
+  expect(nb[0] >= 0 && nb[0] < n, "lp id");
+  iovsBruteForceDestroy(ix);
+}
+
 IOVS_TEST(brute_force_bitset_filter) {
   Res res;
   const int64_t n = 20, dim = 4, k = 3;
@@ -220,6 +276,13 @@ IOVS_TEST(ivf_pq_recall) {
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   const float rec = recall_at_k(got.data(), truth.data(), nq, k);
   expect(rec >= 0.5f, "ivf-pq recall " + std::to_string(rec));
+  const auto pqpath = std::filesystem::temp_directory_path() / "iovs_ivfpq.bin";
+  expect_status(iovsIvfPqSerialize(ix, pqpath.string().c_str()), "pqser");
+  iovsIvfPqIndex_t loaded = nullptr;
+  expect_status(iovsIvfPqDeserialize(res.r, pqpath.string().c_str(), &loaded), "pqdes");
+  auto extra = make_data(4, dim, 212);
+  expect_status(iovsIvfPqExtend(res.r, loaded, extra.data(), 4), "pqext");
+  iovsIvfPqDestroy(loaded);
   iovsIvfPqDestroy(ix);
 }
 
@@ -238,6 +301,13 @@ IOVS_TEST(ivf_rabitq_recall) {
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   const float rec = recall_at_k(got.data(), truth.data(), nq, k);
   expect(rec >= 0.45f, "rabitq recall " + std::to_string(rec));
+  const auto rqpath = std::filesystem::temp_directory_path() / "iovs_rabitq.bin";
+  expect_status(iovsIvfRabitqSerialize(ix, rqpath.string().c_str()), "rqser");
+  iovsIvfRabitqIndex_t loaded = nullptr;
+  expect_status(iovsIvfRabitqDeserialize(res.r, rqpath.string().c_str(), &loaded), "rqdes");
+  auto extra = make_data(4, dim, 223);
+  expect_status(iovsIvfRabitqExtend(res.r, loaded, extra.data(), 4), "rqext");
+  iovsIvfRabitqDestroy(loaded);
   iovsIvfRabitqDestroy(ix);
 }
 

@@ -223,12 +223,28 @@ bool ov_gather_rows(ResourcesData& r, const char* device, const float* src, int6
 
 bool npu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
               int64_t* indices, float* values, bool largest) {
-  return ov_topk(r, "NPU", scores, rows, cols, k, indices, values, largest);
+  if (ov_topk(r, "NPU", scores, rows, cols, k, indices, values, largest)) return true;
+  constexpr int64_t kTile = 32;
+  if (rows <= kTile) return false;
+  for (int64_t i = 0; i < rows; i += kTile) {
+    const int64_t rr = std::min(kTile, rows - i);
+    if (!ov_topk(r, "NPU", scores + i * cols, rr, cols, k, indices + i * k, values + i * k, largest)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out) {
-  return ov_gather_rows(r, "NPU", src, src_rows, dim, idx, nidx, out);
+  if (ov_gather_rows(r, "NPU", src, src_rows, dim, idx, nidx, out)) return true;
+  constexpr int64_t kTile = 128;
+  if (nidx <= kTile) return false;
+  for (int64_t i = 0; i < nidx; i += kTile) {
+    const int64_t nn = std::min(kTile, nidx - i);
+    if (!ov_gather_rows(r, "NPU", src, src_rows, dim, idx + i, nn, out + i * dim)) return false;
+  }
+  return true;
 }
 
 }  // namespace impl

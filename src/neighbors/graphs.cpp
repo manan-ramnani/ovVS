@@ -576,6 +576,122 @@ iovsStatus iovsIvfRabitqDestroy(iovsIvfRabitqIndex_t index) {
   return IOVS_STATUS_SUCCESS;
 }
 
+constexpr uint32_t kRabitqMagic = 0x31425152u; /* 'RQB1' */
+
+iovsStatus iovsIvfRabitqSerialize(iovsIvfRabitqIndex_t index, const char* path) {
+  if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<IvfRabitq*>(index);
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  f.write(reinterpret_cast<const char*>(&kRabitqMagic), 4);
+  int32_t ver = 1;
+  f.write(reinterpret_cast<const char*>(&ver), 4);
+  f.write(reinterpret_cast<const char*>(&ix->ds.n), 8);
+  f.write(reinterpret_cast<const char*>(&ix->ds.dim), 8);
+  f.write(reinterpret_cast<const char*>(&ix->nlist), 4);
+  f.write(reinterpret_cast<const char*>(&ix->nbytes), 8);
+  int32_t metric = static_cast<int32_t>(ix->ds.metric);
+  f.write(reinterpret_cast<const char*>(&metric), 4);
+  f.write(reinterpret_cast<const char*>(ix->centroids.data()),
+          static_cast<std::streamsize>(ix->centroids.size() * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(ix->rand_sign.data()), static_cast<std::streamsize>(ix->rand_sign.size()));
+  f.write(reinterpret_cast<const char*>(ix->scales.data()),
+          static_cast<std::streamsize>(ix->scales.size() * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(ix->signs.data()), static_cast<std::streamsize>(ix->signs.size()));
+  f.write(reinterpret_cast<const char*>(ix->assign.data()),
+          static_cast<std::streamsize>(ix->assign.size() * sizeof(int32_t)));
+  f.write(reinterpret_cast<const char*>(ix->ds.x.data()),
+          static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  for (int32_t c = 0; c < ix->nlist; ++c) {
+    int32_t sz = static_cast<int32_t>(ix->lists[static_cast<size_t>(c)].size());
+    f.write(reinterpret_cast<const char*>(&sz), 4);
+    if (sz > 0)
+      f.write(reinterpret_cast<const char*>(ix->lists[static_cast<size_t>(c)].data()),
+              static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
+  }
+  return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+}
+
+iovsStatus iovsIvfRabitqDeserialize(iovsResources_t res, const char* path, iovsIvfRabitqIndex_t* index) {
+  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  uint32_t magic = 0;
+  f.read(reinterpret_cast<char*>(&magic), 4);
+  if (magic != kRabitqMagic) return IOVS_STATUS_IO;
+  int32_t ver = 0;
+  f.read(reinterpret_cast<char*>(&ver), 4);
+  auto* ix = new IvfRabitq();
+  f.read(reinterpret_cast<char*>(&ix->ds.n), 8);
+  f.read(reinterpret_cast<char*>(&ix->ds.dim), 8);
+  f.read(reinterpret_cast<char*>(&ix->nlist), 4);
+  f.read(reinterpret_cast<char*>(&ix->nbytes), 8);
+  int32_t metric = 0;
+  f.read(reinterpret_cast<char*>(&metric), 4);
+  ix->ds.metric = static_cast<iovsMetric>(metric);
+  ix->centroids.resize(static_cast<size_t>(ix->nlist) * static_cast<size_t>(ix->ds.dim));
+  ix->rand_sign.resize(static_cast<size_t>(ix->ds.dim));
+  ix->scales.resize(static_cast<size_t>(ix->ds.n));
+  ix->signs.resize(static_cast<size_t>(ix->ds.n * ix->nbytes));
+  ix->assign.resize(static_cast<size_t>(ix->ds.n));
+  ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
+  f.read(reinterpret_cast<char*>(ix->centroids.data()),
+         static_cast<std::streamsize>(ix->centroids.size() * sizeof(float)));
+  f.read(reinterpret_cast<char*>(ix->rand_sign.data()), static_cast<std::streamsize>(ix->rand_sign.size()));
+  f.read(reinterpret_cast<char*>(ix->scales.data()),
+         static_cast<std::streamsize>(ix->scales.size() * sizeof(float)));
+  f.read(reinterpret_cast<char*>(ix->signs.data()), static_cast<std::streamsize>(ix->signs.size()));
+  f.read(reinterpret_cast<char*>(ix->assign.data()),
+         static_cast<std::streamsize>(ix->assign.size() * sizeof(int32_t)));
+  f.read(reinterpret_cast<char*>(ix->ds.x.data()),
+         static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  ix->lists.resize(static_cast<size_t>(ix->nlist));
+  for (int32_t c = 0; c < ix->nlist; ++c) {
+    int32_t sz = 0;
+    f.read(reinterpret_cast<char*>(&sz), 4);
+    ix->lists[static_cast<size_t>(c)].resize(static_cast<size_t>(std::max(sz, 0)));
+    if (sz > 0)
+      f.read(reinterpret_cast<char*>(ix->lists[static_cast<size_t>(c)].data()),
+             static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
+  }
+  if (!f) {
+    delete ix;
+    return IOVS_STATUS_IO;
+  }
+  *index = reinterpret_cast<iovsIvfRabitqIndex_t>(ix);
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsIvfRabitqExtend(iovsResources_t res, iovsIvfRabitqIndex_t index, const float* extra,
+                               int64_t nextra) {
+  if (!res || !index || !extra || nextra <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<IvfRabitq*>(index);
+  const int64_t dim = ix->ds.dim;
+  const int64_t old_n = ix->ds.n;
+  ix->ds.x.insert(ix->ds.x.end(), extra, extra + nextra * dim);
+  ix->ds.n += nextra;
+  std::vector<int64_t> labels(static_cast<size_t>(nextra));
+  std::vector<float> d(static_cast<size_t>(nextra));
+  std::vector<float> scores(static_cast<size_t>(nextra) * static_cast<size_t>(ix->nlist));
+  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
+                scores.data(), 2.f);
+  prim_topk(*rd(res), scores.data(), nextra, ix->nlist, 1, labels.data(), d.data(), false);
+  ix->assign.resize(static_cast<size_t>(ix->ds.n));
+  ix->scales.resize(static_cast<size_t>(ix->ds.n));
+  ix->signs.resize(static_cast<size_t>(ix->ds.n * ix->nbytes));
+  std::vector<float> resid(static_cast<size_t>(dim));
+  for (int64_t i = 0; i < nextra; ++i) {
+    const int32_t a = static_cast<int32_t>(labels[static_cast<size_t>(i)]);
+    ix->assign[static_cast<size_t>(old_n + i)] = a;
+    if (a >= 0 && a < ix->nlist) ix->lists[static_cast<size_t>(a)].push_back(old_n + i);
+    const float* c = ix->centroids.data() + static_cast<size_t>(std::max(a, 0)) * dim;
+    for (int64_t t = 0; t < dim; ++t) resid[static_cast<size_t>(t)] = extra[i * dim + t] - c[t];
+    ix->scales[static_cast<size_t>(old_n + i)] = std::sqrt(std::max(nrm2sq(resid.data(), dim), 1e-12f));
+    pack_signs(resid.data(), dim, ix->rand_sign.data(), ix->signs.data() + (old_n + i) * ix->nbytes);
+  }
+  return IOVS_STATUS_SUCCESS;
+}
+
 iovsStatus iovsNnDescentBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
                               iovsMetric metric, int32_t graph_degree, int32_t iterations,
                               iovsNnDescentGraph_t* graph) {

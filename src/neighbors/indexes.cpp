@@ -436,3 +436,118 @@ iovsStatus iovsIvfPqDestroy(iovsIvfPqIndex_t index) {
   delete reinterpret_cast<IvfPq*>(index);
   return IOVS_STATUS_SUCCESS;
 }
+
+constexpr uint32_t kIvfPqMagic = 0x31515049u; /* 'IPQ1' */
+
+iovsStatus iovsIvfPqSerialize(iovsIvfPqIndex_t index, const char* path) {
+  if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<IvfPq*>(index);
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  f.write(reinterpret_cast<const char*>(&kIvfPqMagic), 4);
+  int32_t ver = 1;
+  f.write(reinterpret_cast<const char*>(&ver), 4);
+  f.write(reinterpret_cast<const char*>(&ix->ds.n), 8);
+  f.write(reinterpret_cast<const char*>(&ix->ds.dim), 8);
+  f.write(reinterpret_cast<const char*>(&ix->nlist), 4);
+  f.write(reinterpret_cast<const char*>(&ix->pq_m), 4);
+  f.write(reinterpret_cast<const char*>(&ix->pq_ks), 4);
+  f.write(reinterpret_cast<const char*>(&ix->dsub), 4);
+  int32_t metric = static_cast<int32_t>(ix->ds.metric);
+  f.write(reinterpret_cast<const char*>(&metric), 4);
+  f.write(reinterpret_cast<const char*>(ix->centroids.data()),
+          static_cast<std::streamsize>(ix->centroids.size() * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(ix->codebooks.data()),
+          static_cast<std::streamsize>(ix->codebooks.size() * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(ix->codes.data()), static_cast<std::streamsize>(ix->codes.size()));
+  f.write(reinterpret_cast<const char*>(ix->ds.x.data()),
+          static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(ix->assign.data()),
+          static_cast<std::streamsize>(ix->assign.size() * sizeof(int32_t)));
+  for (int32_t c = 0; c < ix->nlist; ++c) {
+    int32_t sz = static_cast<int32_t>(ix->lists[static_cast<size_t>(c)].size());
+    f.write(reinterpret_cast<const char*>(&sz), 4);
+    if (sz > 0)
+      f.write(reinterpret_cast<const char*>(ix->lists[static_cast<size_t>(c)].data()),
+              static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
+  }
+  return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+}
+
+iovsStatus iovsIvfPqDeserialize(iovsResources_t res, const char* path, iovsIvfPqIndex_t* index) {
+  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return IOVS_STATUS_IO;
+  uint32_t magic = 0;
+  f.read(reinterpret_cast<char*>(&magic), 4);
+  if (magic != kIvfPqMagic) return IOVS_STATUS_IO;
+  int32_t ver = 0;
+  f.read(reinterpret_cast<char*>(&ver), 4);
+  auto* ix = new IvfPq();
+  f.read(reinterpret_cast<char*>(&ix->ds.n), 8);
+  f.read(reinterpret_cast<char*>(&ix->ds.dim), 8);
+  f.read(reinterpret_cast<char*>(&ix->nlist), 4);
+  f.read(reinterpret_cast<char*>(&ix->pq_m), 4);
+  f.read(reinterpret_cast<char*>(&ix->pq_ks), 4);
+  f.read(reinterpret_cast<char*>(&ix->dsub), 4);
+  int32_t metric = 0;
+  f.read(reinterpret_cast<char*>(&metric), 4);
+  ix->ds.metric = static_cast<iovsMetric>(metric);
+  ix->centroids.resize(static_cast<size_t>(ix->nlist) * static_cast<size_t>(ix->ds.dim));
+  ix->codebooks.resize(static_cast<size_t>(ix->pq_m) * ix->pq_ks * ix->dsub);
+  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+  ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
+  ix->assign.resize(static_cast<size_t>(ix->ds.n));
+  f.read(reinterpret_cast<char*>(ix->centroids.data()),
+         static_cast<std::streamsize>(ix->centroids.size() * sizeof(float)));
+  f.read(reinterpret_cast<char*>(ix->codebooks.data()),
+         static_cast<std::streamsize>(ix->codebooks.size() * sizeof(float)));
+  f.read(reinterpret_cast<char*>(ix->codes.data()), static_cast<std::streamsize>(ix->codes.size()));
+  f.read(reinterpret_cast<char*>(ix->ds.x.data()),
+         static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+  f.read(reinterpret_cast<char*>(ix->assign.data()),
+         static_cast<std::streamsize>(ix->assign.size() * sizeof(int32_t)));
+  ix->lists.resize(static_cast<size_t>(ix->nlist));
+  for (int32_t c = 0; c < ix->nlist; ++c) {
+    int32_t sz = 0;
+    f.read(reinterpret_cast<char*>(&sz), 4);
+    ix->lists[static_cast<size_t>(c)].resize(static_cast<size_t>(std::max(sz, 0)));
+    if (sz > 0)
+      f.read(reinterpret_cast<char*>(ix->lists[static_cast<size_t>(c)].data()),
+             static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
+  }
+  if (!f) {
+    delete ix;
+    return IOVS_STATUS_IO;
+  }
+  *index = reinterpret_cast<iovsIvfPqIndex_t>(ix);
+  return IOVS_STATUS_SUCCESS;
+}
+
+iovsStatus iovsIvfPqExtend(iovsResources_t res, iovsIvfPqIndex_t index, const float* extra, int64_t nextra) {
+  if (!res || !index || !extra || nextra <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<IvfPq*>(index);
+  const int64_t dim = ix->ds.dim;
+  const int64_t old_n = ix->ds.n;
+  ix->ds.x.insert(ix->ds.x.end(), extra, extra + nextra * dim);
+  ix->ds.n += nextra;
+  std::vector<int64_t> labels(static_cast<size_t>(nextra));
+  std::vector<float> d(static_cast<size_t>(nextra));
+  std::vector<float> scores(static_cast<size_t>(nextra) * static_cast<size_t>(ix->nlist));
+  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
+                scores.data(), 2.f);
+  prim_topk(*rd(res), scores.data(), nextra, ix->nlist, 1, labels.data(), d.data(), false);
+  std::vector<float> resid(static_cast<size_t>(nextra) * static_cast<size_t>(dim));
+  ix->assign.resize(static_cast<size_t>(ix->ds.n));
+  for (int64_t i = 0; i < nextra; ++i) {
+    const int32_t a = static_cast<int32_t>(labels[static_cast<size_t>(i)]);
+    ix->assign[static_cast<size_t>(old_n + i)] = a;
+    if (a >= 0 && a < ix->nlist) ix->lists[static_cast<size_t>(a)].push_back(old_n + i);
+    const float* c = ix->centroids.data() + static_cast<size_t>(std::max(a, 0)) * dim;
+    for (int64_t t = 0; t < dim; ++t) resid[static_cast<size_t>(i * dim + t)] = extra[i * dim + t] - c[t];
+  }
+  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+  pq_encode(resid.data(), nextra, dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
+            ix->codes.data() + old_n * ix->pq_m);
+  return IOVS_STATUS_SUCCESS;
+}
