@@ -1,8 +1,10 @@
 #include "test_harness.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <numeric>
 #include <set>
+#include <thread>
 
 IOVS_TEST(kmeans_inertia_drops) {
   Res res;
@@ -137,4 +139,37 @@ IOVS_TEST(mixer_auto_skips_busy_npu) {
   iovsResourcesLastDevice(res.r, &last);
   expect(last != IOVS_DEVICE_NPU, "auto must not pick busy npu");
   expect_status(iovsResourcesSetNpuBusy(res.r, 0), "free");
+}
+
+IOVS_TEST(energy_probe_does_not_crash) {
+  Res res;
+  int64_t uj = -1;
+  const iovsStatus st = iovsResourcesEnergyUj(res.r, &uj);
+  expect(st == IOVS_STATUS_SUCCESS || st == IOVS_STATUS_UNSUPPORTED, "energy status");
+  if (st == IOVS_STATUS_SUCCESS) expect(uj >= 0, "energy uj");
+}
+
+IOVS_TEST(mixer_auto_completes_under_competing_npu) {
+  Res res;
+  int32_t npu = 0;
+  iovsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+  const int64_t m = 256, n = 64, k = 128;
+  auto A = make_data(m, k, 3);
+  auto B = make_data(n, k, 4);
+  std::atomic<bool> stop{false};
+  std::thread load([&] {
+    Res r2;
+    iovsResourcesSetPolicy(r2.r, IOVS_POLICY_FORCE_NPU);
+    std::vector<float> C(static_cast<size_t>(m * n));
+    while (!stop.load()) {
+      iovsGemm(r2.r, A.data(), B.data(), C.data(), m, n, k, 1);
+    }
+  });
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_AUTO);
+  std::vector<float> C(static_cast<size_t>(m * n));
+  const iovsStatus st = iovsGemm(res.r, A.data(), B.data(), C.data(), m, n, k, 1);
+  stop.store(true);
+  load.join();
+  expect_status(st, "auto during npu load");
 }

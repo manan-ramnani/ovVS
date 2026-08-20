@@ -15,6 +15,10 @@ ioVS picks a device per primitive (`gemm`, `topk`, `gather`, pairwise). Algorith
 
 `iovsResourcesSetNpuBusy(1)` is mixer v2: AUTO skips NPU (LLM or another graph occupying the NPU) and still completes on GPU/CPU.
 
+Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>/gemm_large.json` when that file is found (`IOVS_TABLES` or `../../tables` from the binary). On Arrow Lake 265K that is GPU, then NPU, then CPU.
+
+`iovsResourcesEnergyUj` returns package microjoules from Linux RAPL sysfs or Intel Power Gadget on Windows. If neither exists, status is `unsupported` (no RAPL MSR/ETW energy counter on this host after probing Power Gadget DLLs and `GetSystemPowerStatus`).
+
 ## This SKU
 
 Bakeoff JSON lives in `tables/<sku>/`. This lab machine writes `tables/arrow-lake/` (Core Ultra 7 265K). Lunar Lake files are only created if that CPU brand string is actually probed — do not copy Arrow Lake numbers.
@@ -28,6 +32,10 @@ Search is `prim_graph_walk`: fused SYCL iGPU kernel when `IOVS_WITH_SYCL=ON` (SL
 ## FP16 / INT8
 
 `iovsBruteForceBuildTyped` converts F16 (IEEE) or I8 (value as float) into the fp32 workspace used by prims. I8 search ids match an independent L2 oracle on the same integer-valued floats. F16 search ids match an independent L2 oracle on IEEE-decoded binary16 vectors (not the original fp32 dataset); L2 distances use atol **2e-2** (binary16 mantissa ~1e-3, accumulated over typical test `dim`).
+
+Python `neighbors.*.build/search` accept NumPy arrays and DLPack exporters (`np.from_dlpack` / `__dlpack__`). Search results are NumPy when NumPy is importable.
+
+ScaNN-like indexes train IVF-PQ in anisotropic (per-dim std) space and **re-rank candidates on the original unscaled vectors**.
 
 ## HNSW file
 

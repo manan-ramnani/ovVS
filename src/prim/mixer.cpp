@@ -25,6 +25,13 @@ iovsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elem
   const bool npu_shaped =
       std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0 ||
       std::strcmp(op, "topk") == 0 || std::strcmp(op, "gather") == 0;
+  /* Large GEMM/pairwise: use bakeoff winner from tables/<sku>/gemm_large.json when present. */
+  if (npu_shaped && (std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0) &&
+      flops_or_elems >= r.large_gemm_flops && r.large_gemm_winner != IOVS_DEVICE_AUTO) {
+    if (r.large_gemm_winner == IOVS_DEVICE_GPU && r.gpu_available) return IOVS_DEVICE_GPU;
+    if (r.large_gemm_winner == IOVS_DEVICE_NPU && r.npu_available && !r.npu_busy) return IOVS_DEVICE_NPU;
+    if (r.large_gemm_winner == IOVS_DEVICE_CPU) return IOVS_DEVICE_CPU;
+  }
   if (r.npu_available && !r.npu_busy && npu_shaped && flops_or_elems >= 256 * 256 * 32) {
     return IOVS_DEVICE_NPU;
   }

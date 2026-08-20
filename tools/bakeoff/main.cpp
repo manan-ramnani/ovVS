@@ -43,11 +43,14 @@ int main(int argc, char** argv) {
   iovsResourcesNpuAvailable(res, &npu);
   iovsResourcesGpuAvailable(res, &gpu);
 
+  int64_t e0 = 0, e1 = 0;
+  const iovsStatus es0 = iovsResourcesEnergyUj(res, &e0);
   std::printf(
       "{\n  \"sku\": \"%s\",\n  \"op\": \"%s\",\n  \"shape\": [%lld, %lld, %lld],\n  \"npu\": %s,\n  "
-      "\"gpu\": %s,\n  \"sycl\": %s,\n  \"runs\": [\n",
+      "\"gpu\": %s,\n  \"sycl\": %s,\n  \"energy_probe\": \"%s\",\n  \"runs\": [\n",
       sku, op.c_str(), static_cast<long long>(M), static_cast<long long>(N), static_cast<long long>(K),
-      npu ? "true" : "false", gpu ? "true" : "false", iovsSyclEnabled() ? "true" : "false");
+      npu ? "true" : "false", gpu ? "true" : "false", iovsSyclEnabled() ? "true" : "false",
+      es0 == IOVS_STATUS_SUCCESS ? "rapl_or_gadget" : "unsupported");
 
   const iovsPolicy policies[] = {IOVS_POLICY_FORCE_CPU, IOVS_POLICY_FORCE_NPU, IOVS_POLICY_FORCE_GPU};
   const char* names[] = {"cpu", "npu", "gpu"};
@@ -84,7 +87,10 @@ int main(int argc, char** argv) {
         "    {\"requested\": \"%s\", \"last_device\": \"%s\", \"ms\": %.4f, \"status\": \"%s\"}",
         names[p], last_name(last), t1 - t0, iovsStatusString(st));
   }
-  std::printf("\n  ]\n}\n");
+  const iovsStatus es1 = iovsResourcesEnergyUj(res, &e1);
+  std::printf("\n  ],\n  \"energy_uj_before\": %lld,\n  \"energy_uj_after\": %lld,\n  \"energy_status\": \"%s\"\n}\n",
+              static_cast<long long>(e0), static_cast<long long>(e1),
+              iovsStatusString(es1 == IOVS_STATUS_SUCCESS ? es1 : es0));
   iovsResourcesDestroy(res);
   return 0;
 }

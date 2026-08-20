@@ -54,6 +54,17 @@ def main() -> int:
         print("mismatch", got, truth, file=sys.stderr)
         return 1
     print("python consumer ok neighbors", got, "version", iovs.version(), "numpy", use_np)
+    if use_np:
+        # DLPack ingest: build+search from __dlpack__ capsules, same independent L2 oracle.
+        d_dl = np.from_dlpack(data)
+        q_dl = np.from_dlpack(q)
+        idx2 = iovs.neighbors.brute_force.build(d_dl, dim=dim, resources=res)
+        nb2, _ = idx2.search(q_dl, k=k)
+        got2 = list(nb2.ravel()[:k])
+        if got2 != truth:
+            print("dlpack mismatch", got2, truth, file=sys.stderr)
+            return 1
+        print("python consumer dlpack ok neighbors", got2)
     return 0
 
 

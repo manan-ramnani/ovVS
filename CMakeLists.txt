@@ -44,6 +44,7 @@ set(IOVS_SOURCES
   src/cluster/cluster.cpp
   src/preprocess/preprocess.cpp
   src/rt/batcher.cpp
+  src/rt/energy.cpp
 )
 
 add_library(iovs SHARED ${IOVS_SOURCES})

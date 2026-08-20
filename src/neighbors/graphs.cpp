@@ -80,6 +80,7 @@ struct VamanaIndex {
 };
 
 struct ScannIndex {
+  Dataset ds;
   iovsIvfPqIndex_t pq = nullptr;
   std::vector<float> aniso;
 };
@@ -1189,6 +1190,7 @@ iovsStatus iovsScannBuild(iovsResources_t res, const float* dataset, int64_t n, 
                           iovsMetric metric, int32_t nlist, int32_t pq_m, iovsScannIndex_t* index) {
   if (!res || !dataset || !index) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = new ScannIndex();
+  copy_ds(ix->ds, dataset, n, dim, metric);
   ix->aniso.resize(static_cast<size_t>(dim), 1.f);
   std::vector<float> mean(static_cast<size_t>(dim), 0.f);
   for (int64_t i = 0; i < n; ++i)
@@ -1202,6 +1204,7 @@ iovsStatus iovsScannBuild(iovsResources_t res, const float* dataset, int64_t n, 
     }
     ix->aniso[static_cast<size_t>(d)] = std::sqrt(v / static_cast<float>(std::max<int64_t>(n, 1)) + 1e-6f);
   }
+  /* Score-aware / anisotropic: train IVF-PQ in weighted space (ScaNN-style AVQ). */
   std::vector<float> scaled(static_cast<size_t>(n) * static_cast<size_t>(dim));
   for (int64_t i = 0; i < n; ++i)
     for (int64_t d = 0; d < dim; ++d)
@@ -1219,14 +1222,58 @@ iovsStatus iovsScannBuild(iovsResources_t res, const float* dataset, int64_t n, 
 iovsStatus iovsScannSearch(iovsResources_t res, iovsScannIndex_t index, const float* queries,
                            int64_t nq, int64_t k, int32_t nprobe, int32_t krefine,
                            int64_t* neighbors, float* distances) {
-  if (!res || !index || !queries) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<ScannIndex*>(index);
-  const int64_t dim = static_cast<int64_t>(ix->aniso.size());
+  const int64_t dim = ix->ds.dim;
+  if (krefine < static_cast<int32_t>(k)) krefine = static_cast<int32_t>(k);
   std::vector<float> q(static_cast<size_t>(nq) * static_cast<size_t>(dim));
   for (int64_t i = 0; i < nq; ++i)
     for (int64_t d = 0; d < dim; ++d)
       q[static_cast<size_t>(i * dim + d)] = queries[i * dim + d] * ix->aniso[static_cast<size_t>(d)];
-  return iovsIvfPqSearch(res, ix->pq, q.data(), nq, k, nprobe, krefine, nullptr, neighbors, distances);
+  std::vector<int64_t> cand(static_cast<size_t>(nq) * static_cast<size_t>(krefine));
+  std::vector<float> cd(static_cast<size_t>(nq) * static_cast<size_t>(krefine));
+  const iovsStatus st =
+      iovsIvfPqSearch(res, ix->pq, q.data(), nq, krefine, nprobe, krefine, nullptr, cand.data(), cd.data());
+  if (st != IOVS_STATUS_SUCCESS) return st;
+  /* Re-rank on the original (unscaled) vectors — ScaNN-style residual refine. */
+  for (int64_t qi = 0; qi < nq; ++qi) {
+    std::vector<int64_t> ids;
+    ids.reserve(static_cast<size_t>(krefine));
+    for (int32_t t = 0; t < krefine; ++t) {
+      const int64_t id = cand[static_cast<size_t>(qi * krefine + t)];
+      if (id >= 0 && id < ix->ds.n) ids.push_back(id);
+    }
+    if (ids.empty()) {
+      for (int64_t t = 0; t < k; ++t) {
+        neighbors[qi * k + t] = -1;
+        distances[qi * k + t] = kInf;
+      }
+      continue;
+    }
+    std::vector<float> gathered(ids.size() * static_cast<size_t>(dim));
+    prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim, ids.data(), static_cast<int64_t>(ids.size()),
+                     gathered.data());
+    std::vector<float> sc(ids.size());
+    prim_pairwise(*rd(res), ix->ds.metric, queries + qi * dim, 1, gathered.data(),
+                  static_cast<int64_t>(ids.size()), dim, sc.data(), 2.f);
+    const int64_t kk = std::min(k, static_cast<int64_t>(ids.size()));
+    std::vector<int64_t> fi(static_cast<size_t>(kk));
+    std::vector<float> fv(static_cast<size_t>(kk));
+    prim_topk(*rd(res), sc.data(), 1, static_cast<int64_t>(ids.size()), kk, fi.data(), fv.data(),
+              metric_largest(ix->ds.metric));
+    for (int64_t t = 0; t < k; ++t) {
+      if (t < kk) {
+        neighbors[qi * k + t] = ids[static_cast<size_t>(fi[static_cast<size_t>(t)])];
+        float d = fv[static_cast<size_t>(t)];
+        if (ix->ds.metric == IOVS_METRIC_INNER_PRODUCT) d = -d;
+        distances[qi * k + t] = d;
+      } else {
+        neighbors[qi * k + t] = -1;
+        distances[qi * k + t] = kInf;
+      }
+    }
+  }
+  return IOVS_STATUS_SUCCESS;
 }
 
 iovsStatus iovsScannDestroy(iovsScannIndex_t index) {

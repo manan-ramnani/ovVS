@@ -1,7 +1,10 @@
 #include "internal.hpp"
 
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <sstream>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -58,6 +61,69 @@ static std::string sku_from_cpu(const std::string& brand) {
   return "generic-cpu";
 }
 
+static std::string read_file(const std::string& path) {
+  std::ifstream f(path);
+  if (!f) return {};
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static float json_run_ms(const std::string& s, const char* requested) {
+  const std::string key = std::string("\"requested\": \"") + requested + "\"";
+  const auto p = s.find(key);
+  if (p == std::string::npos) return -1.f;
+  const auto m = s.find("\"ms\":", p);
+  if (m == std::string::npos || m > p + 180) return -1.f;
+  return static_cast<float>(std::atof(s.c_str() + m + 5));
+}
+
+static std::vector<std::string> table_candidates(const std::string& sku) {
+  std::vector<std::string> out;
+  if (const char* e = std::getenv("IOVS_TABLES")) {
+    out.push_back(std::string(e) + "/" + sku + "/gemm_large.json");
+    out.push_back(std::string(e) + "/gemm_large.json");
+  }
+  out.push_back(std::string("tables/") + sku + "/gemm_large.json");
+#ifdef _WIN32
+  char mod[MAX_PATH] = {0};
+  if (GetModuleFileNameA(nullptr, mod, MAX_PATH)) {
+    std::string dir(mod);
+    const auto slash = dir.find_last_of("\\/");
+    if (slash != std::string::npos) dir.resize(slash);
+    out.push_back(dir + "/../../tables/" + sku + "/gemm_large.json");
+    out.push_back(dir + "/../../../tables/" + sku + "/gemm_large.json");
+  }
+#endif
+  return out;
+}
+
+static void load_large_gemm_table(ResourcesData& r) {
+  for (const auto& path : table_candidates(r.sku)) {
+    const std::string s = read_file(path);
+    if (s.empty()) continue;
+    const float cpu = json_run_ms(s, "cpu");
+    const float npu = json_run_ms(s, "npu");
+    const float gpu = json_run_ms(s, "gpu");
+    float best = 1e30f;
+    iovsDevice win = IOVS_DEVICE_AUTO;
+    if (cpu > 0 && cpu < best) {
+      best = cpu;
+      win = IOVS_DEVICE_CPU;
+    }
+    if (npu > 0 && npu < best) {
+      best = npu;
+      win = IOVS_DEVICE_NPU;
+    }
+    if (gpu > 0 && gpu < best) {
+      best = gpu;
+      win = IOVS_DEVICE_GPU;
+    }
+    if (win != IOVS_DEVICE_AUTO) {
+      r.large_gemm_winner = win;
+      return;
+    }
+  }
+}
+
 void probe_fill(ResourcesData& r) {
   r.npu_available = npu_available();
   r.gpu_available = gpu_available();
@@ -65,6 +131,7 @@ void probe_fill(ResourcesData& r) {
   r.gpu_name = r.gpu_available ? "Arc-iGPU" : "";
   r.sku = sku_from_cpu(cpu_brand());
   r.cache_dir = cache_home();
+  load_large_gemm_table(r);
 }
 
 std::string probe_json() {

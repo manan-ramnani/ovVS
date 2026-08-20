@@ -822,6 +822,9 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
 | Mixer v2 | `iovsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
 | Dynamic batcher | thread-safe waiter queue; flush at max_B or max_wait; `iovsBatcherLastBatchSize` | concurrent nq=1 submits coalesce; results match eager brute |
+| ScaNN | anisotropic IVF-PQ + original-space refine | nprobe=all + krefine=n matches brute L2 |
+| Python tensors | NumPy + DLPack (`np.from_dlpack` / `__dlpack__`) | consumer searches from DLPack views |
+| Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake winner is GPU |
 
 ---
 
@@ -833,7 +836,7 @@ Filled in as installs finish. Placeholder until toolchain logs land:
 - **SYCL fused CAGRA walk (enabled):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ioVS with `-DIOVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (fused iGPU walk). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed).
 - **SHAVE ELF on NPU silicon:** `npu_compiler` cloned at `6761af885b8ff54ddf0da5bf8ad44e30746b2f62` with `sw_runtime_kernels`. No SHAVE C compiler/firmware path to load unsigned ELF on this Windows NPU. Running path: host-linked `shave/*.c` + OpenVINO NPU TopK/Gather/MatMul + HostCompile M=256 GEMM tiles. Park only “SHAVE ELF on NPU silicon”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.
-- **Energy/RAPL:** not wired if no counter after trying; search still works.
+- **Energy/RAPL:** `iovsResourcesEnergyUj` probes Linux RAPL sysfs and Intel Power Gadget (`EnergyLib64.dll`). On this Windows 265K host those DLLs are absent and there is no RAPL sysfs; status is `unsupported`. `GetSystemPowerStatus` is not a package-joule counter. Park energy numbers only; search works. Bakeoff emits `energy_probe`.
 - **git push:** `gh repo create manan-ramnani/ioVS` succeeded. First `git push` of full history was rejected: OAuth token lacks `workflow` scope (`.github/workflows/ci.yml`). Pushed a workflow-free snapshot as `origin/main` (`0a111b6`). Local `main` keeps full history including the workflow file (`a52ea83`). Re-push of CI requires a token with the `workflow` scope.
 - **FAISS/hnswlib pip:** park comparator only after retries on this Python; still emit ioVS bench numbers.
 

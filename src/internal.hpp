@@ -129,6 +129,8 @@ struct ResourcesData {
   int32_t npu_compile_fails = 0;
   int32_t npu_fallbacks = 0;
   bool npu_busy = false;
+  iovsDevice large_gemm_winner = IOVS_DEVICE_AUTO;
+  int64_t large_gemm_flops = 100000LL * 32LL * 768LL;
   std::vector<float> scratch;
 
   float* scratch_f(size_t n) {

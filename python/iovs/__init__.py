@@ -320,10 +320,25 @@ class IvfPqIndex(_Index):
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
 
+def _from_dlpack(obj):
+    """Return a C-contiguous float32 ndarray from a DLPack exporter, or None."""
+    try:
+        import numpy as np
+
+        if hasattr(obj, "__dlpack__"):
+            return np.ascontiguousarray(np.from_dlpack(obj), dtype=np.float32)
+    except Exception:
+        return None
+    return None
+
+
 def _query_ptr(queries, dim):
     try:
         import numpy as np
 
+        dl = _from_dlpack(queries)
+        if dl is not None:
+            queries = dl
         if hasattr(queries, "shape"):
             a = np.ascontiguousarray(queries, dtype=np.float32)
             nq = int(a.shape[0]) if a.ndim == 2 else 1
@@ -360,6 +375,9 @@ def _dataset_ptr(dataset, dim):
     try:
         import numpy as np
 
+        dl = _from_dlpack(dataset)
+        if dl is not None:
+            dataset = dl
         if hasattr(dataset, "shape"):
             a = np.ascontiguousarray(dataset, dtype=np.float32)
             n, d = int(a.shape[0]), int(a.shape[1])

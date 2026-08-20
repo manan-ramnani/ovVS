@@ -349,6 +349,17 @@ IOVS_TEST(vamana_and_scann) {
   expect_status(iovsScannSearch(res.r, sx, q.data(), nq, k, 8, 12, got.data(), gd.data()), "scanns");
   expect(recall_at_k(got.data(), truth.data(), nq, k) >= 0.35f, "scann recall");
   iovsScannDestroy(sx);
+
+  /* Full nprobe + krefine=n: original-space refine must match brute L2 ids. */
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  iovsScannIndex_t sx2 = nullptr;
+  expect_status(iovsScannBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 4, &sx2),
+                "scann2");
+  expect_status(iovsScannSearch(res.r, sx2, q.data(), nq, k, 4, static_cast<int32_t>(n), got.data(),
+                                gd.data()),
+                "scann-refine");
+  expect(recall_at_k(got.data(), truth.data(), nq, k) >= 0.99f, "scann original refine");
+  iovsScannDestroy(sx2);
 }
 
 IOVS_TEST(cagra_graph_build_params_and_q) {

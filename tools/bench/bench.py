@@ -41,10 +41,24 @@ def main() -> int:
         return 0
 
     rng = np.random.default_rng(0)
-    # Generated stand-in (SIFT1M not fetched). Documented: 800 x 32d, 32 queries.
     n, dim, nq, k = 800, 32, 32, 10
     data = rng.standard_normal((n, dim), dtype=np.float32)
     queries = rng.standard_normal((nq, dim), dtype=np.float32)
+    sift = ROOT / "data" / "sift-128-euclidean.hdf5"
+    if sift.exists():
+        try:
+            import h5py  # type: ignore
+
+            with h5py.File(sift, "r") as h:
+                data = np.asarray(h["train"][:2000], dtype=np.float32)
+                queries = np.asarray(h["test"][:32], dtype=np.float32)
+            n, dim = int(data.shape[0]), int(data.shape[1])
+            nq = int(queries.shape[0])
+            print(f"using SIFT hdf5 n={n} dim={dim} nq={nq}")
+        except Exception as e:
+            print(f"SIFT hdf5 present but unused: {e}; generated 800x32 stand-in")
+    else:
+        print("SIFT hdf5 absent; generated stand-in n=800 dim=32 nq=32")
 
     lib = load_iovs()
     res = lib.Resources()
