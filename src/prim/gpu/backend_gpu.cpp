@@ -210,13 +210,18 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances) {
 #if defined(IOVS_WITH_SYCL)
-  /* Fused iGPU walk: one work-item per query, SLM itopk + visited hashmap, in-kernel L2. */
+  /* Fused iGPU walk: one work-item per query, global itopk heap + per-vertex seen[n], in-kernel L2.
+     Heaps and seen are sized to the real itopk and n (not 64 / 4096). Host prim walk if they cannot fit. */
   if (!gpu_available()) return false;
+  if (n <= 0 || nq <= 0 || k <= 0 || dim <= 0 || degree <= 0) return false;
+  itopk = std::max(itopk, static_cast<int32_t>(k));
+  search_width = std::max(1, search_width);
+  constexpr int64_t kMaxItopk = 4096;
+  constexpr int64_t kMaxSeenBytes = 64 * 1024 * 1024;
+  if (itopk > kMaxItopk) return false;
+  if (nq > 0 && n > kMaxSeenBytes / nq) return false;
   try {
     auto& q = gpu_queue();
-    itopk = std::max(itopk, static_cast<int32_t>(k));
-    itopk = std::min(itopk, 64);
-    search_width = std::max(1, search_width);
     const size_t N = static_cast<size_t>(n);
     const size_t D = static_cast<size_t>(dim);
     const size_t NQ = static_cast<size_t>(nq);
@@ -225,6 +230,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t IT = static_cast<size_t>(itopk);
     const size_t SW = static_cast<size_t>(search_width);
     const int met = static_cast<int>(metric);
+    const int max_iters = std::max(24, itopk * 6);
     sycl::buffer<float, 1> bds(const_cast<float*>(dataset), sycl::range<1>(N * D));
     sycl::buffer<int32_t, 1> bg(const_cast<int32_t*>(graph), sycl::range<1>(N * DEG));
     sycl::buffer<float, 1> bq(const_cast<float*>(queries), sycl::range<1>(NQ * D));
@@ -237,6 +243,10 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
       bits = all_one.data();
     }
     sycl::buffer<uint8_t, 1> bb(const_cast<uint8_t*>(bits), sycl::range<1>((N + 7) / 8));
+    /* 0 = unseen, 1 = in heap / seen, 2 = expanded. Length NQ*N so id>=4096 is visitable. */
+    sycl::buffer<uint8_t, 1> bseen(sycl::range<1>(NQ * N));
+    sycl::buffer<int64_t, 1> bhid(sycl::range<1>(NQ * IT));
+    sycl::buffer<float, 1> bhd(sycl::range<1>(NQ * IT));
     q.submit([&](sycl::handler& h) {
       auto DS = bds.get_access<sycl::access::mode::read>(h);
       auto G = bg.get_access<sycl::access::mode::read>(h);
@@ -244,10 +254,14 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
       auto OUTI = bn.get_access<sycl::access::mode::write>(h);
       auto OUTD = bd.get_access<sycl::access::mode::write>(h);
       auto BS = bb.get_access<sycl::access::mode::read>(h);
-      sycl::local_accessor<float, 1> slm_d(sycl::range<1>(64), h);
-      sycl::local_accessor<int64_t, 1> slm_id(sycl::range<1>(64), h);
-      h.parallel_for(sycl::nd_range<1>(sycl::range<1>(NQ), sycl::range<1>(1)), [=](sycl::nd_item<1> itm) {
-        const size_t qi = itm.get_global_id(0);
+      auto Seen = bseen.get_access<sycl::access::mode::read_write>(h);
+      auto HID = bhid.get_access<sycl::access::mode::read_write>(h);
+      auto HD = bhd.get_access<sycl::access::mode::read_write>(h);
+      h.parallel_for(sycl::range<1>(NQ), [=](sycl::id<1> qiid) {
+        const size_t qi = qiid[0];
+        const size_t sbase = qi * N;
+        const size_t hbase = qi * IT;
+        for (size_t i = 0; i < N; ++i) Seen[sbase + i] = 0;
         auto dist_one = [&](size_t id) {
           float s = 0.f;
           float ip = 0.f, nx = 0.f, ny = 0.f;
@@ -267,99 +281,72 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
           }
           return s;
         };
-        auto allowed_id = [&](size_t id) {
-          return (BS[id >> 3] >> (id & 7)) & 1;
-        };
-        /* tiny hashmap: 256-slot open address of seen ids */
-        int32_t seen[256];
-        for (int i = 0; i < 256; ++i) seen[i] = -1;
-        auto mark = [&](int32_t id) {
-          uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
-          for (int p = 0; p < 256; ++p) {
-            uint32_t s = (h + static_cast<uint32_t>(p)) & 255u;
-            if (seen[s] == -1 || seen[s] == id) {
-              seen[s] = id;
-              return;
+        auto allowed_id = [&](size_t id) { return (BS[id >> 3] >> (id & 7)) & 1; };
+        int nkeep = 0;
+        auto consider = [&](int64_t id, float dv) {
+          if (id < 0 || static_cast<size_t>(id) >= N) return;
+          if (Seen[sbase + static_cast<size_t>(id)] != 0) return;
+          Seen[sbase + static_cast<size_t>(id)] = 1;
+          if (nkeep < static_cast<int>(IT)) {
+            HID[hbase + static_cast<size_t>(nkeep)] = id;
+            HD[hbase + static_cast<size_t>(nkeep)] = dv;
+            ++nkeep;
+            return;
+          }
+          int wi = 0;
+          float wv = HD[hbase];
+          for (int i = 1; i < nkeep; ++i) {
+            if (HD[hbase + static_cast<size_t>(i)] > wv) {
+              wv = HD[hbase + static_cast<size_t>(i)];
+              wi = i;
             }
           }
-        };
-        auto was = [&](int32_t id) {
-          uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
-          for (int p = 0; p < 256; ++p) {
-            uint32_t s = (h + static_cast<uint32_t>(p)) & 255u;
-            if (seen[s] == -1) return false;
-            if (seen[s] == id) return true;
+          if (dv < wv) {
+            HID[hbase + static_cast<size_t>(wi)] = id;
+            HD[hbase + static_cast<size_t>(wi)] = dv;
           }
-          return true;
         };
-        int nkeep = 0;
         for (size_t s = 0; s < SW && s < N; ++s) {
-          int64_t id = static_cast<int64_t>((s * 9973 + qi * 13) % N);
-          if (!allowed_id(static_cast<size_t>(id)) || was(static_cast<int32_t>(id))) continue;
-          mark(static_cast<int32_t>(id));
-          slm_id[nkeep] = id;
-          slm_d[nkeep] = dist_one(static_cast<size_t>(id));
-          ++nkeep;
+          const int64_t id = static_cast<int64_t>((s * 9973 + qi * 13) % N);
+          if (!allowed_id(static_cast<size_t>(id))) continue;
+          consider(id, dist_one(static_cast<size_t>(id)));
         }
-        char expd[4096];
-        const size_t expn = N < 4096 ? N : 4096;
-        for (size_t i = 0; i < expn; ++i) expd[i] = 0;
-        const int max_iters = itopk * 6 > 24 ? itopk * 6 : 24;
         for (int iter = 0; iter < max_iters; ++iter) {
           int pick = -1;
           float best = 1e30f;
           for (int i = 0; i < nkeep; ++i) {
-            const int64_t id = slm_id[i];
-            if (id < 0 || static_cast<size_t>(id) >= expn) continue;
-            if (!expd[id] && slm_d[i] < best) {
-              best = slm_d[i];
+            const int64_t id = HID[hbase + static_cast<size_t>(i)];
+            if (id < 0 || static_cast<size_t>(id) >= N) continue;
+            if (Seen[sbase + static_cast<size_t>(id)] != 2 && HD[hbase + static_cast<size_t>(i)] < best) {
+              best = HD[hbase + static_cast<size_t>(i)];
               pick = i;
             }
           }
           if (pick < 0) break;
-          const int64_t pid = slm_id[pick];
-          expd[pid] = 1;
+          const int64_t pid = HID[hbase + static_cast<size_t>(pick)];
+          Seen[sbase + static_cast<size_t>(pid)] = 2;
           for (size_t e = 0; e < DEG; ++e) {
             const int32_t nb = G[static_cast<size_t>(pid) * DEG + e];
             if (nb < 0 || static_cast<size_t>(nb) >= N) continue;
-            if (!allowed_id(static_cast<size_t>(nb)) || was(nb)) continue;
-            mark(nb);
-            const float dv = dist_one(static_cast<size_t>(nb));
-            if (nkeep < static_cast<int>(IT)) {
-              slm_id[nkeep] = nb;
-              slm_d[nkeep] = dv;
-              ++nkeep;
-            } else {
-              int wi = 0;
-              float wv = slm_d[0];
-              for (int i = 1; i < nkeep; ++i) {
-                if (slm_d[i] > wv) {
-                  wv = slm_d[i];
-                  wi = i;
-                }
-              }
-              if (dv < wv) {
-                slm_id[wi] = nb;
-                slm_d[wi] = dv;
-              }
-            }
+            if (!allowed_id(static_cast<size_t>(nb))) continue;
+            consider(nb, dist_one(static_cast<size_t>(nb)));
           }
         }
         for (int a = 0; a < nkeep; ++a) {
           int best = a;
           for (int b = a + 1; b < nkeep; ++b)
-            if (slm_d[b] < slm_d[best]) best = b;
-          const float td = slm_d[a];
-          const int64_t ti = slm_id[a];
-          slm_d[a] = slm_d[best];
-          slm_id[a] = slm_id[best];
-          slm_d[best] = td;
-          slm_id[best] = ti;
+            if (HD[hbase + static_cast<size_t>(b)] < HD[hbase + static_cast<size_t>(best)]) best = b;
+          const float td = HD[hbase + static_cast<size_t>(a)];
+          const int64_t ti = HID[hbase + static_cast<size_t>(a)];
+          HD[hbase + static_cast<size_t>(a)] = HD[hbase + static_cast<size_t>(best)];
+          HID[hbase + static_cast<size_t>(a)] = HID[hbase + static_cast<size_t>(best)];
+          HD[hbase + static_cast<size_t>(best)] = td;
+          HID[hbase + static_cast<size_t>(best)] = ti;
         }
         for (size_t t = 0; t < KK; ++t) {
           if (t < static_cast<size_t>(nkeep)) {
-            OUTI[qi * KK + t] = slm_id[t];
-            float d = slm_d[t];
+            OUTI[qi * KK + t] = HID[hbase + t];
+            float d = HD[hbase + t];
             if (met == 2) d = -d;
             OUTD[qi * KK + t] = d;
           } else {

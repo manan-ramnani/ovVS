@@ -817,7 +817,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
 | FORCE_* honesty | DEVICE_UNAVAILABLE if the requested device did not run | bakeoff last_device must match requested device on success |
 | iGPU topk/gather without DPC++ | OpenVINO TopK/Gather on GPU plugin | SYCL kernels remain for icpx |
-| CAGRA walk | `prim_graph_walk`: fused SYCL if `IOVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | oneAPI `icpx` blocked by UAC; enabled with intel/llvm nightly `clang++ -fsycl` (`sycl_windows.tar.gz`); `cagra_force_gpu_last_device` passes |
+| CAGRA walk | `prim_graph_walk`: fused SYCL if `IOVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | Heaps/seen sized to real `itopk`/`n` (not SLM-64 / expd-4096). Refuse SYCL only if itopk>4096 or seen bytes>64MiB, then host prim walk. `cagra_sycl_walk_n_over_4096` FORCE_GPU n=4200 vs independent L2. |
 | HostCompile | NPU GEMM tiles of M=256 when a full-shape compile fails | in `npu_gemm`; SHAVE C still host-linked until unsigned ELF is loadable |
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
 | Mixer v2 | `iovsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |

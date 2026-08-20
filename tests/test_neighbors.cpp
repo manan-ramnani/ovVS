@@ -453,6 +453,35 @@ IOVS_TEST(cagra_force_gpu_last_device) {
   iovsCagraDestroy(ix);
 }
 
+IOVS_TEST(cagra_sycl_walk_n_over_4096) {
+  if (!iovsSyclEnabled()) return;
+  Res res;
+  int32_t gpu = 0;
+  iovsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  /* n>4096: old kernel skipped expanding id>=4096 and overflowed slm at search_width>64. */
+  const int64_t n = 4200, dim = 8, nq = 4, k = 5;
+  auto data = make_data(n, dim, 442);
+  auto q = make_data(nq, dim, 443);
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
+  iovsCagraIndex_t ix = nullptr;
+  expect_status(iovsCagraBuild(res.r, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 8, 16, &ix), "b");
+  iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_GPU);
+  std::vector<int64_t> got(static_cast<size_t>(nq * k)), truth(static_cast<size_t>(nq * k));
+  std::vector<float> gd(static_cast<size_t>(nq * k)), td(static_cast<size_t>(nq * k));
+  expect_status(iovsCagraSearch(res.r, ix, q.data(), nq, k, 32, 80, nullptr, got.data(), gd.data()), "s");
+  iovsDevice last = IOVS_DEVICE_CPU;
+  iovsResourcesLastDevice(res.r, &last);
+  expect(last == IOVS_DEVICE_GPU, "sycl n>4096 last_device");
+  brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
+  for (int64_t i = 0; i < nq * k; ++i) {
+    expect(got[static_cast<size_t>(i)] >= 0 && got[static_cast<size_t>(i)] < n, "id range");
+  }
+  const float rec = recall_at_k(got.data(), truth.data(), nq, k);
+  expect(rec >= 0.2f, "sycl n>4096 recall vs independent L2 " + std::to_string(rec));
+  iovsCagraDestroy(ix);
+}
+
 IOVS_TEST(ivf_flat_serialize_extend) {
   Res res;
   iovsResourcesSetPolicy(res.r, IOVS_POLICY_FORCE_CPU);
