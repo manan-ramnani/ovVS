@@ -27,6 +27,26 @@ def load_iovs():
     return m
 
 
+def energy_uj_per_query(res, fn, nq, min_s=0.15):
+    """Package RAPL µJ / query. Repeats `fn` until min_s so short searches are measurable."""
+    e0 = res.energy_uj() if res is not None else None
+    if e0 is None:
+        return None
+    n = 0
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < min_s:
+        fn()
+        n += 1
+    e1 = res.energy_uj()
+    if e1 is None or n <= 0:
+        return None
+    return (e1 - e0) / float(n * max(nq, 1))
+
+
+def fmt_ujq(ujq):
+    return "na" if ujq is None else f"{ujq:.1f}"
+
+
 def recall_at_k(got, truth, nq, k):
     hit = 0
     for q in range(nq):
@@ -75,8 +95,9 @@ def main() -> int:
             t0 = time.perf_counter()
             nbp, _ = idx_p.search(queries, k=k)
             t1 = time.perf_counter()
+            ujq = energy_uj_per_query(res_p, lambda: idx_p.search(queries, k=k), nq)
             print(
-                f"iovs brute policy={name} n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f} last_device={res_p.last_device()}"
+                f"iovs brute policy={name} n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f} last_device={res_p.last_device()} uj/q={fmt_ujq(ujq)}"
             )
             if name == "cpu":
                 nb = nbp
@@ -117,7 +138,8 @@ def main() -> int:
         inb, _ = ivf_ix.search(queries, k=k, nprobe=nprobe)
         t1 = time.perf_counter()
         rec_i = recall_at_k(np.asarray(inb).reshape(-1), Iivf.reshape(-1), nq, k)
-        print(f"iovs ivf-flat ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_i:.3f}")
+        ujq = energy_uj_per_query(res, lambda: ivf_ix.search(queries, k=k, nprobe=nprobe), nq)
+        print(f"iovs ivf-flat ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_i:.3f} uj/q={fmt_ujq(ujq)}")
         pq_m, nbits, krefine = 8, 8, 32
         quant_pq = faiss.IndexFlatL2(dim)
         faiss_pq = faiss.IndexIVFPQ(quant_pq, dim, nlist, pq_m, nbits)
@@ -135,7 +157,10 @@ def main() -> int:
         pnb, _ = pq_ix.search(queries, k=k, nprobe=nprobe, krefine=krefine)
         t1 = time.perf_counter()
         rec_p = recall_at_k(np.asarray(pnb).reshape(-1), Ipq.reshape(-1), nq, k)
-        print(f"iovs ivf-pq ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_p:.3f}")
+        ujq = energy_uj_per_query(
+            res, lambda: pq_ix.search(queries, k=k, nprobe=nprobe, krefine=krefine), nq
+        )
+        print(f"iovs ivf-pq ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_p:.3f} uj/q={fmt_ujq(ujq)}")
         faiss_ok = True
     except Exception as e:
         print(f"faiss unavailable: {e}")
@@ -156,7 +181,10 @@ def main() -> int:
         cnb, _ = cg.search(queries, k=k, itopk_size=32, search_width=2)
         t1 = time.perf_counter()
         rec_c = recall_at_k(np.asarray(cnb).reshape(-1), np.asarray(labels).reshape(-1), nq, k)
-        print(f"iovs cagra ms={(t1 - t0) * 1000:.3f} vs-hnswlib-recall={rec_c:.3f}")
+        ujq = energy_uj_per_query(
+            res, lambda: cg.search(queries, k=k, itopk_size=32, search_width=2), nq
+        )
+        print(f"iovs cagra ms={(t1 - t0) * 1000:.3f} vs-hnswlib-recall={rec_c:.3f} uj/q={fmt_ujq(ujq)}")
     except Exception as e:
         print(f"hnswlib unavailable: {e}")
 

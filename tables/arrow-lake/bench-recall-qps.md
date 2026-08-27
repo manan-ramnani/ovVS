@@ -15,3 +15,16 @@ ioVS IVF-PQ vs-faiss 0.637 is competitor-overlap (FAISS IVF-PQ vs-brute on this 
 CAGRA (graph_degree=16, itopk=32, search_width=2) vs-brute is 0.991 vs hnswlib M=16 ef=32 vs-brute 0.994. vs-hnswlib-recall is ID overlap with hnswlib, not vs-brute.
 The bench does **not** emit `FAISS comparator parked`.
 Python must load `build-icpx/bin/iovs.dll` (`IOVS_LIBRARY`); `python/iovs/__init__.py` honors that env var and prefers `build-icpx` over `build/bin`.
+
+Package RAPL µJ/query (`Resources.energy_uj`, EMI `RAPL_Package0_PKG`, ~150 ms repeat window) on the same slice:
+
+| Path | last_device | uj/query |
+|---|---|---|
+| brute CPU | 1 | 1049 |
+| brute NPU | 2 | 4638 |
+| brute GPU | 3 | 17893 |
+| IVF-Flat CPU | 1 | 1239 |
+| IVF-PQ CPU | 1 | 2186 |
+| CAGRA CPU | 1 | 2990 |
+
+These are **package** joules (CPU+iGPU+uncore), not NPU-isolated. Short CPU searches are noisy; NPU/GPU walls are long enough that the delta is real. NPU brute is slower *and* more package µJ/query than CPU on this small slice.

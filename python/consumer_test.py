@@ -9,8 +9,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-dll = ROOT / "build" / "bin" / "iovs.dll"
-os.environ["IOVS_LIBRARY"] = str(dll)
+if "IOVS_LIBRARY" not in os.environ:
+    for cand in (
+        ROOT / "build-icpx" / "bin" / "iovs.dll",
+        ROOT / "build-sycl" / "bin" / "iovs.dll",
+        ROOT / "build" / "bin" / "iovs.dll",
+    ):
+        if cand.exists():
+            os.environ["IOVS_LIBRARY"] = str(cand)
+            break
 sys.path.insert(0, str(ROOT / "python"))
 
 import iovs  # noqa: E402
@@ -54,6 +61,7 @@ def main() -> int:
         print("mismatch", got, truth, file=sys.stderr)
         return 1
     print("python consumer ok neighbors", got, "version", iovs.version(), "numpy", use_np)
+    _ = res.energy_uj()
     if use_np:
         # DLPack ingest: build+search from __dlpack__ capsules, same independent L2 oracle.
         d_dl = np.from_dlpack(data)

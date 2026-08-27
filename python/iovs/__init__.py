@@ -164,6 +164,7 @@ _lib.iovsGatherRows.argtypes = [
 ]
 _lib.iovsResourcesSetPolicy.argtypes = [c_void_p, c_int32]
 _lib.iovsResourcesLastDevice.argtypes = [c_void_p, POINTER(c_int32)]
+_lib.iovsResourcesEnergyUj.argtypes = [c_void_p, POINTER(c_int64)]
 _lib.iovsBitsetFromAllowList.argtypes = [c_int64, POINTER(c_int64), c_int64, POINTER(c_uint8)]
 _lib.iovsIvfPqSerialize.argtypes = [c_void_p, c_char_p]
 _lib.iovsIvfPqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
@@ -307,6 +308,13 @@ class Resources:
         if _lib.iovsResourcesLastDevice(self._h, ctypes.byref(d)) != 0:
             raise RuntimeError("last_device failed")
         return int(d.value)
+
+    def energy_uj(self):
+        uj = c_int64()
+        rc = _lib.iovsResourcesEnergyUj(self._h, ctypes.byref(uj))
+        if rc != 0:
+            return None
+        return int(uj.value)
 
     def gemm(self, a, b, m, n, k, trans_b=1):
         cbuf = (c_float * (m * n))()
