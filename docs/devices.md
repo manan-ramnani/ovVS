@@ -33,7 +33,7 @@ Search is `prim_graph_walk`: fused SYCL iGPU kernel when `OVVS_WITH_SYCL=ON` (SL
 
 `ovvsBruteForceBuildTyped` still converts F16/I8 datasets into an fp32 workspace for search (index storage). **Compute** can be lower-bit: `ovvsGemmEx(..., compute)` keeps host buffers fp32 and runs the MatMul as that type on the device.
 
-- **INT8 (NPU):** NCE MACs are INT8-native (Arrow Lake 3720 TOPS are INT8; FP16 is half-rate). AUTO large GEMM tries FakeQuantize INT8 first. `ovvsGemmEx(..., I8)` FORCE_NPU uses that path.
+- **INT8 (NPU):** NCE MACs are INT8-native (Arrow Lake 3720 TOPS are INT8; FP16 is half-rate). The OpenVINO graph contract is **NNCF Low Precision IR** (FakeQuantize on activations **and** Constant weights), not two runtime `f32` Parameters. Raw `si8` MatMul is rejected. `PERF_COUNT` on this SKU: DPU MatMul is 21 µs for 64³ and 5.3 ms for `1e5×32×768`; SHAVE DMA of the big Parameter is 35 ms. Baking B as Constant makes DPU faster (2 µs) and **wall slower** (8–24 ms) — Level Zero/UMD, not the MAC array. Scratchpad is 4 MB, so large datasets never stay on-die. See `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`. FORCE_NPU still runs FakeQuantize INT8; AUTO low-bit prefers iGPU XMX because that path is a real GEMM.
 - **FP16 (iGPU):** Xe Matrix Extensions (XMX/DPAS) do FP16 and INT8. `ovvsGemmEx(..., F16)` AUTO/FORCE_GPU uses oneMKL `sycl::half` GEMM (XMX), then a SYCL-half loop, then OpenVINO GPU.
 - **INT8 (iGPU):** oneMKL `int8×int8→float` GEMM (XMX, 2× FP16 issue rate on Xe-core). AUTO I8 tries NPU first, then this.
 - **FP16 (NPU):** still available via `ovvsGemmEx(..., F16)` FORCE_NPU (`Convert→f16 MatMul`). Not the AUTO large-GEMM default.
