@@ -6,7 +6,7 @@ ovVS picks a device per primitive (`gemm`, `topk`, `gather`, pairwise). Algorith
 
 | Policy | Behavior |
 |---|---|
-| `OVVS_POLICY_AUTO` | NPU if the op is large enough and NPU is not marked busy; else GPU; else CPU |
+| `OVVS_POLICY_AUTO` | Per `docs/hw-split.md`: GEMM/TopK/Gather → CPU oneMKL on this SKU; CAGRA walk → iGPU; ADC → NPU |
 | `OVVS_POLICY_FORCE_CPU` | CPU only |
 | `OVVS_POLICY_FORCE_NPU` | NPU only. If the NPU does not run the op, the call returns `OVVS_STATUS_DEVICE_UNAVAILABLE`. CPU is **not** reported as an NPU win. |
 | `OVVS_POLICY_FORCE_GPU` | GPU only (OpenVINO GPU plugin, or SYCL if `OVVS_WITH_SYCL=ON`). Same unavailable rule. |
@@ -23,7 +23,7 @@ Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>
 
 Bakeoff JSON lives in `tables/<sku>/`. This lab machine writes `tables/arrow-lake/` (Core Ultra 7 265K). Lunar Lake files are only created if that CPU brand string is actually probed — do not copy Arrow Lake numbers.
 
-Tiny GEMM (`B` small, `K` small) often wins on CPU because of NPU launch tax (`tables/arrow-lake/gemm.json`). Large GEMM `1e5 × 32 × 768` after InferRequest reuse + L0 `get_tensor` feed: **NPU 54 ms**, GPU 151 ms, CPU 192 ms — NPU is the AUTO large-GEMM winner (`gemm_large.json`). Large F16: NPU 50 ms vs GPU XMX 79 ms (`gemm_f16.json`). Large I8: GPU XMX 122 ms still beats NPU FQ 209 ms (`gemm_i8.json`). Large topk/gather still CPU-win (launch tax).
+Tiny and large GEMM on this SKU both win on **CPU oneMKL** (`cblas_sgemm`): 64×128×32 is 0.006 ms; `1e5×32×768` is **18 ms** vs NPU 45 ms vs GPU 221 ms (`gemm_large.json`). Search-shaped 32×1e5×768 is the same story (CPU 18 vs NPU 36, `gemm_search.json`). NPU DPU is 5.3 ms; the 45 ms wall is Parameter DMA. AUTO GEMM is CPU. Large TopK/Gather stay CPU. CAGRA walk is iGPU. ADC is NPU. See `docs/hw-split.md`.
 
 ## CAGRA walk
 

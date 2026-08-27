@@ -827,7 +827,9 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | C++ API | header wrappers beyond brute-force | IVF-Flat / IVF-PQ / IVF-RaBitQ / CAGRA + serialize/extend in `ovvs.hpp` |
 | Allow-list filter | `ovvsBitsetFromAllowList` | fills `(n+7)/8` bitset; missing ids stay 0 |
 | IVF-PQ / RaBitQ persist | magic `IPQ1` / `RQB1` | serialize/deserialize/extend encode residuals into existing codebooks |
-| Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake after L0 `get_tensor` feed: f32 NPU **54 ms** vs GPU 151 vs CPU 192. F16 large NPU 50 vs GPU XMX 79 (`gemm_f16.json`). I8 AUTO stays iGPU XMX 122 vs NPU FQ 209 (`gemm_i8.json`). |
+| Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake after oneMKL CPU: **CPU 18 ms** vs NPU 45 vs GPU 221. NPU DPU 5.3 ms; Parameter DMA is the tax. Canonical split: `docs/hw-split.md`. |
+| TopK/Gather AUTO | CPU | `topk_large.json` CPU 3.4 ms vs NPU 99 vs GPU 758. |
+| CPU GEMM | oneMKL `cblas_sgemm` | Naive triple loop was 192 ms; MKL is 18 ms. That flip made CPU the dense GEMM device on this SKU. |
 | NPU programming model | Inference engine, not BLAS | DPU MatMul is µs; wall was SHAVE copies from `set_tensor(host*)` plus new InferRequest. Feed `get_input_tensor` L0 buffers; reuse InferRequest; always memcpy (k-means mutates in place — no pointer-sticky skip). INT8 = NNCF FQ+Constant weights. Scratchpad 4 MB. Compile: TURBO + `optimization-level=2`. Canonical: `AGENTS.md` “NPU contract” + `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`. |
 
 ---

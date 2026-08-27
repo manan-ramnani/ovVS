@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 1.8790, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 113.7947, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 749.8954, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 3.4481, "ms_hot": 3.4171, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 98.6358, "ms_hot": 97.3678, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 757.7537, "ms_hot": 755.1473, "status": "success"}
   ],
-  "note": "Large topk (k=10 over 1e5) still CPU-win; NPU/GPU launch tax dominates. GEMM is the accelerator win. FORCE_* last_device matches."
+  "note": "Large topk (k=10 over 1e5) CPU-win. AUTO TopK is CPU. FORCE_* last_device matches."
 }

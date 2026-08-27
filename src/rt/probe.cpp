@@ -71,6 +71,11 @@ static float json_run_ms(const std::string& s, const char* requested) {
   const std::string key = std::string("\"requested\": \"") + requested + "\"";
   const auto p = s.find(key);
   if (p == std::string::npos) return -1.f;
+  /* Prefer ms_hot (repeated infer, sticky L0) when present — that is search. */
+  const auto hot = s.find("\"ms_hot\":", p);
+  if (hot != std::string::npos && hot < p + 280) {
+    return static_cast<float>(std::atof(s.c_str() + hot + 9));
+  }
   const auto m = s.find("\"ms\":", p);
   if (m == std::string::npos || m > p + 180) return -1.f;
   return static_cast<float>(std::atof(s.c_str() + m + 5));

@@ -1,0 +1,32 @@
+{
+  "sku": "arrow-lake",
+  "op": "gemm",
+  "shapes": [
+    {
+      "shape": [256, 256, 128],
+      "runs": [
+        {"requested": "cpu", "ms": 0.0631, "ms_hot": 0.0300},
+        {"requested": "npu", "ms": 0.9627, "ms_hot": 0.8250},
+        {"requested": "gpu", "ms": 12.5296, "ms_hot": 0.8217}
+      ]
+    },
+    {
+      "shape": [32, 1024, 768],
+      "note": "IVF-coarse: nq=32, nlist=1024, dim=768",
+      "runs": [
+        {"requested": "cpu", "ms": 0.1887, "ms_hot": 0.1114},
+        {"requested": "npu", "ms": 1.0915, "ms_hot": 0.7928},
+        {"requested": "gpu", "ms": 3.8194, "ms_hot": 3.9090}
+      ]
+    },
+    {
+      "shape": [512, 512, 512],
+      "runs": [
+        {"requested": "cpu", "ms": 0.3748, "ms_hot": 0.3616},
+        {"requested": "npu", "ms": 1.1554, "ms_hot": 0.8802},
+        {"requested": "gpu", "ms": 32.5739, "ms_hot": 27.3039}
+      ]
+    }
+  ],
+  "note": "oneMKL CPU wins every mid GEMM. NPU launch ~0.8–1.1 ms. Do not AUTO-route these to NPU."
+}

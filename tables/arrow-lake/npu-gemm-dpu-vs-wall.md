@@ -21,15 +21,18 @@ CPU f32 64×64×32 was 0.016 ms in `gemm.json`. NPU DPU is in the same µs band;
 
 `set_tensor(host*)` made the plugin SHAVE-copy into Level Zero buffers. `ovvsGemm` now `memcpy`s into `get_input_tensor` L0 buffers and reuses one InferRequest (`src/prim/npu/backend_npu.cpp`). Bakeoff (`ovvs_bakeoff`, warmup + 1 timed run):
 
-| Shape | Path | Wall |
+| Shape | Path | Wall (ms / ms_hot) |
 |---|---|---|
-| 64×128×32 f32 | CPU | 0.015 ms |
-| 64×128×32 f32 | NPU C API | 0.78 ms (DPU ~21 µs) |
-| 1e5×32×768 f32 | NPU C API | **54 ms** (was 117 ms with `set_tensor`; DPU 5.3 ms) |
-| 1e5×32×768 f16 | NPU C API | **50 ms** (was 148 ms) |
-| 1e5×32×768 i8 FQ | NPU C API | 209 ms (GPU XMX 122 ms still wins I8) |
+| 64×128×32 f32 | CPU oneMKL | **0.018 / 0.006** |
+| 64×128×32 f32 | NPU C API | 0.94 / 0.57 |
+| 1e5×32×768 f32 | CPU oneMKL | **18 / 20** |
+| 1e5×32×768 f32 | NPU C API | 45 / 53 (DPU 5.3) |
+| 32×1e5×768 f32 | CPU oneMKL | **18 / 26** |
+| 32×1e5×768 f32 | NPU C API | 36 / 35 |
+| 1e5×32×768 f16 | NPU C API | 39 / 42 |
+| 1e5×32×768 i8 FQ | NPU C API | 231 / 223 |
 
-Remaining 54 vs 5.3 ms is host memcpy of A (~307 MB) into L0 plus UMD. Closing that needs NPU-allocated tensors as the dataset home, not pointer-sticky skip (k-means mutates centroids in place).
+Fingerprint-sticky skips host memcpy of unchanged ≥64 KiB operands. The remaining NPU wall vs DPU is **device DMA of the Parameter into SRAM**, not a second plugin copy. oneMKL `cblas_sgemm` reads the same DRAM faster than that DMA. AUTO GEMM is CPU on this SKU. Closing the DPU gap needs weights that already live in NPU SRAM (compiled Constant that does not regress wall, or `create_l0_host_tensor` as tensor home).
 
 SRAM on this NPU is **4 MB**. `1e5×768` f16 is ~150 MB, so the big operand never lives in scratchpad. `2000×128` f16 is ~0.5 MB and would fit; we still pay SHAVE/L0 to get it there every infer unless it is a compiled Constant, and Constant-B made **wall** worse on 64 and 256 even though DPU got 5–10× faster.
 

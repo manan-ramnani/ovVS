@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 193.7242, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 208.6836, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 122.1615, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 17.4388, "ms_hot": 16.8065, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 230.5390, "ms_hot": 223.4130, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 203.1594, "ms_hot": 170.5013, "status": "success"}
   ],
-  "note": "oneMKL int8×int8→float on Xe-LPG XMX 122 ms beats CPU 194 and NPU FakeQuantize-INT8 209 (was 310). NCE INT8 TOPS are not visible through two-Parameter FQ MatMul; AUTO I8 → GPU. FORCE_NPU still runs the NPU path."
+  "note": "FORCE_CPU is f32 cblas 17 ms. NPU FakeQuantize 223 ms. iGPU XMX int8 170 ms. AUTO I8 follows gemm_large.json (CPU). FORCE_GPU still XMX."
 }

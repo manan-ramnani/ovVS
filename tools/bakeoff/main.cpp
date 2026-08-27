@@ -29,6 +29,12 @@ int main(int argc, char** argv) {
     N = 32;
     K = 768;
   }
+  if (op == "search" || op == "gemm-search") {
+    op = "gemm";
+    M = 32;
+    N = 100000;
+    K = 768;
+  }
   if (op == "gemm-f16" || op == "gemm-i8") {
     if (argc <= 4) {
       M = 256;
@@ -95,13 +101,17 @@ int main(int argc, char** argv) {
     const double t0 = now_ms();
     ovvsStatus st = run_op();
     const double t1 = now_ms();
+    const ovvsStatus st_hot = run_op();
+    const double t2 = now_ms();
+    if (st == OVVS_STATUS_SUCCESS) st = st_hot;
     if (!first) std::printf(",\n");
     first = false;
     ovvsDevice last = OVVS_DEVICE_CPU;
     ovvsResourcesLastDevice(res, &last);
     std::printf(
-        "    {\"requested\": \"%s\", \"last_device\": \"%s\", \"ms\": %.4f, \"status\": \"%s\"}",
-        names[p], last_name(last), t1 - t0, ovvsStatusString(st));
+        "    {\"requested\": \"%s\", \"last_device\": \"%s\", \"ms\": %.4f, \"ms_hot\": %.4f, "
+        "\"status\": \"%s\"}",
+        names[p], last_name(last), t1 - t0, t2 - t1, ovvsStatusString(st));
   }
   const ovvsStatus es1 = ovvsResourcesEnergyUj(res, &e1);
   std::printf("\n  ],\n  \"energy_uj_before\": %lld,\n  \"energy_uj_after\": %lld,\n  \"energy_status\": \"%s\"\n}\n",

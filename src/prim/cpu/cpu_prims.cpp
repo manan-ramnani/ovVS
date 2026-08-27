@@ -1,10 +1,26 @@
 #include "internal.hpp"
 
+#include <cstdint>
+
+#if defined(OVVS_WITH_MKL)
+#include <mkl_cblas.h>
+#endif
+
 namespace ovvs {
 namespace impl {
 
 void cpu_gemm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
               bool trans_b) {
+#if defined(OVVS_WITH_MKL)
+  if (m > 0 && n > 0 && k > 0 && m <= INT32_MAX && n <= INT32_MAX && k <= INT32_MAX) {
+    const MKL_INT mm = static_cast<MKL_INT>(m);
+    const MKL_INT nn = static_cast<MKL_INT>(n);
+    const MKL_INT kk = static_cast<MKL_INT>(k);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans, mm, nn, kk, 1.f, a,
+                kk, b, trans_b ? kk : nn, 0.f, c, nn);
+    return;
+  }
+#endif
   for (int64_t i = 0; i < m; ++i) {
     for (int64_t j = 0; j < n; ++j) {
       float s = 0.f;

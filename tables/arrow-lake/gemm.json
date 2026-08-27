@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 0.0150, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 0.7792, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 0.0357, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 0.0183, "ms_hot": 0.0055, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 0.9355, "ms_hot": 0.5692, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 0.0345, "ms_hot": 0.0338, "status": "success"}
   ],
-  "note": "icx 2025.1.1 SYCL+oneMKL. Tiny GEMM still CPU-win (NPU launch tax ~0.78 ms vs DPU 21 µs). GPU is oneMKL/hand-SYCL USM."
+  "note": "CPU is oneMKL cblas_sgemm. Tiny GEMM CPU-win (launch tax on NPU/GPU)."
 }

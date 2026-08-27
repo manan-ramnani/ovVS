@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 191.9961, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 54.2290, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 151.4030, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 17.7418, "ms_hot": 19.5047, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 44.9322, "ms_hot": 52.5481, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 220.7428, "ms_hot": 240.9524, "status": "success"}
   ],
-  "note": "After InferRequest reuse + get_input_tensor L0 feed (no set_tensor host copy). NPU 54 ms vs previous 117 ms; DPU still 5.3 ms. AUTO large-GEMM winner is NPU."
+  "note": "CPU oneMKL cblas_sgemm 18 ms beats NPU L0-feed 45 ms and iGPU 221 ms. NPU DPU is 5.3 ms; Parameter DMA is the rest. AUTO large-GEMM winner is CPU. FORCE_NPU still NPU."
 }

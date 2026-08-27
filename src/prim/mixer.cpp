@@ -22,21 +22,21 @@ ovvsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elem
   const ovvsDevice forced = policy_force(r.policy);
   if (forced != OVVS_DEVICE_AUTO) return forced;
 
-  const bool npu_shaped =
-      std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0 ||
-      std::strcmp(op, "topk") == 0 || std::strcmp(op, "gather") == 0;
-  /* Large GEMM/pairwise: use bakeoff winner from tables/<sku>/gemm_large.json when present. */
-  if (npu_shaped && (std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0) &&
-      flops_or_elems >= r.large_gemm_flops && r.large_gemm_winner != OVVS_DEVICE_AUTO) {
+  /* TopK / Gather: CPU wins every Arrow Lake bakeoff (launch tax). FORCE_* still
+     takes the branch above. See tables/arrow-lake/topk_large.json, gather_large.json. */
+  if (std::strcmp(op, "topk") == 0 || std::strcmp(op, "gather") == 0) return OVVS_DEVICE_CPU;
+
+  const bool gemm_like = std::strcmp(op, "gemm") == 0 || std::strcmp(op, "pairwise") == 0;
+  if (!gemm_like) return OVVS_DEVICE_CPU;
+
+  /* Dense GEMM: oneMKL cblas_sgemm wins tiny through 1e5×32×768 on Arrow Lake
+     once CPU is not a triple loop. NPU DPU is faster in isolation; the Parameter
+     DMA tax is not. Honour gemm_large.json when the shape is in that class so a
+     SKU where NPU/GPU actually wins can flip AUTO. */
+  if (flops_or_elems >= r.large_gemm_flops && r.large_gemm_winner != OVVS_DEVICE_AUTO) {
     if (r.large_gemm_winner == OVVS_DEVICE_GPU && r.gpu_available) return OVVS_DEVICE_GPU;
     if (r.large_gemm_winner == OVVS_DEVICE_NPU && r.npu_available && !r.npu_busy) return OVVS_DEVICE_NPU;
     if (r.large_gemm_winner == OVVS_DEVICE_CPU) return OVVS_DEVICE_CPU;
-  }
-  if (r.npu_available && !r.npu_busy && npu_shaped && flops_or_elems >= 256 * 256 * 32) {
-    return OVVS_DEVICE_NPU;
-  }
-  if (r.gpu_available && flops_or_elems >= 64 * 64) {
-    if (npu_shaped) return OVVS_DEVICE_GPU;
   }
   return OVVS_DEVICE_CPU;
 }
@@ -77,22 +77,11 @@ ovvsStatus prim_gemm_compute(ResourcesData& r, const float* a, const float* b, f
     r.last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
   }
-  /* AUTO I8: Xe-LPG XMX (oneMKL) beats NPU FakeQuantize MatMul on Arrow Lake.
-     AUTO F16 large: NPU Convert+f16 with L0 get_tensor beat XMX (`gemm_f16.json`).
-     FORCE_NPU still hits NPU for both. */
-  if (compute == OVVS_DTYPE_I8) {
-    if (r.gpu_available && try_gpu()) return OVVS_STATUS_SUCCESS;
-    if (r.npu_available && !r.npu_busy && try_npu()) return OVVS_STATUS_SUCCESS;
-  } else if (compute == OVVS_DTYPE_F16) {
-    const ovvsDevice d = choose_device(r, "gemm", m * n * k);
-    if (d == OVVS_DEVICE_NPU && try_npu()) return OVVS_STATUS_SUCCESS;
-    if ((d == OVVS_DEVICE_GPU || d == OVVS_DEVICE_NPU) && try_gpu()) return OVVS_STATUS_SUCCESS;
-    if (r.npu_available && !r.npu_busy && try_npu()) return OVVS_STATUS_SUCCESS;
-  } else {
-    const ovvsDevice d = choose_device(r, "gemm", m * n * k);
-    if (d == OVVS_DEVICE_NPU && try_npu()) return OVVS_STATUS_SUCCESS;
-    if ((d == OVVS_DEVICE_GPU || d == OVVS_DEVICE_NPU) && try_gpu()) return OVVS_STATUS_SUCCESS;
-  }
+  /* AUTO: same size ladder as f32. On Arrow Lake that is CPU oneMKL for dense GEMM
+     (F16/I8 XMX and NPU FQ lose to cblas_sgemm). FORCE_* still above. */
+  const ovvsDevice d = choose_device(r, "gemm", m * n * k);
+  if (d == OVVS_DEVICE_NPU && try_npu()) return OVVS_STATUS_SUCCESS;
+  if ((d == OVVS_DEVICE_GPU || d == OVVS_DEVICE_NPU) && try_gpu()) return OVVS_STATUS_SUCCESS;
   cpu_gemm(a, b, c, m, n, k, trans_b);
   r.last_device = OVVS_DEVICE_CPU;
   r.last_compute_dtype = OVVS_DTYPE_F32;

@@ -45,6 +45,41 @@ static float* usm_f(size_t n) { return usm_scratch<float>(n); }
 static int64_t* usm_i64(size_t n) { return usm_scratch<int64_t>(n); }
 static sycl::half* usm_h(size_t n) { return usm_scratch<sycl::half>(n); }
 static std::int8_t* usm_i8(size_t n) { return usm_scratch<std::int8_t>(n); }
+
+static void pack_f16(sycl::queue& q, const float* src, sycl::half* dst, size_t n) {
+  if (ovvs_usm_is_shared(src)) {
+    q.parallel_for(n, [=](sycl::id<1> i) { dst[i] = static_cast<sycl::half>(src[i]); }).wait();
+    return;
+  }
+  sycl::buffer<float, 1> b(const_cast<float*>(src), sycl::range<1>(n));
+  q.submit([&](sycl::handler& h) {
+     auto a = b.get_access<sycl::access::mode::read>(h);
+     h.parallel_for(n, [=](sycl::id<1> i) { dst[i] = static_cast<sycl::half>(a[i]); });
+   }).wait();
+}
+
+static void pack_i8(sycl::queue& q, const float* src, std::int8_t* dst, size_t n, float scale) {
+  const float inv = 1.f / scale;
+  if (ovvs_usm_is_shared(src)) {
+    q.parallel_for(n, [=](sycl::id<1> i) {
+       float v = src[i] * inv;
+       if (v > 127.f) v = 127.f;
+       if (v < -127.f) v = -127.f;
+       dst[i] = static_cast<std::int8_t>(v);
+     }).wait();
+    return;
+  }
+  sycl::buffer<float, 1> b(const_cast<float*>(src), sycl::range<1>(n));
+  q.submit([&](sycl::handler& h) {
+     auto a = b.get_access<sycl::access::mode::read>(h);
+     h.parallel_for(n, [=](sycl::id<1> i) {
+       float v = a[i] * inv;
+       if (v > 127.f) v = 127.f;
+       if (v < -127.f) v = -127.f;
+       dst[i] = static_cast<std::int8_t>(v);
+     });
+   }).wait();
+}
 #endif
 
 void* ovvs_usm_malloc(size_t bytes) {
@@ -205,8 +240,8 @@ static bool gemm_mkl_f16(const float* a, const float* b, float* c, int64_t m, in
   if (!packed || !C) return false;
   sycl::half* A = packed;
   sycl::half* B = packed + M * K;
-  for (size_t i = 0; i < M * K; ++i) A[i] = static_cast<sycl::half>(a[i]);
-  for (size_t i = 0; i < bsz; ++i) B[i] = static_cast<sycl::half>(b[i]);
+  pack_f16(q, a, A, M * K);
+  pack_f16(q, b, B, bsz);
   const auto transA = oneapi::mkl::transpose::nontrans;
   const auto transB = trans_b ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans;
   const std::int64_t lda = static_cast<std::int64_t>(K);
@@ -239,17 +274,8 @@ static bool gemm_mkl_i8(const float* a, const float* b, float* c, int64_t m, int
   };
   const float sa = std::max(maxabs(a, asz) / 127.f, 1e-8f);
   const float sb = std::max(maxabs(b, bsz) / 127.f, 1e-8f);
-  auto quant = [](const float* src, std::int8_t* dst, size_t n, float scale) {
-    const float inv = 1.f / scale;
-    for (size_t i = 0; i < n; ++i) {
-      float v = src[i] * inv;
-      if (v > 127.f) v = 127.f;
-      if (v < -127.f) v = -127.f;
-      dst[i] = static_cast<std::int8_t>(std::lrintf(v));
-    }
-  };
-  quant(a, A, asz, sa);
-  quant(b, B, bsz, sb);
+  pack_i8(q, a, A, asz, sa);
+  pack_i8(q, b, B, bsz, sb);
   const float alpha = sa * sb;
   const auto transA = oneapi::mkl::transpose::nontrans;
   const auto transB = trans_b ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans;

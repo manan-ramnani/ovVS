@@ -43,17 +43,58 @@ struct CachedReq {
   ov::CompiledModel compiled;
   ov::InferRequest req;
   std::mutex mu;
+  const void* fp_ptr[4]{};
+  size_t fp_n[4]{};
+  uint64_t fp_h[4]{};
 };
+
+/* Cheap content fingerprint: ends + 32 strided samples. Catches k-means/ScaNN
+   rewriting centroids (first row changes). In-place mutation that misses every
+   sample is not detected — reallocate the buffer if you mutate a large operand. */
+static uint64_t content_fp(const void* p, size_t n) {
+  const auto* b = static_cast<const uint8_t*>(p);
+  uint64_t h = 0x9e3779b97f4a7c15ull ^ n;
+  auto mix = [&](size_t off) {
+    uint64_t w = 0;
+    const size_t o = off > n - 8 ? n - 8 : off;
+    std::memcpy(&w, b + o, 8);
+    h ^= w + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+  };
+  if (n < 8) {
+    uint64_t w = 0;
+    if (n) std::memcpy(&w, b, n);
+    return h ^ w;
+  }
+  mix(0);
+  mix(n - 8);
+  for (int i = 1; i < 32; ++i) mix((n - 8) * static_cast<size_t>(i) / 32);
+  return h;
+}
 
 /* NPU plugin L0 tensors are allocated at create_infer_request. get_input_tensor /
    get_output_tensor populate those buffers with no extra SHAVE copy. set_tensor on a
-   malloc/USM host pointer forces a copy (OpenVINO intel_npu README). Always memcpy:
-   k-means / ScaNN mutate centroids in place behind a stable pointer. */
+   malloc/USM host pointer forces a copy (OpenVINO intel_npu README). Skip memcpy
+   when the operand is already in the L0 tensor or the fingerprint matches (search
+   dataset / k-means X). Tiny payloads always copy — hash is not cheaper. */
 static void fill_in(CachedReq& slot, size_t idx, const void* src, size_t nbytes) {
   ov::Tensor t = slot.req.get_input_tensor(idx);
   if (t.get_byte_size() < nbytes) throw std::runtime_error("npu input smaller than payload");
   void* dst = t.data();
-  if (dst != src && src != nullptr && nbytes > 0) std::memcpy(dst, src, nbytes);
+  if (dst == src || src == nullptr || nbytes == 0) return;
+  if (nbytes >= 65536 && slot.fp_ptr[idx] == src && slot.fp_n[idx] == nbytes) {
+    const uint64_t h = content_fp(src, nbytes);
+    if (h == slot.fp_h[idx]) return;
+    slot.fp_h[idx] = h;
+  } else if (nbytes >= 65536) {
+    slot.fp_ptr[idx] = src;
+    slot.fp_n[idx] = nbytes;
+    slot.fp_h[idx] = content_fp(src, nbytes);
+  } else {
+    slot.fp_ptr[idx] = nullptr;
+    slot.fp_n[idx] = 0;
+    slot.fp_h[idx] = 0;
+  }
+  std::memcpy(dst, src, nbytes);
 }
 
 static void read_out(CachedReq& slot, size_t idx, void* dst, size_t nbytes) {

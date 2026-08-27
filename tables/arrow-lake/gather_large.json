@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 4.0498, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 213.1547, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 24.1799, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 5.7168, "ms_hot": 5.0331, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 172.9069, "ms_hot": 175.8374, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 30.0827, "ms_hot": 45.4321, "status": "success"}
   ],
-  "note": "4096-row gather from 1e5x768: CPU wins. SYCL USM GPU is faster than NPU. Accelerated FORCE_* last_device matches."
+  "note": "4096-row gather from 1e5x768: CPU 5 ms, GPU 30 ms, NPU 173 ms. AUTO Gather is CPU."
 }

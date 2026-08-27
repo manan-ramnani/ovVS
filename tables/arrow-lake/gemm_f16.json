@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 185.9271, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 50.0141, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 79.3338, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 19.1467, "ms_hot": 21.5812, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 39.4606, "ms_hot": 42.4270, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 81.4887, "ms_hot": 87.8122, "status": "success"}
   ],
-  "note": "NPU Convert+f16 MatMul with L0 get_tensor 50 ms beats oneMKL sycl::half XMX 79 ms and CPU 186. AUTO F16 large → NPU (same large-GEMM threshold as f32). Tiny F16 still GPU/CPU. FORCE_GPU still XMX."
+  "note": "FORCE_CPU is f32 cblas (compute dtype ignored). NPU Convert+f16 39 ms, iGPU oneMKL half XMX 81 ms. AUTO F16 follows gemm_large.json (CPU). FORCE_GPU/NPU keep XMX/NPU."
 }
