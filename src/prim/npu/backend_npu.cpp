@@ -20,9 +20,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +37,66 @@ namespace impl {
 static ov::Core& ov_core() {
   static ov::Core& core = *new ov::Core();
   return core;
+}
+
+struct CachedReq {
+  ov::CompiledModel compiled;
+  ov::InferRequest req;
+  std::mutex mu;
+};
+
+/* NPU plugin L0 tensors are allocated at create_infer_request. get_input_tensor /
+   get_output_tensor populate those buffers with no extra SHAVE copy. set_tensor on a
+   malloc/USM host pointer forces a copy (OpenVINO intel_npu README). Always memcpy:
+   k-means / ScaNN mutate centroids in place behind a stable pointer. */
+static void fill_in(CachedReq& slot, size_t idx, const void* src, size_t nbytes) {
+  ov::Tensor t = slot.req.get_input_tensor(idx);
+  if (t.get_byte_size() < nbytes) throw std::runtime_error("npu input smaller than payload");
+  void* dst = t.data();
+  if (dst != src && src != nullptr && nbytes > 0) std::memcpy(dst, src, nbytes);
+}
+
+static void read_out(CachedReq& slot, size_t idx, void* dst, size_t nbytes) {
+  ov::Tensor t = slot.req.get_output_tensor(idx);
+  if (t.get_byte_size() < nbytes) throw std::runtime_error("npu output smaller than payload");
+  const void* src = t.data();
+  if (src != dst && dst != nullptr && nbytes > 0) std::memcpy(dst, src, nbytes);
+}
+
+static ov::CompiledModel compile_on(const char* device, const std::shared_ptr<ov::Model>& model,
+                                    const std::string& cache_dir) {
+  ov::AnyMap props;
+  if (!cache_dir.empty()) props["CACHE_DIR"] = cache_dir;
+  if (std::strcmp(device, "NPU") == 0) {
+    props["PERFORMANCE_HINT"] = "LATENCY";
+    props["NPU_TURBO"] = true;
+    props["NPU_COMPILATION_MODE_PARAMS"] =
+        std::string("optimization-level=2 performance-hint-override=latency");
+  }
+  try {
+    return ov_core().compile_model(model, device, props);
+  } catch (...) {
+    props.erase("NPU_COMPILATION_MODE_PARAMS");
+    try {
+      return ov_core().compile_model(model, device, props);
+    } catch (...) {
+      props.erase("NPU_TURBO");
+      return ov_core().compile_model(model, device, props);
+    }
+  }
+}
+
+static CachedReq& cached_req(const std::string& key, const std::function<ov::CompiledModel()>& make) {
+  static auto& g = *new std::unordered_map<std::string, std::unique_ptr<CachedReq>>();
+  static std::mutex gmu;
+  std::lock_guard<std::mutex> lk(gmu);
+  auto& slot = g[key];
+  if (!slot) {
+    slot = std::make_unique<CachedReq>();
+    slot->compiled = make();
+    slot->req = slot->compiled.create_infer_request();
+  }
+  return *slot;
 }
 
 #endif
@@ -69,31 +133,24 @@ bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float
     using namespace ov;
     std::ostringstream key;
     key << device << "_gemm_m" << m << "_n" << n << "_k" << k << "_tb" << int(trans_b);
-    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
-    auto it = cache.find(key.str());
-    if (it == cache.end()) {
+    std::filesystem::create_directories(r.cache_dir);
+    CachedReq& slot = cached_req(key.str(), [&] {
       auto pA = std::make_shared<opset8::Parameter>(element::f32, Shape{static_cast<size_t>(m), static_cast<size_t>(k)});
       auto pB = std::make_shared<opset8::Parameter>(
           element::f32, trans_b ? Shape{static_cast<size_t>(n), static_cast<size_t>(k)}
                                 : Shape{static_cast<size_t>(k), static_cast<size_t>(n)});
       auto mm = std::make_shared<opset8::MatMul>(pA, pB, false, trans_b);
       auto model = std::make_shared<Model>(OutputVector{mm}, ParameterVector{pA, pB});
-      std::filesystem::create_directories(r.cache_dir);
-      cache[key.str()] = ov_core().compile_model(model, device);
-      it = cache.find(key.str());
-    }
-    auto req = it->second.create_infer_request();
-    const Shape sa{static_cast<size_t>(m), static_cast<size_t>(k)};
-    const Shape sb = trans_b ? Shape{static_cast<size_t>(n), static_cast<size_t>(k)}
-                             : Shape{static_cast<size_t>(k), static_cast<size_t>(n)};
-    const Shape scs{static_cast<size_t>(m), static_cast<size_t>(n)};
-    Tensor tA(element::f32, sa, const_cast<float*>(a));
-    Tensor tB(element::f32, sb, const_cast<float*>(b));
-    Tensor tC(element::f32, scs, c);
-    req.set_input_tensor(0, tA);
-    req.set_input_tensor(1, tB);
-    req.set_output_tensor(tC);
-    req.infer();
+      return compile_on(device, model, r.cache_dir);
+    });
+    std::lock_guard<std::mutex> lk(slot.mu);
+    const size_t na = static_cast<size_t>(m * k) * sizeof(float);
+    const size_t nb = static_cast<size_t>((trans_b ? n * k : k * n)) * sizeof(float);
+    const size_t nc = static_cast<size_t>(m * n) * sizeof(float);
+    fill_in(slot, 0, a, na);
+    fill_in(slot, 1, b, nb);
+    slot.req.infer();
+    read_out(slot, 0, c, nc);
     return true;
   } catch (...) {
     ++r.npu_compile_fails;
@@ -174,16 +231,13 @@ bool ov_matmul_compute(ResourcesData& r, const char* device, ovvsDType compute, 
     const Shape sa{static_cast<size_t>(m), static_cast<size_t>(k)};
     const Shape sb = trans_b ? Shape{static_cast<size_t>(n), static_cast<size_t>(k)}
                              : Shape{static_cast<size_t>(k), static_cast<size_t>(n)};
-    const Shape scs{static_cast<size_t>(m), static_cast<size_t>(n)};
     std::ostringstream key;
     key << device << "_gemm_" << compute_tag(compute) << "_m" << m << "_n" << n << "_k" << k << "_tb"
         << int(trans_b);
-    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
-    auto it = cache.find(key.str());
+    std::filesystem::create_directories(r.cache_dir);
     const bool i8 = compute == OVVS_DTYPE_I8;
-    if (it == cache.end()) {
+    CachedReq& slot = cached_req(key.str(), [&] {
       if (i8) {
-        /* NPU MatMul rejects raw si8; FakeQuantize marks u8/i8 so the compiler emits SRAM INT8 GEMM. */
         auto pA = std::make_shared<opset8::Parameter>(element::f32, sa);
         auto pB = std::make_shared<opset8::Parameter>(element::f32, sb);
         auto pRa = std::make_shared<opset8::Parameter>(element::f32, Shape{1});
@@ -194,46 +248,34 @@ bool ov_matmul_compute(ResourcesData& r, const char* device, ovvsDType compute, 
         auto fqB = std::make_shared<opset8::FakeQuantize>(pB, loB, pRb, loB, pRb, 256);
         auto mm = std::make_shared<opset8::MatMul>(fqA, fqB, false, trans_b);
         auto model = std::make_shared<Model>(OutputVector{mm}, ParameterVector{pA, pB, pRa, pRb});
-        cache[key.str()] = ov_core().compile_model(model, device);
-      } else {
-        auto pA = std::make_shared<opset8::Parameter>(element::f32, sa);
-        auto pB = std::make_shared<opset8::Parameter>(element::f32, sb);
-        const auto et = ov_compute_type(compute);
-        auto a_c = std::make_shared<opset8::Convert>(pA, et);
-        auto b_c = std::make_shared<opset8::Convert>(pB, et);
-        auto mm = std::make_shared<opset8::MatMul>(a_c, b_c, false, trans_b);
-        auto out = std::make_shared<opset8::Convert>(mm, element::f32);
-        auto model = std::make_shared<Model>(OutputVector{out}, ParameterVector{pA, pB});
-        cache[key.str()] = ov_core().compile_model(model, device);
+        return compile_on(device, model, r.cache_dir);
       }
-      it = cache.find(key.str());
-    }
-    auto req = it->second.create_infer_request();
+      auto pA = std::make_shared<opset8::Parameter>(element::f32, sa);
+      auto pB = std::make_shared<opset8::Parameter>(element::f32, sb);
+      const auto et = ov_compute_type(compute);
+      auto a_c = std::make_shared<opset8::Convert>(pA, et);
+      auto b_c = std::make_shared<opset8::Convert>(pB, et);
+      auto mm = std::make_shared<opset8::MatMul>(a_c, b_c, false, trans_b);
+      auto out = std::make_shared<opset8::Convert>(mm, element::f32);
+      auto model = std::make_shared<Model>(OutputVector{out}, ParameterVector{pA, pB});
+      return compile_on(device, model, r.cache_dir);
+    });
+    std::lock_guard<std::mutex> lk(slot.mu);
+    const size_t na = static_cast<size_t>(m * k) * sizeof(float);
+    const size_t nb = static_cast<size_t>((trans_b ? n * k : k * n)) * sizeof(float);
+    const size_t nc = static_cast<size_t>(m * n) * sizeof(float);
+    fill_in(slot, 0, a, na);
+    fill_in(slot, 1, b, nb);
     if (i8) {
-      const int64_t na = m * k;
-      const int64_t nb = trans_b ? n * k : k * n;
-      float ra = std::max(max_abs(a, na), 1e-8f);
-      float rb = std::max(max_abs(b, nb), 1e-8f);
-      Tensor tA(element::f32, sa, const_cast<float*>(a));
-      Tensor tB(element::f32, sb, const_cast<float*>(b));
-      Tensor tRa(element::f32, Shape{1}, &ra);
-      Tensor tRb(element::f32, Shape{1}, &rb);
-      Tensor tC(element::f32, scs, c);
-      req.set_input_tensor(0, tA);
-      req.set_input_tensor(1, tB);
-      req.set_input_tensor(2, tRa);
-      req.set_input_tensor(3, tRb);
-      req.set_output_tensor(tC);
-      req.infer();
-    } else {
-      Tensor tA(element::f32, sa, const_cast<float*>(a));
-      Tensor tB(element::f32, sb, const_cast<float*>(b));
-      Tensor tC(element::f32, scs, c);
-      req.set_input_tensor(0, tA);
-      req.set_input_tensor(1, tB);
-      req.set_output_tensor(tC);
-      req.infer();
+      const int64_t n_a = m * k;
+      const int64_t n_b = trans_b ? n * k : k * n;
+      float ra = std::max(max_abs(a, n_a), 1e-8f);
+      float rb = std::max(max_abs(b, n_b), 1e-8f);
+      fill_in(slot, 2, &ra, sizeof(ra));
+      fill_in(slot, 3, &rb, sizeof(rb));
     }
+    slot.req.infer();
+    read_out(slot, 0, c, nc);
     r.last_compute_dtype = compute;
     return true;
   } catch (...) {
@@ -269,11 +311,9 @@ bool npu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const
 
 bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b) {
-  const bool large = (m * n * k) >= (64LL * 64LL * 32LL);
-  /* NCE MACs are INT8-native (FP16 at half rate). Prefer quantized INT8 on large GEMM. */
-  if (large && npu_gemm_compute(r, OVVS_DTYPE_I8, a, b, c, m, n, k, trans_b)) return true;
-  if (npu_gemm_compute(r, OVVS_DTYPE_F32, a, b, c, m, n, k, trans_b)) return true;
-  return false;
+  /* Default API is fp32. INT8/FP16 only via npu_gemm_compute / ovvsGemmEx — do not silently
+     swap in FakeQuantize on the hot f32 path (it lost to f32 DPU+DMA on this SKU). */
+  return npu_gemm_compute(r, OVVS_DTYPE_F32, a, b, c, m, n, k, trans_b);
 }
 
 #if defined(OVVS_WITH_OPENVINO)
@@ -328,9 +368,8 @@ bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t 
     using namespace ov;
     std::ostringstream key;
     key << device << "_topk_r" << rows << "_c" << cols << "_k" << k << "_lg" << int(largest);
-    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
-    auto it = cache.find(key.str());
-    if (it == cache.end()) {
+    std::filesystem::create_directories(r.cache_dir);
+    CachedReq& slot = cached_req(key.str(), [&] {
       auto pScores = std::make_shared<opset8::Parameter>(
           element::f32, Shape{static_cast<size_t>(rows), static_cast<size_t>(cols)});
       auto kconst = opset8::Constant::create(element::i32, Shape{}, {static_cast<int32_t>(k)});
@@ -338,24 +377,18 @@ bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t 
                                                      largest ? "max" : "min", "value", element::i32);
       auto model = std::make_shared<Model>(OutputVector{topk->output(0), topk->output(1)},
                                            ParameterVector{pScores});
-      cache[key.str()] = ov_core().compile_model(model, device);
-      it = cache.find(key.str());
-    }
-    auto req = it->second.create_infer_request();
-    Tensor tS(element::f32, Shape{static_cast<size_t>(rows), static_cast<size_t>(cols)},
-              const_cast<float*>(scores));
-    req.set_input_tensor(tS);
-    req.infer();
-    Tensor tV = req.get_output_tensor(0);
-    Tensor tI = req.get_output_tensor(1);
-    const float* pv = tV.data<float>();
-    std::memcpy(values, pv, static_cast<size_t>(rows * k) * sizeof(float));
+      return compile_on(device, model, r.cache_dir);
+    });
+    std::lock_guard<std::mutex> lk(slot.mu);
+    fill_in(slot, 0, scores, static_cast<size_t>(rows * cols) * sizeof(float));
+    slot.req.infer();
+    read_out(slot, 0, values, static_cast<size_t>(rows * k) * sizeof(float));
+    Tensor tI = slot.req.get_output_tensor(1);
     if (tI.get_element_type() == element::i32) {
       const int32_t* pi = tI.data<int32_t>();
       for (int64_t i = 0; i < rows * k; ++i) indices[i] = pi[i];
     } else if (tI.get_element_type() == element::i64) {
-      const int64_t* pi = tI.data<int64_t>();
-      std::memcpy(indices, pi, static_cast<size_t>(rows * k) * sizeof(int64_t));
+      std::memcpy(indices, tI.data<int64_t>(), static_cast<size_t>(rows * k) * sizeof(int64_t));
     } else {
       return false;
     }
@@ -386,31 +419,24 @@ bool ov_gather_rows(ResourcesData& r, const char* device, const float* src, int6
     using namespace ov;
     std::ostringstream key;
     key << device << "_gather_sr" << src_rows << "_d" << dim << "_n" << nidx;
-    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
-    auto it = cache.find(key.str());
-    if (it == cache.end()) {
+    std::filesystem::create_directories(r.cache_dir);
+    CachedReq& slot = cached_req(key.str(), [&] {
       auto pSrc = std::make_shared<opset8::Parameter>(
           element::f32, Shape{static_cast<size_t>(src_rows), static_cast<size_t>(dim)});
       auto pIdx = std::make_shared<opset8::Parameter>(element::i32, Shape{static_cast<size_t>(nidx)});
       auto axis = opset8::Constant::create(element::i64, Shape{}, {0});
       auto g = std::make_shared<ov::op::v8::Gather>(pSrc, pIdx, axis);
       auto model = std::make_shared<Model>(OutputVector{g}, ParameterVector{pSrc, pIdx});
-      cache[key.str()] = ov_core().compile_model(model, device);
-      it = cache.find(key.str());
-    }
-    std::vector<int32_t> i32(static_cast<size_t>(nidx));
+      return compile_on(device, model, r.cache_dir);
+    });
+    std::lock_guard<std::mutex> lk(slot.mu);
+    fill_in(slot, 0, src, static_cast<size_t>(src_rows * dim) * sizeof(float));
+    Tensor tI = slot.req.get_input_tensor(1);
+    if (tI.get_byte_size() < static_cast<size_t>(nidx) * sizeof(int32_t)) return false;
+    int32_t* i32 = tI.data<int32_t>();
     for (int64_t i = 0; i < nidx; ++i) i32[static_cast<size_t>(i)] = static_cast<int32_t>(idx[i]);
-    auto req = it->second.create_infer_request();
-    Tensor tS(element::f32, Shape{static_cast<size_t>(src_rows), static_cast<size_t>(dim)},
-              const_cast<float*>(src));
-    Tensor tI(element::i32, Shape{static_cast<size_t>(nidx)}, i32.data());
-    req.set_input_tensor(0, tS);
-    req.set_input_tensor(1, tI);
-    req.infer();
-    Tensor tO = req.get_output_tensor();
-    const size_t nbytes = static_cast<size_t>(nidx * dim) * sizeof(float);
-    if (tO.get_byte_size() < nbytes) return false;
-    std::memcpy(out, tO.data<float>(), nbytes);
+    slot.req.infer();
+    read_out(slot, 0, out, static_cast<size_t>(nidx * dim) * sizeof(float));
     return true;
   } catch (...) {
     ++r.npu_compile_fails;
@@ -463,21 +489,12 @@ bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
   try {
     using namespace ov;
     const int64_t lut_n = static_cast<int64_t>(pq_m) * ks;
-    std::vector<float> lut(tables, tables + lut_n);
+    std::filesystem::create_directories(r.cache_dir);
     for (int64_t off = 0; off < ncodes; off += kTile) {
       const int64_t nn = std::min(kTile, ncodes - off);
-      std::vector<int32_t> idx(static_cast<size_t>(nn * pq_m));
-      for (int64_t i = 0; i < nn; ++i) {
-        const uint8_t* code = codes + (off + i) * pq_m;
-        for (int32_t m = 0; m < pq_m; ++m) {
-          idx[static_cast<size_t>(i * pq_m + m)] = m * ks + static_cast<int32_t>(code[m]);
-        }
-      }
       std::ostringstream key;
       key << "NPU_adc_m" << pq_m << "_ks" << ks << "_n" << nn;
-      static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
-      auto it = cache.find(key.str());
-      if (it == cache.end()) {
+      CachedReq& slot = cached_req(key.str(), [&] {
         auto pLut = std::make_shared<opset8::Parameter>(element::f32, Shape{static_cast<size_t>(lut_n)});
         auto pIdx = std::make_shared<opset8::Parameter>(element::i32, Shape{static_cast<size_t>(nn),
                                                                             static_cast<size_t>(pq_m)});
@@ -486,17 +503,20 @@ bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
         auto red_axes = opset8::Constant::create(element::i64, Shape{1}, {1});
         auto red = std::make_shared<ov::op::v1::ReduceSum>(g, red_axes, false);
         auto model = std::make_shared<Model>(OutputVector{red}, ParameterVector{pLut, pIdx});
-        cache[key.str()] = ov_core().compile_model(model, "NPU");
-        it = cache.find(key.str());
+        return compile_on("NPU", model, r.cache_dir);
+      });
+      std::lock_guard<std::mutex> lk(slot.mu);
+      fill_in(slot, 0, tables, static_cast<size_t>(lut_n) * sizeof(float));
+      Tensor tI = slot.req.get_input_tensor(1);
+      int32_t* idxp = tI.data<int32_t>();
+      for (int64_t i = 0; i < nn; ++i) {
+        const uint8_t* code = codes + (off + i) * pq_m;
+        for (int32_t m = 0; m < pq_m; ++m) {
+          idxp[static_cast<size_t>(i * pq_m + m)] = m * ks + static_cast<int32_t>(code[m]);
+        }
       }
-      auto req = it->second.create_infer_request();
-      Tensor tL(element::f32, Shape{static_cast<size_t>(lut_n)}, lut.data());
-      Tensor tI(element::i32, Shape{static_cast<size_t>(nn), static_cast<size_t>(pq_m)}, idx.data());
-      req.set_input_tensor(0, tL);
-      req.set_input_tensor(1, tI);
-      req.infer();
-      Tensor tO = req.get_output_tensor();
-      std::memcpy(out + off, tO.data<float>(), static_cast<size_t>(nn) * sizeof(float));
+      slot.req.infer();
+      read_out(slot, 0, out + off, static_cast<size_t>(nn) * sizeof(float));
     }
     return true;
   } catch (...) {
@@ -525,9 +545,8 @@ bool ov_pairwise_npu(ResourcesData& r, ovvsMetric metric, const float* x, int64_
     const float p = metric_arg > 0.f ? metric_arg : 2.f;
     std::ostringstream key;
     key << "NPU_pair_m" << static_cast<int>(metric) << "_nx" << nx << "_ny" << ny << "_d" << dim << "_p" << p;
-    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
-    auto it = cache.find(key.str());
-    if (it == cache.end()) {
+    std::filesystem::create_directories(r.cache_dir);
+    CachedReq& slot = cached_req(key.str(), [&] {
       auto pX = std::make_shared<opset8::Parameter>(element::f32,
                                                     Shape{static_cast<size_t>(nx), static_cast<size_t>(dim)});
       auto pY = std::make_shared<opset8::Parameter>(element::f32,
@@ -555,19 +574,13 @@ bool ov_pairwise_npu(ResourcesData& r, ovvsMetric metric, const float* x, int64_
         scores = std::make_shared<ov::op::v1::Power>(sm, invp);
       }
       auto model = std::make_shared<Model>(OutputVector{scores}, ParameterVector{pX, pY});
-      cache[key.str()] = ov_core().compile_model(model, "NPU");
-      it = cache.find(key.str());
-    }
-    auto req = it->second.create_infer_request();
-    Tensor tX(element::f32, Shape{static_cast<size_t>(nx), static_cast<size_t>(dim)}, const_cast<float*>(x));
-    Tensor tY(element::f32, Shape{static_cast<size_t>(ny), static_cast<size_t>(dim)}, const_cast<float*>(y));
-    req.set_input_tensor(0, tX);
-    req.set_input_tensor(1, tY);
-    req.infer();
-    Tensor tO = req.get_output_tensor();
-    const size_t nbytes = static_cast<size_t>(nx * ny) * sizeof(float);
-    if (tO.get_byte_size() < nbytes) return false;
-    std::memcpy(out, tO.data<float>(), nbytes);
+      return compile_on("NPU", model, r.cache_dir);
+    });
+    std::lock_guard<std::mutex> lk(slot.mu);
+    fill_in(slot, 0, x, static_cast<size_t>(nx * dim) * sizeof(float));
+    fill_in(slot, 1, y, static_cast<size_t>(ny * dim) * sizeof(float));
+    slot.req.infer();
+    read_out(slot, 0, out, static_cast<size_t>(nx * ny) * sizeof(float));
     return true;
   } catch (...) {
     ++r.npu_compile_fails;

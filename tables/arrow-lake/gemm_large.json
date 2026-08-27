@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 190.7622, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 116.5510, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 149.5386, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 191.9961, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 54.2290, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 151.4030, "status": "success"}
   ],
-  "note": "icx SYCL USM + oneMKL GPU GEMM vs OpenVINO NPU. NPU fastest on 1e5x32x768; AUTO large-GEMM winner is NPU."
+  "note": "After InferRequest reuse + get_input_tensor L0 feed (no set_tensor host copy). NPU 54 ms vs previous 117 ms; DPU still 5.3 ms. AUTO large-GEMM winner is NPU."
 }

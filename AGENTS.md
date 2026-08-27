@@ -31,9 +31,26 @@ bindings → C ABI (libovvs) → C++ algorithms → mixer/planner
 - Algorithms call `ovvs::prim`, never OpenVINO or SYCL directly.
 - Default tensor home: USM shared (CPU + iGPU). NPU sees tiles/bound host buffers, not a second index copy as source of truth.
 - Graph ANN (CAGRA/Vamana/NN-Descent walk) lives on **iGPU**. NPU may score a padded candidate slab if bakeoff says so.
-- Dense/static GEMM, coarse IVF, PQ ADC tables, k-means assignment, binary/RaBitQ GEMM: **NPU first**.
+- Dense/static GEMM, coarse IVF, PQ ADC tables, k-means assignment, binary/RaBitQ GEMM: **NPU first** *only when the op matches the NPU contract below*.
 
 Details, knobs, and CAGRA mapping: the plan §4–§6.
+
+---
+
+## NPU contract (do not forget)
+
+The DPU is **not** broken. Arrow Lake 265K `PERF_COUNT`: MatMul is **21 µs** on DPU for 64³ and **5.3 ms** for `1e5×32×768`. Wall times of 0.5–170 ms are SHAVE copies + Level Zero + **new InferRequest per call**. Table: `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`.
+
+Intel added an **inference engine** (compiled graph, weight-stationary, ~4 MB scratchpad), not cuBLAS.
+
+1. **Compile once, reuse `InferRequest`.** Never `create_infer_request` on the hot path.
+2. **Feed L0 tensors via `get_input_tensor` / `get_output_tensor`.** The plugin allocates Level Zero buffers at request creation. `memcpy` into those. `set_tensor` on a malloc/USM host pointer **forces a SHAVE copy** (intel_npu README). That copy is the 35 ms “SHAVE A” in `PERF_COUNT`, not a broken DPU.
+3. **Reuse the request’s L0 buffers; memcpy every infer.** Pointer-identity “sticky B” is unsafe: k-means and ScaNN mutate centroids in place. An explicit pin-weights API is the future search-path win. Scratchpad is **4 MB** (`1e5×768` f16 ≈ 150 MB does not fit).
+4. **INT8 is NNCF Low Precision IR** (FakeQuantize on activations **and Constant weights**). Raw `si8` MatMul is illegal. Two live fp32 Parameters will not light INT8 MACs. TOPS on this SKU are INT8; FP16 is half-rate. Compile with `NPU_TURBO` + `optimization-level=2 performance-hint-override=latency`.
+5. **Device split on this SKU.** AUTO large f32/f16 GEMM → NPU (`gemm_large.json` 54 ms, `gemm_f16.json` 50 ms). AUTO I8 GEMM → iGPU XMX (`gemm_i8.json`). Tiny GEMM → CPU. Graph walk stays iGPU. NPU still owns compiled quantized stages (coarse IVF, ADC) when they lift.
+6. **Do not bake B as an IR Constant just to be clever.** That made DPU 10× faster and wall 10× *slower* (UMD/constant reload). Sticky Parameter + reused request + L0 `get_tensor` is the path.
+
+If a change “uses the NPU” but creates a request per call, `set_tensor`s host pointers, or DMA’s the dataset every query, it is a defect.
 
 ---
 

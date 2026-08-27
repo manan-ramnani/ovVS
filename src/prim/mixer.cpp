@@ -77,10 +77,16 @@ ovvsStatus prim_gemm_compute(ResourcesData& r, const float* a, const float* b, f
     r.last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
   }
-  /* AUTO: iGPU XMX is the FP16 *and* INT8 winner on Arrow Lake (oneMKL).
-     NPU INT8 TOPS are real, but OpenVINO FQ MatMul is slower than XMX here; FORCE_NPU still hits NPU. */
-  if (compute == OVVS_DTYPE_F16 || compute == OVVS_DTYPE_I8) {
+  /* AUTO I8: Xe-LPG XMX (oneMKL) beats NPU FakeQuantize MatMul on Arrow Lake.
+     AUTO F16 large: NPU Convert+f16 with L0 get_tensor beat XMX (`gemm_f16.json`).
+     FORCE_NPU still hits NPU for both. */
+  if (compute == OVVS_DTYPE_I8) {
     if (r.gpu_available && try_gpu()) return OVVS_STATUS_SUCCESS;
+    if (r.npu_available && !r.npu_busy && try_npu()) return OVVS_STATUS_SUCCESS;
+  } else if (compute == OVVS_DTYPE_F16) {
+    const ovvsDevice d = choose_device(r, "gemm", m * n * k);
+    if (d == OVVS_DEVICE_NPU && try_npu()) return OVVS_STATUS_SUCCESS;
+    if ((d == OVVS_DEVICE_GPU || d == OVVS_DEVICE_NPU) && try_gpu()) return OVVS_STATUS_SUCCESS;
     if (r.npu_available && !r.npu_busy && try_npu()) return OVVS_STATUS_SUCCESS;
   } else {
     const ovvsDevice d = choose_device(r, "gemm", m * n * k);
