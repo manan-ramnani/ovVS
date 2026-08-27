@@ -5,16 +5,16 @@ fn l2sq(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() {
-    let dll = std::env::var("IOVS_LIBRARY").unwrap_or_else(|_| {
+    let dll = std::env::var("OVVS_LIBRARY").unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("build")
             .join("bin")
-            .join("iovs.dll")
+            .join("ovvs.dll")
             .to_string_lossy()
             .into_owned()
     });
-    let lib = iovs::Lib::load(std::path::Path::new(&dll)).expect("load");
+    let lib = ovvs::Lib::load(std::path::Path::new(&dll)).expect("load");
     let n: i64 = 12;
     let dim: i64 = 4;
     let k: i64 = 3;

@@ -1,4 +1,4 @@
-"""ioVS Python bindings — ctypes over the stable C ABI. numpy arrays preferred."""
+"""ovVS Python bindings — ctypes over the stable C ABI. numpy arrays preferred."""
 
 from __future__ import annotations
 
@@ -12,13 +12,13 @@ from pathlib import Path
 def _load():
     here = Path(__file__).resolve().parent
     if sys.platform.startswith("win"):
-        fnames = ["iovs.dll"]
+        fnames = ["ovvs.dll"]
     elif sys.platform == "darwin":
-        fnames = ["libiovs.dylib"]
+        fnames = ["libovvs.dylib"]
     else:
-        fnames = ["libiovs.so"]
+        fnames = ["libovvs.so"]
     candidates = []
-    env = os.environ.get("IOVS_LIBRARY")
+    env = os.environ.get("OVVS_LIBRARY")
     if env:
         candidates.append(Path(env))
     roots = [
@@ -39,14 +39,14 @@ def _load():
             if sys.platform.startswith("win"):
                 os.add_dll_directory(str(p.parent))
             return ctypes.CDLL(str(p))
-    raise FileNotFoundError("libiovs not found; set IOVS_LIBRARY or build the C++ library")
+    raise FileNotFoundError("libovvs not found; set OVVS_LIBRARY or build the C++ library")
 
 
 _lib = _load()
-_lib.iovsGetVersion.restype = c_char_p
-_lib.iovsResourcesCreate.argtypes = [POINTER(c_void_p)]
-_lib.iovsResourcesDestroy.argtypes = [c_void_p]
-_lib.iovsBruteForceBuild.argtypes = [
+_lib.ovvsGetVersion.restype = c_char_p
+_lib.ovvsResourcesCreate.argtypes = [POINTER(c_void_p)]
+_lib.ovvsResourcesDestroy.argtypes = [c_void_p]
+_lib.ovvsBruteForceBuild.argtypes = [
     c_void_p,
     POINTER(c_float),
     c_int64,
@@ -54,7 +54,7 @@ _lib.iovsBruteForceBuild.argtypes = [
     c_int32,
     POINTER(c_void_p),
 ]
-_lib.iovsBruteForceSearch.argtypes = [
+_lib.ovvsBruteForceSearch.argtypes = [
     c_void_p,
     c_void_p,
     POINTER(c_float),
@@ -64,8 +64,8 @@ _lib.iovsBruteForceSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
-_lib.iovsBruteForceDestroy.argtypes = [c_void_p]
-_lib.iovsCagraBuild.argtypes = [
+_lib.ovvsBruteForceDestroy.argtypes = [c_void_p]
+_lib.ovvsCagraBuild.argtypes = [
     c_void_p,
     POINTER(c_float),
     c_int64,
@@ -75,7 +75,7 @@ _lib.iovsCagraBuild.argtypes = [
     c_int32,
     POINTER(c_void_p),
 ]
-_lib.iovsCagraSearch.argtypes = [
+_lib.ovvsCagraSearch.argtypes = [
     c_void_p,
     c_void_p,
     POINTER(c_float),
@@ -87,89 +87,8 @@ _lib.iovsCagraSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
-_lib.iovsCagraDestroy.argtypes = [c_void_p]
-_lib.iovsIvfFlatBuild.argtypes = [
-    c_void_p,
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    c_int32,
-    c_int32,
-    POINTER(c_void_p),
-]
-_lib.iovsIvfFlatSearch.argtypes = [
-    c_void_p,
-    c_void_p,
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    c_int32,
-    c_void_p,
-    POINTER(c_int64),
-    POINTER(c_float),
-]
-_lib.iovsIvfFlatDestroy.argtypes = [c_void_p]
-_lib.iovsIvfPqBuild.argtypes = [
-    c_void_p,
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    c_int32,
-    c_int32,
-    c_int32,
-    c_int32,
-    POINTER(c_void_p),
-]
-_lib.iovsIvfPqSearch.argtypes = [
-    c_void_p,
-    c_void_p,
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    c_int32,
-    c_int32,
-    c_void_p,
-    POINTER(c_int64),
-    POINTER(c_float),
-]
-_lib.iovsIvfPqDestroy.argtypes = [c_void_p]
-_lib.iovsGemm.argtypes = [
-    c_void_p,
-    POINTER(c_float),
-    POINTER(c_float),
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    c_int64,
-    c_int32,
-]
-_lib.iovsTopk.argtypes = [
-    c_void_p,
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    c_int64,
-    POINTER(c_int64),
-    POINTER(c_float),
-    c_int32,
-]
-_lib.iovsGatherRows.argtypes = [
-    c_void_p,
-    POINTER(c_float),
-    c_int64,
-    c_int64,
-    POINTER(c_int64),
-    c_int64,
-    POINTER(c_float),
-]
-_lib.iovsResourcesSetPolicy.argtypes = [c_void_p, c_int32]
-_lib.iovsResourcesLastDevice.argtypes = [c_void_p, POINTER(c_int32)]
-_lib.iovsResourcesEnergyUj.argtypes = [c_void_p, POINTER(c_int64)]
-_lib.iovsBitsetFromAllowList.argtypes = [c_int64, POINTER(c_int64), c_int64, POINTER(c_uint8)]
-_lib.iovsIvfPqSerialize.argtypes = [c_void_p, c_char_p]
-_lib.iovsIvfPqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
-_lib.iovsIvfPqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
-_lib.iovsIvfRabitqBuild.argtypes = [
+_lib.ovvsCagraDestroy.argtypes = [c_void_p]
+_lib.ovvsIvfFlatBuild.argtypes = [
     c_void_p,
     POINTER(c_float),
     c_int64,
@@ -178,7 +97,30 @@ _lib.iovsIvfRabitqBuild.argtypes = [
     c_int32,
     POINTER(c_void_p),
 ]
-_lib.iovsIvfRabitqSearch.argtypes = [
+_lib.ovvsIvfFlatSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_void_p,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.ovvsIvfFlatDestroy.argtypes = [c_void_p]
+_lib.ovvsIvfPqBuild.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_int32,
+    c_int32,
+    POINTER(c_void_p),
+]
+_lib.ovvsIvfPqSearch.argtypes = [
     c_void_p,
     c_void_p,
     POINTER(c_float),
@@ -190,13 +132,83 @@ _lib.iovsIvfRabitqSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
-_lib.iovsIvfRabitqDestroy.argtypes = [c_void_p]
-_lib.iovsIvfRabitqSerialize.argtypes = [c_void_p, c_char_p]
-_lib.iovsIvfRabitqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
-_lib.iovsIvfRabitqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
-_lib.iovsSyclEnabled.restype = c_int32
-_lib.iovsSyclEnabled.argtypes = []
-_lib.iovsVamanaBuild.argtypes = [
+_lib.ovvsIvfPqDestroy.argtypes = [c_void_p]
+_lib.ovvsGemm.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    POINTER(c_float),
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int64,
+    c_int32,
+]
+_lib.ovvsTopk.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int64,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_int32,
+]
+_lib.ovvsGatherRows.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    POINTER(c_int64),
+    c_int64,
+    POINTER(c_float),
+]
+_lib.ovvsResourcesSetPolicy.argtypes = [c_void_p, c_int32]
+_lib.ovvsResourcesLastDevice.argtypes = [c_void_p, POINTER(c_int32)]
+_lib.ovvsResourcesLastComputeDtype.argtypes = [c_void_p, POINTER(c_int32)]
+_lib.ovvsResourcesEnergyUj.argtypes = [c_void_p, POINTER(c_int64)]
+_lib.ovvsGemmEx.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    POINTER(c_float),
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+]
+_lib.ovvsBitsetFromAllowList.argtypes = [c_int64, POINTER(c_int64), c_int64, POINTER(c_uint8)]
+_lib.ovvsIvfPqSerialize.argtypes = [c_void_p, c_char_p]
+_lib.ovvsIvfPqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
+_lib.ovvsIvfPqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
+_lib.ovvsIvfRabitqBuild.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    POINTER(c_void_p),
+]
+_lib.ovvsIvfRabitqSearch.argtypes = [
+    c_void_p,
+    c_void_p,
+    POINTER(c_float),
+    c_int64,
+    c_int64,
+    c_int32,
+    c_int32,
+    c_void_p,
+    POINTER(c_int64),
+    POINTER(c_float),
+]
+_lib.ovvsIvfRabitqDestroy.argtypes = [c_void_p]
+_lib.ovvsIvfRabitqSerialize.argtypes = [c_void_p, c_char_p]
+_lib.ovvsIvfRabitqDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
+_lib.ovvsIvfRabitqExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
+_lib.ovvsSyclEnabled.restype = c_int32
+_lib.ovvsSyclEnabled.argtypes = []
+_lib.ovvsVamanaBuild.argtypes = [
     c_void_p,
     POINTER(c_float),
     c_int64,
@@ -206,7 +218,7 @@ _lib.iovsVamanaBuild.argtypes = [
     c_float,
     POINTER(c_void_p),
 ]
-_lib.iovsVamanaSearch.argtypes = [
+_lib.ovvsVamanaSearch.argtypes = [
     c_void_p,
     c_void_p,
     POINTER(c_float),
@@ -217,8 +229,8 @@ _lib.iovsVamanaSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
-_lib.iovsVamanaDestroy.argtypes = [c_void_p]
-_lib.iovsScannBuild.argtypes = [
+_lib.ovvsVamanaDestroy.argtypes = [c_void_p]
+_lib.ovvsScannBuild.argtypes = [
     c_void_p,
     POINTER(c_float),
     c_int64,
@@ -228,7 +240,7 @@ _lib.iovsScannBuild.argtypes = [
     c_int32,
     POINTER(c_void_p),
 ]
-_lib.iovsScannSearch.argtypes = [
+_lib.ovvsScannSearch.argtypes = [
     c_void_p,
     c_void_p,
     POINTER(c_float),
@@ -239,9 +251,9 @@ _lib.iovsScannSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
-_lib.iovsScannDestroy.argtypes = [c_void_p]
-_lib.iovsHnswFromCagra.argtypes = [c_void_p, c_void_p, POINTER(c_void_p)]
-_lib.iovsHnswSearch.argtypes = [
+_lib.ovvsScannDestroy.argtypes = [c_void_p]
+_lib.ovvsHnswFromCagra.argtypes = [c_void_p, c_void_p, POINTER(c_void_p)]
+_lib.ovvsHnswSearch.argtypes = [
     c_void_p,
     c_void_p,
     POINTER(c_float),
@@ -251,13 +263,13 @@ _lib.iovsHnswSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
-_lib.iovsHnswDestroy.argtypes = [c_void_p]
-_lib.iovsKMeansFit.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, c_int32, c_int32, POINTER(c_void_p)]
-_lib.iovsKMeansPredict.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64, POINTER(c_int64), POINTER(c_float)]
-_lib.iovsKMeansDestroy.argtypes = [c_void_p]
-_lib.iovsBatcherCreate.argtypes = [c_void_p, c_void_p, c_int32, c_int32, POINTER(c_void_p)]
-_lib.iovsBatcherSearch.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, POINTER(c_int64), POINTER(c_float)]
-_lib.iovsBatcherDestroy.argtypes = [c_void_p]
+_lib.ovvsHnswDestroy.argtypes = [c_void_p]
+_lib.ovvsKMeansFit.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, c_int32, c_int32, POINTER(c_void_p)]
+_lib.ovvsKMeansPredict.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64, POINTER(c_int64), POINTER(c_float)]
+_lib.ovvsKMeansDestroy.argtypes = [c_void_p]
+_lib.ovvsBatcherCreate.argtypes = [c_void_p, c_void_p, c_int32, c_int32, POINTER(c_void_p)]
+_lib.ovvsBatcherSearch.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, POINTER(c_int64), POINTER(c_float)]
+_lib.ovvsBatcherDestroy.argtypes = [c_void_p]
 
 METRIC_L2 = 0
 METRIC_L2_SQRT = 1
@@ -281,46 +293,58 @@ def _as_f32(arr):
 
 
 def version() -> str:
-    return _lib.iovsGetVersion().decode()
+    return _lib.ovvsGetVersion().decode()
 
 
 def sycl_enabled() -> bool:
-    return bool(_lib.iovsSyclEnabled())
+    return bool(_lib.ovvsSyclEnabled())
 
 
 class Resources:
     def __init__(self):
         self._h = c_void_p()
-        if _lib.iovsResourcesCreate(ctypes.byref(self._h)) != 0:
-            raise RuntimeError("iovsResourcesCreate failed")
+        if _lib.ovvsResourcesCreate(ctypes.byref(self._h)) != 0:
+            raise RuntimeError("ovvsResourcesCreate failed")
 
     def close(self):
         if self._h:
-            _lib.iovsResourcesDestroy(self._h)
+            _lib.ovvsResourcesDestroy(self._h)
             self._h = None
 
     def set_policy(self, policy: int) -> None:
-        if _lib.iovsResourcesSetPolicy(self._h, c_int32(policy)) != 0:
+        if _lib.ovvsResourcesSetPolicy(self._h, c_int32(policy)) != 0:
             raise RuntimeError("set_policy failed")
 
     def last_device(self) -> int:
         d = c_int32()
-        if _lib.iovsResourcesLastDevice(self._h, ctypes.byref(d)) != 0:
+        if _lib.ovvsResourcesLastDevice(self._h, ctypes.byref(d)) != 0:
             raise RuntimeError("last_device failed")
+        return int(d.value)
+
+    def last_compute_dtype(self) -> int:
+        d = c_int32()
+        if _lib.ovvsResourcesLastComputeDtype(self._h, ctypes.byref(d)) != 0:
+            raise RuntimeError("last_compute_dtype failed")
         return int(d.value)
 
     def energy_uj(self):
         uj = c_int64()
-        rc = _lib.iovsResourcesEnergyUj(self._h, ctypes.byref(uj))
+        rc = _lib.ovvsResourcesEnergyUj(self._h, ctypes.byref(uj))
         if rc != 0:
             return None
         return int(uj.value)
 
-    def gemm(self, a, b, m, n, k, trans_b=1):
+    def gemm(self, a, b, m, n, k, trans_b=1, compute_dtype=0):
         cbuf = (c_float * (m * n))()
         _, ap = _as_f32(a)
         _, bp = _as_f32(b)
-        rc = _lib.iovsGemm(self._h, ap, bp, cbuf, c_int64(m), c_int64(n), c_int64(k), c_int32(trans_b))
+        if compute_dtype:
+            rc = _lib.ovvsGemmEx(
+                self._h, ap, bp, cbuf, c_int64(m), c_int64(n), c_int64(k), c_int32(trans_b),
+                c_int32(compute_dtype),
+            )
+        else:
+            rc = _lib.ovvsGemm(self._h, ap, bp, cbuf, c_int64(m), c_int64(n), c_int64(k), c_int32(trans_b))
         if rc != 0:
             raise RuntimeError(f"gemm failed rc={rc}")
         return [cbuf[i] for i in range(m * n)]
@@ -329,7 +353,7 @@ class Resources:
         idx = (c_int64 * (rows * k))()
         val = (c_float * (rows * k))()
         _, sp = _as_f32(scores)
-        rc = _lib.iovsTopk(self._h, sp, c_int64(rows), c_int64(cols), c_int64(k), idx, val, c_int32(largest))
+        rc = _lib.ovvsTopk(self._h, sp, c_int64(rows), c_int64(cols), c_int64(k), idx, val, c_int32(largest))
         if rc != 0:
             raise RuntimeError(f"topk failed rc={rc}")
         return [idx[i] for i in range(rows * k)], [val[i] for i in range(rows * k)]
@@ -339,7 +363,7 @@ class Resources:
         out = (c_float * (nidx * dim))()
         _, sp = _as_f32(src)
         ip = (c_int64 * nidx)(*list(indices))
-        rc = _lib.iovsGatherRows(self._h, sp, c_int64(src_rows), c_int64(dim), ip, c_int64(nidx), out)
+        rc = _lib.ovvsGatherRows(self._h, sp, c_int64(src_rows), c_int64(dim), ip, c_int64(nidx), out)
         if rc != 0:
             raise RuntimeError(f"gather failed rc={rc}")
         return [out[i] for i in range(nidx * dim)]
@@ -355,11 +379,11 @@ def bitset_from_allow_list(n, ids):
     nbytes = (n + 7) // 8
     buf = (c_uint8 * max(nbytes, 1))()
     ip = (c_int64 * max(nids, 1))(*([int(x) for x in seq] if nids else []))
-    rc = _lib.iovsBitsetFromAllowList(
+    rc = _lib.ovvsBitsetFromAllowList(
         c_int64(n), ip if nids else None, c_int64(nids), buf
     )
     if rc != 0:
-        raise RuntimeError("iovsBitsetFromAllowList failed")
+        raise RuntimeError("ovvsBitsetFromAllowList failed")
     return buf
 
 
@@ -410,7 +434,7 @@ class BruteIndex(_Index):
         bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsBruteForceSearch(
+        rc = _lib.ovvsBruteForceSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), bsp, nb, ds
         )
         if rc != 0:
@@ -424,7 +448,7 @@ class CagraIndex(_Index):
         bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsCagraSearch(
+        rc = _lib.ovvsCagraSearch(
             self._res._h,
             self._h,
             qptr,
@@ -447,7 +471,7 @@ class IvfFlatIndex(_Index):
         bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsIvfFlatSearch(
+        rc = _lib.ovvsIvfFlatSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(nprobe), bsp, nb, ds
         )
         if rc != 0:
@@ -461,7 +485,7 @@ class IvfPqIndex(_Index):
         bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsIvfPqSearch(
+        rc = _lib.ovvsIvfPqSearch(
             self._res._h,
             self._h,
             qptr,
@@ -478,13 +502,13 @@ class IvfPqIndex(_Index):
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
     def serialize(self, path):
-        rc = _lib.iovsIvfPqSerialize(self._h, str(path).encode())
+        rc = _lib.ovvsIvfPqSerialize(self._h, str(path).encode())
         if rc != 0:
             raise RuntimeError("ivf-pq serialize failed")
 
     def extend(self, extra):
         keep, ptr, n, _d = _dataset_ptr(extra, self.dim)
-        rc = _lib.iovsIvfPqExtend(self._res._h, self._h, ptr, c_int64(n))
+        rc = _lib.ovvsIvfPqExtend(self._res._h, self._h, ptr, c_int64(n))
         if rc != 0:
             raise RuntimeError("ivf-pq extend failed")
         self.n += n
@@ -497,7 +521,7 @@ class IvfRabitqIndex(_Index):
         bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsIvfRabitqSearch(
+        rc = _lib.ovvsIvfRabitqSearch(
             self._res._h,
             self._h,
             qptr,
@@ -514,13 +538,13 @@ class IvfRabitqIndex(_Index):
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
     def serialize(self, path):
-        rc = _lib.iovsIvfRabitqSerialize(self._h, str(path).encode())
+        rc = _lib.ovvsIvfRabitqSerialize(self._h, str(path).encode())
         if rc != 0:
             raise RuntimeError("ivf-rabitq serialize failed")
 
     def extend(self, extra):
         keep, ptr, n, _d = _dataset_ptr(extra, self.dim)
-        rc = _lib.iovsIvfRabitqExtend(self._res._h, self._h, ptr, c_int64(n))
+        rc = _lib.ovvsIvfRabitqExtend(self._res._h, self._h, ptr, c_int64(n))
         if rc != 0:
             raise RuntimeError("ivf-rabitq extend failed")
         self.n += n
@@ -606,10 +630,10 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsBruteForceBuild(res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), ctypes.byref(ix))
+            rc = _lib.ovvsBruteForceBuild(res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), ctypes.byref(ix))
             if rc != 0:
                 raise RuntimeError("brute_force.build failed")
-            return BruteIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsBruteForceDestroy, n=n)
+            return BruteIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsBruteForceDestroy, n=n)
 
     class cagra:
         @staticmethod
@@ -617,7 +641,7 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsCagraBuild(
+            rc = _lib.ovvsCagraBuild(
                 res._h,
                 ptr,
                 c_int64(n),
@@ -629,7 +653,7 @@ class neighbors:
             )
             if rc != 0:
                 raise RuntimeError("cagra.build failed")
-            return CagraIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsCagraDestroy, n=n)
+            return CagraIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsCagraDestroy, n=n)
 
     class ivf_flat:
         @staticmethod
@@ -637,12 +661,12 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsIvfFlatBuild(
+            rc = _lib.ovvsIvfFlatBuild(
                 res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(nlist), ctypes.byref(ix)
             )
             if rc != 0:
                 raise RuntimeError("ivf_flat.build failed")
-            return IvfFlatIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfFlatDestroy, n=n)
+            return IvfFlatIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsIvfFlatDestroy, n=n)
 
     class ivf_pq:
         @staticmethod
@@ -650,7 +674,7 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsIvfPqBuild(
+            rc = _lib.ovvsIvfPqBuild(
                 res._h,
                 ptr,
                 c_int64(n),
@@ -663,7 +687,7 @@ class neighbors:
             )
             if rc != 0:
                 raise RuntimeError("ivf_pq.build failed")
-            return IvfPqIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfPqDestroy, n=n)
+            return IvfPqIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsIvfPqDestroy, n=n)
 
     class ivf_rabitq:
         @staticmethod
@@ -671,13 +695,13 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsIvfRabitqBuild(
+            rc = _lib.ovvsIvfRabitqBuild(
                 res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(nlist), ctypes.byref(ix)
             )
             if rc != 0:
                 raise RuntimeError("ivf_rabitq.build failed")
             return IvfRabitqIndex(
-                res, ix, d, own_res=resources is None, destroy=_lib.iovsIvfRabitqDestroy, n=n
+                res, ix, d, own_res=resources is None, destroy=_lib.ovvsIvfRabitqDestroy, n=n
             )
 
     class vamana:
@@ -686,13 +710,13 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsVamanaBuild(
+            rc = _lib.ovvsVamanaBuild(
                 res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(graph_degree),
                 c_float(alpha), ctypes.byref(ix)
             )
             if rc != 0:
                 raise RuntimeError("vamana.build failed")
-            return VamanaIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsVamanaDestroy, n=n)
+            return VamanaIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsVamanaDestroy, n=n)
 
     class scann:
         @staticmethod
@@ -700,23 +724,23 @@ class neighbors:
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.iovsScannBuild(
+            rc = _lib.ovvsScannBuild(
                 res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(nlist), c_int32(pq_m),
                 ctypes.byref(ix)
             )
             if rc != 0:
                 raise RuntimeError("scann.build failed")
-            return ScannIndex(res, ix, d, own_res=resources is None, destroy=_lib.iovsScannDestroy, n=n)
+            return ScannIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsScannDestroy, n=n)
 
     class hnsw:
         @staticmethod
         def from_cagra(cagra_index, resources=None):
             res = resources or cagra_index._res
             ix = c_void_p()
-            rc = _lib.iovsHnswFromCagra(res._h, cagra_index._h, ctypes.byref(ix))
+            rc = _lib.ovvsHnswFromCagra(res._h, cagra_index._h, ctypes.byref(ix))
             if rc != 0:
                 raise RuntimeError("hnsw.from_cagra failed")
-            return HnswIndex(res, ix, cagra_index.dim, own_res=False, destroy=_lib.iovsHnswDestroy, n=cagra_index.n)
+            return HnswIndex(res, ix, cagra_index.dim, own_res=False, destroy=_lib.ovvsHnswDestroy, n=cagra_index.n)
 
     build = brute_force.build
 
@@ -727,7 +751,7 @@ class VamanaIndex(_Index):
         bskeep, bsp = _bitset_ptr(self.n, bitset, allow_list)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsVamanaSearch(
+        rc = _lib.ovvsVamanaSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(beam), bsp, nb, ds
         )
         if rc != 0:
@@ -740,7 +764,7 @@ class ScannIndex(_Index):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsScannSearch(
+        rc = _lib.ovvsScannSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(nprobe), c_int32(krefine), nb, ds
         )
         if rc != 0:
@@ -753,7 +777,7 @@ class HnswIndex(_Index):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsHnswSearch(
+        rc = _lib.ovvsHnswSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(ef), nb, ds
         )
         if rc != 0:
@@ -767,7 +791,7 @@ class KMeans:
         self._own = resources is None
         keep, ptr, n, d = _dataset_ptr(dataset, dim)
         self._h = c_void_p()
-        rc = _lib.iovsKMeansFit(
+        rc = _lib.ovvsKMeansFit(
             self._res._h, ptr, c_int64(n), c_int64(d), c_int32(nclusters), c_int32(iters), ctypes.byref(self._h)
         )
         if rc != 0:
@@ -779,14 +803,14 @@ class KMeans:
         keep, ptr, n, _d = _dataset_ptr(x, self.dim)
         labs = (c_int64 * n)()
         dist = (c_float * n)()
-        rc = _lib.iovsKMeansPredict(self._res._h, self._h, ptr, c_int64(n), labs, dist)
+        rc = _lib.ovvsKMeansPredict(self._res._h, self._h, ptr, c_int64(n), labs, dist)
         if rc != 0:
             raise RuntimeError("kmeans predict failed")
         return [labs[i] for i in range(n)], [dist[i] for i in range(n)]
 
     def close(self):
         if self._h:
-            _lib.iovsKMeansDestroy(self._h)
+            _lib.ovvsKMeansDestroy(self._h)
             self._h = None
 
     def __del__(self):
@@ -796,7 +820,7 @@ class KMeans:
 class Batcher:
     def __init__(self, brute_index, max_batch=8, max_wait_ms=0):
         self._b = c_void_p()
-        rc = _lib.iovsBatcherCreate(
+        rc = _lib.ovvsBatcherCreate(
             brute_index._res._h, brute_index._h, c_int32(max_batch), c_int32(max_wait_ms), ctypes.byref(self._b)
         )
         if rc != 0:
@@ -807,14 +831,14 @@ class Batcher:
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
         nb = (c_int64 * (nq * k))()
         ds = (c_float * (nq * k))()
-        rc = _lib.iovsBatcherSearch(self._b, qptr, c_int64(nq), c_int64(k), nb, ds)
+        rc = _lib.ovvsBatcherSearch(self._b, qptr, c_int64(nq), c_int64(k), nb, ds)
         if rc != 0:
             raise RuntimeError("batcher search failed")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
     def close(self):
         if self._b:
-            _lib.iovsBatcherDestroy(self._b)
+            _lib.ovvsBatcherDestroy(self._b)
             self._b = None
 
     def __del__(self):

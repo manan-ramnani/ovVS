@@ -9,18 +9,18 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if "IOVS_LIBRARY" not in os.environ:
+if "OVVS_LIBRARY" not in os.environ:
     for cand in (
-        ROOT / "build-icpx" / "bin" / "iovs.dll",
-        ROOT / "build-sycl" / "bin" / "iovs.dll",
-        ROOT / "build" / "bin" / "iovs.dll",
+        ROOT / "build-icpx" / "bin" / "ovvs.dll",
+        ROOT / "build-sycl" / "bin" / "ovvs.dll",
+        ROOT / "build" / "bin" / "ovvs.dll",
     ):
         if cand.exists():
-            os.environ["IOVS_LIBRARY"] = str(cand)
+            os.environ["OVVS_LIBRARY"] = str(cand)
             break
 sys.path.insert(0, str(ROOT / "python"))
 
-import iovs  # noqa: E402
+import ovvs  # noqa: E402
 
 
 def l2sq(a, b, dim):
@@ -45,8 +45,8 @@ def main() -> int:
         data = array.array("f", [((i * 17) % 100) / 50.0 - 1.0 for i in range(n * dim)])
         q = array.array("f", [0.1, -0.2, 0.3, 0.0])
         use_np = False
-    res = iovs.Resources()
-    idx = iovs.neighbors.brute_force.build(data, dim=dim, resources=res)
+    res = ovvs.Resources()
+    idx = ovvs.neighbors.brute_force.build(data, dim=dim, resources=res)
     nb, ds = idx.search(q, k=k)
     # oracle
     dists = []
@@ -60,13 +60,13 @@ def main() -> int:
     if got != truth:
         print("mismatch", got, truth, file=sys.stderr)
         return 1
-    print("python consumer ok neighbors", got, "version", iovs.version(), "numpy", use_np)
+    print("python consumer ok neighbors", got, "version", ovvs.version(), "numpy", use_np)
     _ = res.energy_uj()
     if use_np:
         # DLPack ingest: build+search from __dlpack__ capsules, same independent L2 oracle.
         d_dl = np.from_dlpack(data)
         q_dl = np.from_dlpack(q)
-        idx2 = iovs.neighbors.brute_force.build(d_dl, dim=dim, resources=res)
+        idx2 = ovvs.neighbors.brute_force.build(d_dl, dim=dim, resources=res)
         nb2, _ = idx2.search(q_dl, k=k)
         got2 = list(nb2.ravel()[:k])
         if got2 != truth:
@@ -82,7 +82,7 @@ def main() -> int:
         return 1
     print("python consumer allow-list ok neighbors", got3)
 
-    idxh = iovs.neighbors.brute_force.build(data, dim=dim, metric=iovs.METRIC_HAMMING, resources=res)
+    idxh = ovvs.neighbors.brute_force.build(data, dim=dim, metric=ovvs.METRIC_HAMMING, resources=res)
     nbh, _ = idxh.search(q, k=1)
     got_h = int(nbh.ravel()[0] if hasattr(nbh, "ravel") else nbh[0])
     hbest, htruth = 1e30, -1
@@ -105,13 +105,13 @@ def main() -> int:
         print("hamming mismatch", got_h, got_h_score, htruth, hbest, file=sys.stderr)
         return 1
     print("python consumer hamming ok neighbor", got_h)
-    km = iovs.KMeans(data, nclusters=2, iters=8, dim=dim, resources=res)
+    km = ovvs.KMeans(data, nclusters=2, iters=8, dim=dim, resources=res)
     labs, dist = km.predict(data)
     if not any(d > 0 for d in dist):
         print("kmeans inertia zero", file=sys.stderr)
         return 1
     print("python consumer kmeans ok label0", labs[0], "inertia", sum(dist))
-    vam = iovs.neighbors.vamana.build(data, dim=dim, graph_degree=4, resources=res)
+    vam = ovvs.neighbors.vamana.build(data, dim=dim, graph_degree=4, resources=res)
     vnb, _ = vam.search(q, k=k, beam=4)
     print("python consumer vamana ok neighbor", int(vnb.ravel()[0] if hasattr(vnb, "ravel") else vnb[0]))
     return 0

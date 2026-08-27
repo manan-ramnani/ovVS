@@ -1,10 +1,10 @@
-# AGENTS.md — ioVS
+# AGENTS.md — ovVS
 
 Intel NPU + iGPU vector search library. The goal is a **complete NVIDIA cuVS equivalent** on Intel client hardware (Core Ultra NPU + Arc iGPU), not a research toy and not a CPU FAISS wrapper.
 
 Canonical plan (read before coding):
 
-`.claude/plans/2026-08-20-iovs-intel-cuvs-equivalent.md`
+`.claude/plans/2026-08-20-ovvs-intel-cuvs-equivalent.md`
 
 That document is the spec: architecture, device policy, feature matrix, and sequenced tasks T0.x–T23.x. If this file and the plan disagree, **the plan wins** until someone updates both.
 
@@ -12,7 +12,7 @@ That document is the spec: architecture, device policy, feature matrix, and sequ
 
 ## Mission for agents
 
-- Implement ioVS to cuVS feature parity (brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, CAGRA, NN-Descent, Vamana, ScaNN, all-neighbors, HNSW export, filters, dynamic batching, k-means, SLINK, spectral, quantizers, PCA, pairwise, k-selection, C/C++/Python/Rust/Go/Java).
+- Implement ovVS to cuVS feature parity (brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, CAGRA, NN-Descent, Vamana, ScaNN, all-neighbors, HNSW export, filters, dynamic batching, k-means, SLINK, spectral, quantizers, PCA, pairwise, k-selection, C/C++/Python/Rust/Go/Java).
 - **Do not drop a feature because the NPU cannot express it.** Use the punch-through ladder (OpenVINO graph → compiler rewrite → SHAVE kernel → HostCompile tiles → iGPU SYCL → CPU last). CPU-only for a hot loop is a defect unless the bakeoff proves it is fastest **and** a GPU/NPU path still exists for large batch.
 - **NPU wherever it lifts**, else iGPU. Record that decision in `tables/<sku>/`. Never hard-code folklore without a bakeoff file.
 - Custom kernels are in-scope: SYCL, oneMKL, Level Zero, OpenVINO graphs, `npu_compiler` SHAVE/DPU, HostCompile.
@@ -22,13 +22,13 @@ That document is the spec: architecture, device policy, feature matrix, and sequ
 ## Architecture (short)
 
 ```
-bindings → C ABI (libiovs) → C++ algorithms → mixer/planner
-  → iovs::prim (gemm, dist, topk, gather, ...)
+bindings → C ABI (libovvs) → C++ algorithms → mixer/planner
+  → ovvs::prim (gemm, dist, topk, gather, ...)
     → npu | gpu | cpu backends
-  → iovs::rt (Level Zero NPU + GPU, OpenVINO, USM, blob cache)
+  → ovvs::rt (Level Zero NPU + GPU, OpenVINO, USM, blob cache)
 ```
 
-- Algorithms call `iovs::prim`, never OpenVINO or SYCL directly.
+- Algorithms call `ovvs::prim`, never OpenVINO or SYCL directly.
 - Default tensor home: USM shared (CPU + iGPU). NPU sees tiles/bound host buffers, not a second index copy as source of truth.
 - Graph ANN (CAGRA/Vamana/NN-Descent walk) lives on **iGPU**. NPU may score a padded candidate slab if bakeoff says so.
 - Dense/static GEMM, coarse IVF, PQ ADC tables, k-means assignment, binary/RaBitQ GEMM: **NPU first**.
@@ -56,7 +56,7 @@ Phase 23 (npu_compiler / SHAVE) is a **parallel** track from Phase 4 onward, not
 
 ## Engineering rules
 
-- C++20. C ABI is the stability boundary (`include/iovs/`). Bindings wrap C, not the reverse.
+- C++20. C ABI is the stability boundary (`include/ovvs/`). Bindings wrap C, not the reverse.
 - SYCL code compiled with Intel DPC++ (`icpx`) Level Zero backend. Host may be MSVC or clang.
 - OpenVINO NPU plugin for NPU graphs. Pin compiler/driver versions; cache keys must include them.
 - Tests: golden vs CPU/FAISS; `FORCE_NPU` / `FORCE_GPU` / hetero; no silent compile-fail fallback without a counter and a log.
@@ -70,7 +70,7 @@ Phase 23 (npu_compiler / SHAVE) is a **parallel** track from Phase 4 onward, not
 ## Commands (once the tree exists)
 
 ```text
-cmake -B build -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DIOVS_WITH_SYCL=ON
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DOVVS_WITH_SYCL=ON
 cmake --build build
 ctest --test-dir build -L cpu
 # Windows oneAPI: call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" then icx (MSVC-like). icpx is GNU-like and breaks Ninja+MSVC flags.

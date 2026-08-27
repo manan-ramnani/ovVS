@@ -1,4 +1,4 @@
-# ioVS: Complete cuVS Equivalent on Intel NPU + iGPU
+# ovVS: Complete cuVS Equivalent on Intel NPU + iGPU
 
 **Status:** implementing (v0.1 library in-tree; Arrow Lake bakeoff tables checked in)  
 **Date:** 2026-08-20  
@@ -10,16 +10,16 @@ This document is the implementation spec for agents and humans. Read it before w
 
 ## 1. Mission
 
-Build **ioVS** (this repo): a vector-search and clustering library with the same job as [NVIDIA cuVS](https://github.com/NVIDIA/cuvs), targeting Intel client SoCs that have both:
+Build **ovVS** (this repo): a vector-search and clustering library with the same job as [NVIDIA cuVS](https://github.com/NVIDIA/cuvs), targeting Intel client SoCs that have both:
 
 - an **NPU** (Meteor Lake NPU 3720, Lunar Lake NPU 4000, Arrow Lake, Panther Lake NPU5, Wildcat Lake)
 - an **Arc iGPU** (Xe-LPG / Xe2) programmable via SYCL and Level Zero
 
 The library must expose a cuVS-shaped API (resources, build/search/extend/serialize, DLPack tensors, C ABI + language bindings) and implement every public algorithm class cuVS ships, not a subset.
 
-cuVS is GPU-native. ioVS is **heterogeneous-native**. Equivalence means:
+cuVS is GPU-native. ovVS is **heterogeneous-native**. Equivalence means:
 
-| Dimension | cuVS | ioVS |
+| Dimension | cuVS | ovVS |
 |---|---|---|
 | Algorithms | brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, CAGRA, CAGRA-Q, NN-Descent, Vamana, ScaNN, all-neighbors, HNSW export, filtered search, dynamic batching, k-means, SLINK, spectral clustering, PCA, PQ/SQ/binary quantizers, spectral embedding, pairwise distances, k-selection | same surface |
 | Build + search | GPU | NPU and/or iGPU and/or CPU, chosen per op by a cost model |
@@ -39,7 +39,7 @@ cuVS is GPU-native. ioVS is **heterogeneous-native**. Equivalence means:
 3. **Custom kernels are expected.** OpenVINO graph ops, `npu_compiler` SHAVE runtime kernels, HostCompile CPU+NPU split, SYCL subgroups, oneMKL GEMM, IGC intrinsics — all in scope.
 4. **No silent fallback that hides a missing kernel.** If NPU compile fails, log, count, and take the next device in the ladder. Tests fail if a required stage has no accelerated path on a machine that has the device.
 5. **Correctness before speed, then both.** Recall vs FAISS/brute-force ground truth is a gate. Throughput, latency, and joules/query are the optimization objective.
-6. **One C ABI.** All languages wrap `libiovs`. Do not reimplement algorithms per language.
+6. **One C ABI.** All languages wrap `libovvs`. Do not reimplement algorithms per language.
 
 ---
 
@@ -110,9 +110,9 @@ Windows 11 and Ubuntu 24.04 are both first-class. Drivers: Intel NPU driver + co
 ```
 +------------------------------------------------------------------+
 | Bindings: Python, C++, C, Rust, Go, Java                         |
-|  (all call libiovs C ABI; tensors via DLPack)                    |
+|  (all call libovvs C ABI; tensors via DLPack)                    |
 +------------------------------------------------------------------+
-| Public C++ API  iovs::neighbors / cluster / preprocess / distance|
+| Public C++ API  ovvs::neighbors / cluster / preprocess / distance|
 +------------------------------------------------------------------+
 | Planner / Device Mixer                                           |
 |  stage graph -> cost model -> device assignment -> executable    |
@@ -120,7 +120,7 @@ Windows 11 and Ubuntu 24.04 are both first-class. Drivers: Intel NPU driver + co
 | Algorithm IR  (stages, not devices)                              |
 |  e.g. CAGRA = InitGraph | OptimizeGraph | SearchWalk | DistEval  |
 +------------------------------------------------------------------+
-| Primitive library  iovs::prim  (RAFT analogue)                   |
+| Primitive library  ovvs::prim  (RAFT analogue)                   |
 |  gemm, gemv, dist, topk, sort, scan, hist, gather, scatter,      |
 |  reduce, bitset, hashmap, subgroup ops                           |
 +------------------------+------------------+----------------------+
@@ -129,19 +129,19 @@ Windows 11 and Ubuntu 24.04 are both first-class. Drivers: Intel NPU driver + co
 | SHAVE/DPU kernels       | oneMKL / XMX     | HostCompile host    |
 | HostCompile tiles       | Level Zero queues|                     |
 +------------------------+------------------+----------------------+
-| Runtime  iovs::rt                                                |
+| Runtime  ovvs::rt                                                |
 |  Level Zero loader, NPU UMD, GPU UMD, events, command lists,     |
 |  USM, NPU graph cache, compiled-blob cache, stream/event model   |
 +------------------------------------------------------------------+
-| Memory  iovs::mem                                                |
+| Memory  ovvs::mem                                                |
 |  host DRAM (source of truth), USM shared, USM device,            |
 |  NPU graph weights, tile arenas, pinned staging                  |
 +------------------------------------------------------------------+
 ```
 
-### 4.2 Runtime (`iovs::rt`) — analogue of `raft::device_resources`
+### 4.2 Runtime (`ovvs::rt`) — analogue of `raft::device_resources`
 
-One `iovs::Resources` object per thread-pool / search worker:
+One `ovvs::Resources` object per thread-pool / search worker:
 
 - Level Zero driver handles for GPU and NPU (both are L0 devices on this stack).
 - One GPU command queue (compute) + copy queue if the driver exposes it.
@@ -152,7 +152,7 @@ One `iovs::Resources` object per thread-pool / search worker:
 
 NPU and iGPU **do not share a coherent device address space**. Crossing devices is a host-visible USM/DRAM buffer plus an explicit dependency. The mixer is responsible for not ping-ponging.
 
-### 4.3 Memory (`iovs::mem`)
+### 4.3 Memory (`ovvs::mem`)
 
 Default layout:
 
@@ -163,7 +163,7 @@ Default layout:
 
 Alignment: 64-byte for AVX, 128-byte for iGPU block loads, NPU compiler’s preferred layout (typically NHWC-ish for activations; we will pack GEMM as `[M,K] x [K,N]` with K multiple of 32/64 after bakeoff).
 
-### 4.4 Primitive library (`iovs::prim`) — the RAFT we have to write
+### 4.4 Primitive library (`ovvs::prim`) — the RAFT we have to write
 
 Every primitive has three backends and a mixer entry. No algorithm talks to OpenVINO or SYCL directly.
 
@@ -198,7 +198,7 @@ Every primitive has three backends and a mixer entry. No algorithm talks to Open
 4. Level Zero + SPIR-V / IGC-level if a shuffle/atomic is missing.
 5. CPU. Logged as a defect until an iGPU kernel exists, unless bakeoff proves CPU is faster **and** we still have an iGPU kernel for the large-batch case.
 
-### 4.5 Device mixer (`iovs::plan`)
+### 4.5 Device mixer (`ovvs::plan`)
 
 Algorithms are **stage graphs**, not monoliths.
 
@@ -244,13 +244,13 @@ Rule of thumb encoded in tables, not folklore:
 Each index is a C++ class plus a serialized blob.
 
 ```
-iovs::neighbors::Index
+ovvs::neighbors::Index
   metadata: metric, dtype, n, dim, device_affinity
-  storage:  iovs::mem::Buffer views
+  storage:  ovvs::mem::Buffer views
   stages:   vector<Stage> for build and for search
 ```
 
-Serialization format (`*.iovs`): little-endian, versioned, mmap-friendly. Must round-trip CAGRA graphs, IVF lists, PQ codebooks. Must import/export:
+Serialization format (`*.ovvs`): little-endian, versioned, mmap-friendly. Must round-trip CAGRA graphs, IVF lists, PQ codebooks. Must import/export:
 
 - CAGRA graph → HNSW (hnswlib-compatible layout, matching cuVS)
 - FAISS IVF-PQ / IVF-Flat where layouts are documented
@@ -258,41 +258,41 @@ Serialization format (`*.iovs`): little-endian, versioned, mmap-friendly. Must r
 
 ### 4.7 Public API (cuVS-shaped)
 
-C ABI in `include/iovs/` (stable):
+C ABI in `include/ovvs/` (stable):
 
 ```
-iovsResourcesCreate / Destroy
-iovsBruteForceIndex* / Search
-iovsIvfFlat*
-iovsIvfPq*
-iovsIvfRabitq*
-iovsCagra*  (Build, Search, Extend, Serialize, Deserialize)
-iovsNnDescent*
-iovsVamana*
-iovsScann*
-iovsAllNeighbors*
-iovsHnswFromCagra / iovsHnswSearch
-iovsKMeans*
-iovsSlink*
-iovsSpectral*
-iovsPq / iovsSq / iovsBinaryQuantizer / iovsPca
-iovsPairwiseDistance
-iovsKSelection
-iovsFilter  (bitset)
+ovvsResourcesCreate / Destroy
+ovvsBruteForceIndex* / Search
+ovvsIvfFlat*
+ovvsIvfPq*
+ovvsIvfRabitq*
+ovvsCagra*  (Build, Search, Extend, Serialize, Deserialize)
+ovvsNnDescent*
+ovvsVamana*
+ovvsScann*
+ovvsAllNeighbors*
+ovvsHnswFromCagra / ovvsHnswSearch
+ovvsKMeans*
+ovvsSlink*
+ovvsSpectral*
+ovvsPq / ovvsSq / ovvsBinaryQuantizer / ovvsPca
+ovvsPairwiseDistance
+ovvsKSelection
+ovvsFilter  (bitset)
 ```
 
-C++ in `include/iovs/*.hpp` wrapping the C ABI or vice versa (C ABI is the compatibility boundary, like cuVS).
+C++ in `include/ovvs/*.hpp` wrapping the C ABI or vice versa (C ABI is the compatibility boundary, like cuVS).
 
-Python: `iovs.neighbors.cagra.build(...)` mirroring cuVS names so ports are mechanical.
+Python: `ovvs.neighbors.cagra.build(...)` mirroring cuVS names so ports are mechanical.
 
 ### 4.8 Directory layout (target)
 
 ```
-ioVS/
+ovVS/
   AGENTS.md
   CMakeLists.txt
   .claude/plans/
-  include/iovs/                 C + C++ headers
+  include/ovvs/                 C + C++ headers
   src/
     rt/                         Level Zero, OpenVINO, queues, cache
     mem/                        USM, arenas
@@ -328,7 +328,7 @@ Every row must reach **Accelerated** on a Lunar Lake machine. **Accelerated** me
 
 ### 5.1 Neighbors
 
-| Algorithm | cuVS role | ioVS NPU | ioVS iGPU | ioVS CPU | Done when |
+| Algorithm | cuVS role | ovVS NPU | ovVS iGPU | ovVS CPU | Done when |
 |---|---|---|---|---|---|
 | Brute-force | exact kNN | GEMM+topk graph | GEMM+topk kernel | AVX GEMM | recall=1, beats naive NumPy, NPU used for large NxD |
 | IVF-Flat | inverted lists, full vectors | coarse GEMM | list scan + dist | metadata | recall vs FAISS IVF-Flat within 1% at same nprobe |
@@ -367,7 +367,7 @@ Implement at least: `L2Expanded`, `L2SqrtExpanded`, `InnerProduct`, `CosineExpan
 
 ### 5.4 Bindings
 
-C ABI first. Then C++ header-only/inline wrappers. Then Python. Then Rust, Go, Java. Feature flags in CI: `IOVS_BINDINGS=python` etc. A binding is not done until one algorithm (brute-force search) round-trips in that language.
+C ABI first. Then C++ header-only/inline wrappers. Then Python. Then Rust, Go, Java. Feature flags in CI: `OVVS_BINDINGS=python` etc. A binding is not done until one algorithm (brute-force search) round-trips in that language.
 
 ---
 
@@ -378,7 +378,7 @@ Porting CUDA CAGRA blindly will lose. Redesign for subgroup-16 and DRAM.
 ### 6.1 Build
 
 1. **Initial graph**
-   - IVF-PQ path: reuse ioVS IVF-PQ (NPU coarse + iGPU/NPU ADC), batched queries of the dataset against itself in chunks.
+   - IVF-PQ path: reuse ovVS IVF-PQ (NPU coarse + iGPU/NPU ADC), batched queries of the dataset against itself in chunks.
    - NN-Descent path: iGPU kernels (see §7 phase 11).
    - Iterative CAGRA-search path: after search kernel exists.
 2. **Optimize/prune** on iGPU: each vertex’s `I` neighbors → reverse edges → prune to degree `G`. Sort and unique in SLM if `I` fits, else global.
@@ -390,7 +390,7 @@ NPU during build: all large GEMMs (IVF-PQ train assignment, batched self-search 
 
 Map cuVS knobs:
 
-| cuVS | ioVS iGPU |
+| cuVS | ovVS iGPU |
 |---|---|
 | `team_size` 8/16/32 | subgroup 8 or 16; 32 = two subgroups cooperating |
 | `itopk_size` | SLM array per query |
@@ -437,15 +437,15 @@ Legend: `[P]` prerequisite, `[N]` NPU, `[G]` iGPU, `[C]` CPU, `[H]` hetero, `[K]
 
 ### Phase 1 — Runtime and memory
 
-**Goal:** `iovs::Resources` can allocate USM, submit a GPU kernel, and run an OpenVINO NPU MatMul.
+**Goal:** `ovvs::Resources` can allocate USM, submit a GPU kernel, and run an OpenVINO NPU MatMul.
 
 - **T1.1** `[G]` Level Zero GPU context, USM shared malloc, event. Exit: SYCL vector add correctness.
 - **T1.2** `[N]` OpenVINO `compile_model(..., "NPU")` for a static MatMul. Cache blob to disk. Exit: numerical vs NumPy fp16.
 - **T1.3** `[N]` Bind NPU infer request to external host pointers (zero extra copy). Exit: probe bandwidth; record GB/s.
 - **T1.4** `[H]` Two-device timeline: GPU kernel → host visible → NPU infer → host. Events, no deadlock. Exit: unit test.
-- **T1.5** Compiled-graph cache (`~/.cache/iovs/` + in-process). Key includes shapes + driver/compiler versions. Exit: second run skips compile.
+- **T1.5** Compiled-graph cache (`~/.cache/ovvs/` + in-process). Key includes shapes + driver/compiler versions. Exit: second run skips compile.
 - **T1.6** Scratch arenas, `Resources` thread contract documented. Exit: TSAN-clean host tests (no device TSAN).
-- **T1.7** Error model: `iovsStatus` codes for compile fail, unsupported op, OOM, shape mismatch. No exceptions across C ABI.
+- **T1.7** Error model: `ovvsStatus` codes for compile fail, unsupported op, OOM, shape mismatch. No exceptions across C ABI.
 
 ---
 
@@ -480,7 +480,7 @@ Exit: one checked-in table for `gemm` on the primary laptop.
 - **T4.3** `[N]` Try OpenVINO TopK on score matrix. If compile fails: punch-through ladder. If still fails: NPU emits full scores, iGPU selects — **hetero is success**, not a skip.
 - **T4.4** Bakeoff vs `k`, `n`, `B`.
 
-Exit: primitive API `iovs::prim::topk` used by brute-force.
+Exit: primitive API `ovvs::prim::topk` used by brute-force.
 
 ---
 
@@ -627,7 +627,7 @@ Depends on 6, 10, 12, 4, 5.
 
 - **T17.1** All-neighbors: brute or IVF or NN-Descent switch, output kNN graph CSR.
 - **T17.2** Dynamic batcher: thread-safe queue, max wait, max B; prefers NPU-friendly B.
-- **T17.3** Common `iovsFilter` bitset used by IVF + CAGRA + Vamana.
+- **T17.3** Common `ovvsFilter` bitset used by IVF + CAGRA + Vamana.
 - **T17.4** Allow-list API (Go cuVS style) converting to bitset.
 
 ---
@@ -660,7 +660,7 @@ Depends on 6, 10, 12, 4, 5.
 
 ### Phase 21 — Bindings
 
-- **T21.1** Freeze C ABI versioning (`IOVS_VERSION`, `iovsGetVersion`).
+- **T21.1** Freeze C ABI versioning (`OVVS_VERSION`, `ovvsGetVersion`).
 - **T21.2** C++ headers.
 - **T21.3** Python (pybind11/nanobind) + DLPack + numpy.
 - **T21.4** Rust crate.
@@ -672,8 +672,8 @@ Depends on 6, 10, 12, 4, 5.
 
 ### Phase 22 — Benchmarks, packaging, docs
 
-- **T22.1** `iovs_bench` compatible with cuVS bench datasets and recall-QPS plots.
-- **T22.2** Comparison scripts: FAISS CPU, hnswlib, Intel SVS if present, ioVS NPU, ioVS GPU, ioVS hetero.
+- **T22.1** `ovvs_bench` compatible with cuVS bench datasets and recall-QPS plots.
+- **T22.2** Comparison scripts: FAISS CPU, hnswlib, Intel SVS if present, ovVS NPU, ovVS GPU, ovVS hetero.
 - **T22.3** Packaging: pip wheel, CMake install, vcpkg/conan later.
 - **T22.4** User guide: which index on which SKU, how mixer decides, how to FORCE device.
 - **T22.5** Paper-ready: IVF-RaBitQ-on-NPU + CAGRA-on-Xe2 + hetero energy.
@@ -718,7 +718,7 @@ These are **targets**, not excuses to cut scope. If missed, we kernel-tweak, we 
 | Brute-force 1e5 x 768, B=32, k=10 | faster than OpenVINO-CPU and faster than naive iGPU OpenCL; NPU used for GEMM |
 | IVF-PQ SIFT1M, nprobe typical, recall@10 ≥ 0.95 | beat FAISS CPU QPS at same recall; energy < iGPU-only |
 | CAGRA SIFT1M, recall@10 ≥ 0.95 | beat hnswlib QPS on the same laptop; build faster than hnswlib `efC=200` |
-| IVF-RaBitQ on-device RAG 1e6 x 768 int | lowest joules/query among ioVS indexes at recall ≥ 0.9 |
+| IVF-RaBitQ on-device RAG 1e6 x 768 int | lowest joules/query among ovVS indexes at recall ≥ 0.9 |
 | B=1 CAGRA | p99 latency competitive with hnswlib (iGPU fused walk, not NPU) |
 
 ---
@@ -744,7 +744,7 @@ These are **targets**, not excuses to cut scope. If missed, we kernel-tweak, we 
 ## 11. Tentative internal APIs (so work can start in parallel)
 
 ```cpp
-namespace iovs {
+namespace ovvs {
 enum class Device { Cpu, Npu, Gpu, Auto };
 
 struct Resources { /* L0, OV, arenas, tables */ };
@@ -813,19 +813,19 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | CPU role | control, tiny-B, HostCompile, HNSW export | not the library’s identity |
 | SVS | competitor / idea source | no proprietary blob in core |
 | Equivalence | API + algorithms + quality knobs | not CUDA kernel isomorphism |
-| iGPU GEMM without DPC++ | OpenVINO GPU plugin | historical; official oneAPI `icx` 2025.1.1 is the Windows Ninja compiler. SYCL-first USM is the default iGPU path when `IOVS_WITH_SYCL=ON`; OpenVINO GPU remains fallback |
+| iGPU GEMM without DPC++ | OpenVINO GPU plugin | historical; official oneAPI `icx` 2025.1.1 is the Windows Ninja compiler. SYCL-first USM is the default iGPU path when `OVVS_WITH_SYCL=ON`; OpenVINO GPU remains fallback |
 | First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
 | FORCE_* honesty | DEVICE_UNAVAILABLE if the requested device did not run | bakeoff last_device must match requested device on success |
 | iGPU topk/gather without DPC++ | OpenVINO TopK/Gather on GPU plugin | SYCL kernels remain for icpx |
-| CAGRA walk | `prim_graph_walk`: fused SYCL if `IOVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | Heaps/seen sized to real `itopk`/`n` (not SLM-64 / expd-4096). Refuse SYCL only if itopk>4096 or seen bytes>64MiB, then host prim walk. `cagra_sycl_walk_n_over_4096` FORCE_GPU n=4200 vs independent L2. |
+| CAGRA walk | `prim_graph_walk`: fused SYCL if `OVVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | Heaps/seen sized to real `itopk`/`n` (not SLM-64 / expd-4096). Refuse SYCL only if itopk>4096 or seen bytes>64MiB, then host prim walk. `cagra_sycl_walk_n_over_4096` FORCE_GPU n=4200 vs independent L2. |
 | HostCompile | NPU GEMM tiles of M=256, TopK rows of 32, Gather nidx of 128 when full-shape compile fails | in `npu_gemm` / `npu_topk` / `npu_gather_rows`; SHAVE ADC/TopK C still host-linked until unsigned ELF is loadable |
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
-| Mixer v2 | `iovsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
-| Dynamic batcher | thread-safe waiter queue; flush at max_B or max_wait; `iovsBatcherLastBatchSize` | concurrent nq=1 submits coalesce; results match eager brute |
+| Mixer v2 | `ovvsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
+| Dynamic batcher | thread-safe waiter queue; flush at max_B or max_wait; `ovvsBatcherLastBatchSize` | concurrent nq=1 submits coalesce; results match eager brute |
 | ScaNN | anisotropic IVF-PQ + original-space refine | nprobe=all + krefine=n matches brute L2 |
 | Python tensors | NumPy + DLPack (`np.from_dlpack` / `__dlpack__`) | consumer searches from DLPack views; `allow_list=` / `bitset_from_allow_list` |
-| C++ API | header wrappers beyond brute-force | IVF-Flat / IVF-PQ / IVF-RaBitQ / CAGRA + serialize/extend in `iovs.hpp` |
-| Allow-list filter | `iovsBitsetFromAllowList` | fills `(n+7)/8` bitset; missing ids stay 0 |
+| C++ API | header wrappers beyond brute-force | IVF-Flat / IVF-PQ / IVF-RaBitQ / CAGRA + serialize/extend in `ovvs.hpp` |
+| Allow-list filter | `ovvsBitsetFromAllowList` | fills `(n+7)/8` bitset; missing ids stay 0 |
 | IVF-PQ / RaBitQ persist | magic `IPQ1` / `RQB1` | serialize/deserialize/extend encode residuals into existing codebooks |
 | Large-GEMM AUTO | load `tables/<sku>/gemm_large.json` | Arrow Lake icx SYCL+oneMKL winner is NPU (117 ms vs GPU 150 vs CPU 191) |
 
@@ -835,12 +835,12 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 
 Filled in as installs finish. Placeholder until toolchain logs land:
 
-- **SYCL/oneAPI toolkit:** elevated offline installer `intel-oneapi-base-toolkit-2025.1.3.8_offline.exe` exit 0. `icpx`/`icx` 2025.1.1 at `C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin\`. On Windows Ninja, **`icx` for both C and CXX** (`icpx` is GNU-like; CMake then passes `/nologo /EHsc` and the compiler test fails). `build-icpx` with `-DIOVS_WITH_SYCL=ON -DIOVS_WITH_OPENVINO=ON` links `sycl8.dll` and passes 45/45 plus C++/C consumers, including `cagra_sycl_walk_n_over_4096`. `intel/llvm` nightly `clang++ -fsycl` remains a fallback (`build-sycl`).
-- **SYCL fused CAGRA walk (enabled):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ioVS with `-DIOVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (fused iGPU walk). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed).
+- **SYCL/oneAPI toolkit:** elevated offline installer `intel-oneapi-base-toolkit-2025.1.3.8_offline.exe` exit 0. `icpx`/`icx` 2025.1.1 at `C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin\`. On Windows Ninja, **`icx` for both C and CXX** (`icpx` is GNU-like; CMake then passes `/nologo /EHsc` and the compiler test fails). `build-icpx` with `-DOVVS_WITH_SYCL=ON -DOVVS_WITH_OPENVINO=ON` links `sycl8.dll` and passes 45/45 plus C++/C consumers, including `cagra_sycl_walk_n_over_4096`. `intel/llvm` nightly `clang++ -fsycl` remains a fallback (`build-sycl`).
+- **SYCL fused CAGRA walk (enabled):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ovVS with `-DOVVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (fused iGPU walk). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed).
 - **SHAVE on NPU silicon:** ActShave **does** run. OpenVINO NPU ADC (Gather+ReduceSum) profiling on this 265K: `lut`/`Gather`/`Result` exec_type `Shave`, `ReduceSum` exec_type `DPU`. Compiler-in-driver embeds Intel prebuilt ELF32 `.text` (`gather.3720xx.elf`, …) into a graph ELF64 (`.text.KernelText`, `.text.ActKernelInvocations`). Level Zero `ZE_GRAPH_FORMAT_NATIVE` is that graph blob; a raw SHAVE ELF32 is `invalid_native_binary`. VCL still rejects ELF-as-IR (`invalid_ir`). `ze_activation_kernel_desc_t` is compile-time extra kernel data, not an unsigned loader. MoviTools is artifactory-only (`ENABLE_SHAVE_BINARIES_BUILD`). Probe: `shave_silicon_load: compiler_actshave`, `shave_unsigned_inject: unsupported_no_inject_api`. Park only “custom unsigned SHAVE C compiled with moviCompile and registered as VPU.SW.Kernel”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.
-- **Energy/RAPL:** Windows package joules come from **intelppm EMI**, not Power Gadget. `GUID_DEVICE_ENERGY_METER` `{45BD8344-7ED6-49CF-A440-C276C933B053}` is registered on ACPI processor instance 0 (`cpu.inf` / `intelppm.sys`, Microsoft PPM v2). Channels: `RAPL_Package0_PKG`, `_PP0`, `_PP1`, `_DRAM` (DRAM is 0 on this desktop SKU). `iovsResourcesEnergyUj` reads `IOCTL_EMI_GET_MEASUREMENT` (pWh × 0.0036 = µJ), then PDH Energy Meter, then Power Gadget, then Linux sysfs. Arrow Lake 265K: SUCCESS, increasing µJ. IPF/PMT are not this counter. Bakeoff `energy_probe` is `success` when EMI/PDH is present.
-- **git push:** Repo renamed to [`manan-ramnani/ovVS`](https://github.com/manan-ramnani/ovVS). `origin` is `https://github.com/manan-ramnani/ovVS.git`. Full local `main` (including `.github/workflows/ci.yml`) replaced the old workflow-free snapshot `769ff5d` at `950c625`. C ABI remains `iovs`.
+- **Energy/RAPL:** Windows package joules come from **intelppm EMI**, not Power Gadget. `GUID_DEVICE_ENERGY_METER` `{45BD8344-7ED6-49CF-A440-C276C933B053}` is registered on ACPI processor instance 0 (`cpu.inf` / `intelppm.sys`, Microsoft PPM v2). Channels: `RAPL_Package0_PKG`, `_PP0`, `_PP1`, `_DRAM` (DRAM is 0 on this desktop SKU). `ovvsResourcesEnergyUj` reads `IOCTL_EMI_GET_MEASUREMENT` (pWh × 0.0036 = µJ), then PDH Energy Meter, then Power Gadget, then Linux sysfs. Arrow Lake 265K: SUCCESS, increasing µJ. IPF/PMT are not this counter. Bakeoff `energy_probe` is `success` when EMI/PDH is present.
+- **git push:** Repo renamed to [`manan-ramnani/ovVS`](https://github.com/manan-ramnani/ovVS). `origin` is `https://github.com/manan-ramnani/ovVS.git`. Full local `main` (including `.github/workflows/ci.yml`) replaced the old workflow-free snapshot `769ff5d` at `950c625`. C ABI remains `ovvs`.
 - **FAISS/hnswlib pip:** `faiss-cpu` 1.15.0 and `hnswlib` 0.8.0 import. SIFT slice benches in `tables/arrow-lake/bench-recall-qps.md`.
 
 ---
@@ -850,13 +850,13 @@ Filled in as installs finish. Placeholder until toolchain logs land:
 - Exact OpenVINO opset support for TopK/Gather on NPU 4000 must be measured in T4.3 / T5.2, not assumed from ONNX EP tables (those mix CPU/GPU).
 - HostCompile_Interpreter is the preferred dynamic-shape story on NPU 4000+ (`npu_compiler` docs). Use it for IVF list length.
 - oneMKL GPU GEMM vs hand SYCL joint_matrix: start oneMKL, replace if bakeoff demands.
-- Power: Windows EMI/PDH RAPL vs Linux RAPL; both implemented in `iovsResourcesEnergyUj`. Allow missing only when neither EMI, PDH Energy Meter, Power Gadget, nor sysfs RAPL exists.
+- Power: Windows EMI/PDH RAPL vs Linux RAPL; both implemented in `ovvsResourcesEnergyUj`. Allow missing only when neither EMI, PDH Energy Meter, Power Gadget, nor sysfs RAPL exists.
 
 ---
 
 ## 16. Definition of “v1.0 equivalent”
 
-ioVS 1.0 ships when on Lunar Lake (Windows or Linux):
+ovVS 1.0 ships when on Lunar Lake (Windows or Linux):
 
 1. Brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, CAGRA (build+search+filter+serialize), NN-Descent, k-means, PQ/SQ/binary, pairwise, topk all have accelerated paths.
 2. Python + C++ + C work for those.

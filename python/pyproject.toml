@@ -1,7 +1,7 @@
 [project]
-name = "iovs"
+name = "ovvs"
 version = "0.2.0"
-description = "ioVS Python bindings (ctypes over libiovs C ABI)"
+description = "ovVS Python bindings (ctypes over libovvs C ABI)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -15,4 +15,4 @@ numpy = ["numpy>=1.23"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["iovs*"]
+include = ["ovvs*"]

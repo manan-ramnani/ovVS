@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ioVS VERSION 0.2.0 LANGUAGES C CXX)
+project(ovVS VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,11 +16,11 @@ if(MSVC)
   endforeach()
 endif()
 
-option(IOVS_WITH_OPENVINO "Build OpenVINO NPU backend" OFF)
-option(IOVS_WITH_SYCL "Build SYCL iGPU backend" OFF)
-option(IOVS_WITH_MKL "Link oneMKL for GPU GEMM and LAPACK gesvd/syev" OFF)
-option(IOVS_BUILD_TESTS "Build unit tests" ON)
-option(IOVS_BUILD_TOOLS "Build probe/bakeoff tools" ON)
+option(OVVS_WITH_OPENVINO "Build OpenVINO NPU backend" OFF)
+option(OVVS_WITH_SYCL "Build SYCL iGPU backend" OFF)
+option(OVVS_WITH_MKL "Link oneMKL for GPU GEMM and LAPACK gesvd/syev" OFF)
+option(OVVS_BUILD_TESTS "Build unit tests" ON)
+option(OVVS_BUILD_TOOLS "Build probe/bakeoff tools" ON)
 
 if(MSVC)
   add_compile_options(/W3 /EHsc /utf-8)
@@ -30,7 +30,7 @@ else()
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
-set(IOVS_SOURCES
+set(OVVS_SOURCES
   src/rt/status.cpp
   src/rt/probe.cpp
   src/rt/resources.cpp
@@ -49,8 +49,8 @@ set(IOVS_SOURCES
   src/rt/shave_elf.cpp
 )
 
-add_library(iovs SHARED ${IOVS_SOURCES})
-target_include_directories(iovs
+add_library(ovvs SHARED ${OVVS_SOURCES})
+target_include_directories(ovvs
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -58,81 +58,81 @@ target_include_directories(iovs
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/compiler/shave
 )
-target_compile_definitions(iovs PRIVATE IOVS_BUILD)
+target_compile_definitions(ovvs PRIVATE OVVS_BUILD)
 
 if(WIN32)
-  target_link_libraries(iovs PRIVATE advapi32 setupapi pdh)
+  target_link_libraries(ovvs PRIVATE advapi32 setupapi pdh)
 endif()
 
-if(IOVS_WITH_OPENVINO)
+if(OVVS_WITH_OPENVINO)
   find_package(OpenVINO REQUIRED COMPONENTS Runtime)
-  target_link_libraries(iovs PRIVATE openvino::runtime)
-  target_compile_definitions(iovs PRIVATE IOVS_WITH_OPENVINO)
+  target_link_libraries(ovvs PRIVATE openvino::runtime)
+  target_compile_definitions(ovvs PRIVATE OVVS_WITH_OPENVINO)
   if(WIN32)
-    add_custom_command(TARGET iovs POST_BUILD
+    add_custom_command(TARGET ovvs POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:openvino::runtime>
-        $<TARGET_FILE_DIR:iovs>
-      COMMENT "Copy OpenVINO runtime next to iovs")
+        $<TARGET_FILE_DIR:ovvs>
+      COMMENT "Copy OpenVINO runtime next to ovvs")
   endif()
 endif()
 
-if(IOVS_WITH_SYCL)
+if(OVVS_WITH_SYCL)
   # Windows oneAPI: configure with icx (MSVC-like). icpx is GNU-like and fails CMake MSVC flags.
-  target_compile_definitions(iovs PRIVATE IOVS_WITH_SYCL)
+  target_compile_definitions(ovvs PRIVATE OVVS_WITH_SYCL)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
-    target_compile_options(iovs PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsycl>)
-    target_link_options(iovs PRIVATE -fsycl)
+    target_compile_options(ovvs PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsycl>)
+    target_link_options(ovvs PRIVATE -fsycl)
   endif()
 endif()
 
-if(IOVS_WITH_MKL)
+if(OVVS_WITH_MKL)
   find_package(MKL CONFIG REQUIRED)
-  target_compile_definitions(iovs PRIVATE IOVS_WITH_MKL)
+  target_compile_definitions(ovvs PRIVATE OVVS_WITH_MKL)
   if(TARGET MKL::MKL_SYCL)
-    target_link_libraries(iovs PRIVATE MKL::MKL_SYCL)
+    target_link_libraries(ovvs PRIVATE MKL::MKL_SYCL)
   endif()
   if(TARGET MKL::MKL)
-    target_link_libraries(iovs PRIVATE MKL::MKL)
+    target_link_libraries(ovvs PRIVATE MKL::MKL)
   endif()
 endif()
 
-add_library(iovs::iovs ALIAS iovs)
+add_library(ovvs::ovvs ALIAS ovvs)
 
-if(IOVS_BUILD_TOOLS)
-  add_executable(iovs_probe tools/probe/main.cpp)
-  target_link_libraries(iovs_probe PRIVATE iovs)
-  add_executable(iovs_bakeoff tools/bakeoff/main.cpp)
-  target_link_libraries(iovs_bakeoff PRIVATE iovs)
+if(OVVS_BUILD_TOOLS)
+  add_executable(ovvs_probe tools/probe/main.cpp)
+  target_link_libraries(ovvs_probe PRIVATE ovvs)
+  add_executable(ovvs_bakeoff tools/bakeoff/main.cpp)
+  target_link_libraries(ovvs_bakeoff PRIVATE ovvs)
 endif()
 
-if(IOVS_BUILD_TESTS)
-  add_executable(iovs_tests
+if(OVVS_BUILD_TESTS)
+  add_executable(ovvs_tests
     tests/test_main.cpp
     tests/test_prim.cpp
     tests/test_neighbors.cpp
     tests/test_cluster.cpp
   )
-  target_link_libraries(iovs_tests PRIVATE iovs)
+  target_link_libraries(ovvs_tests PRIVATE ovvs)
   if(WIN32)
-    target_link_options(iovs_tests PRIVATE /STACK:16777216)
+    target_link_options(ovvs_tests PRIVATE /STACK:16777216)
   endif()
-  target_include_directories(iovs_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  add_executable(iovs_consumer tests/consumer.c)
-  target_link_libraries(iovs_consumer PRIVATE iovs)
-  add_executable(iovs_consumer_cxx tests/consumer.cpp)
-  target_link_libraries(iovs_consumer_cxx PRIVATE iovs)
+  target_include_directories(ovvs_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_executable(ovvs_consumer tests/consumer.c)
+  target_link_libraries(ovvs_consumer PRIVATE ovvs)
+  add_executable(ovvs_consumer_cxx tests/consumer.cpp)
+  target_link_libraries(ovvs_consumer_cxx PRIVATE ovvs)
   enable_testing()
-  add_test(NAME cpu COMMAND iovs_tests)
+  add_test(NAME cpu COMMAND ovvs_tests)
   set_tests_properties(cpu PROPERTIES LABELS "cpu")
-  add_test(NAME consumer COMMAND iovs_consumer)
+  add_test(NAME consumer COMMAND ovvs_consumer)
   set_tests_properties(consumer PROPERTIES LABELS "cpu")
-  add_test(NAME consumer_cxx COMMAND iovs_consumer_cxx)
+  add_test(NAME consumer_cxx COMMAND ovvs_consumer_cxx)
   set_tests_properties(consumer_cxx PROPERTIES LABELS "cpu")
 endif()
 
-install(TARGETS iovs EXPORT iovsTargets
+install(TARGETS ovvs EXPORT ovvsTargets
   RUNTIME DESTINATION bin
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib)
-install(DIRECTORY include/iovs DESTINATION include)
+install(DIRECTORY include/ovvs DESTINATION include)

@@ -1,8 +1,8 @@
 //go:build !windows
 
-package iovs
+package ovvs
 
-// Non-Windows builds should link libiovs via cgo. Windows uses syscall in iovs_windows.go.
+// Non-Windows builds should link libovvs via cgo. Windows uses syscall in ovvs_windows.go.
 
 func Version() string { return "" }
 
@@ -18,7 +18,7 @@ func KMeansPredict(data []float32, n, dim, nclusters int) ([]int64, []float32, e
 	return nil, nil, errUnimplemented
 }
 
-var errUnimplemented = errString("iovs: cgo path not built")
+var errUnimplemented = errString("ovvs: cgo path not built")
 
 type errString string
 

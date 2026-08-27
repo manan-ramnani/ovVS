@@ -1,7 +1,7 @@
-/* SHAVE-portable scalar kernel compiled into libiovs (host + future npu_compiler). */
-#include "iovs_shave.h"
+/* SHAVE-portable scalar kernel compiled into libovvs (host + future npu_compiler). */
+#include "ovvs_shave.h"
 
-void iovs_shave_topk_smallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,
+void ovvs_shave_topk_smallest(const float* scores, int32_t cols, int32_t k, int32_t* idx,
                               float* val) {
   for (int32_t t = 0; t < k; ++t) {
     int32_t best = -1;

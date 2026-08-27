@@ -1,4 +1,4 @@
-package ai.iovs;
+package ai.ovvs;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -8,14 +8,14 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 
-/** JDK 21 FFM binding over libiovs. Set IOVS_LIBRARY to the DLL/so path. */
-public final class IoVS {
-  private IoVS() {}
+/** JDK 21 FFM binding over libovvs. Set OVVS_LIBRARY to the DLL/so path. */
+public final class OvVS {
+  private OvVS() {}
 
   private static SymbolLookup lookup() {
-    String lib = System.getenv("IOVS_LIBRARY");
+    String lib = System.getenv("OVVS_LIBRARY");
     if (lib == null || lib.isEmpty()) {
-      throw new IllegalStateException("IOVS_LIBRARY is not set");
+      throw new IllegalStateException("OVVS_LIBRARY is not set");
     }
     Path p = Path.of(lib).toAbsolutePath();
     Path dir = p.getParent();
@@ -32,7 +32,7 @@ public final class IoVS {
       var mh =
           Linker.nativeLinker()
               .downcallHandle(
-                  lookup().find("iovsGetVersion").orElseThrow(),
+                  lookup().find("ovvsGetVersion").orElseThrow(),
                   FunctionDescriptor.of(ValueLayout.ADDRESS));
       MemorySegment s = (MemorySegment) mh.invoke();
       return s.reinterpret(64).getUtf8String(0);
@@ -47,15 +47,15 @@ public final class IoVS {
     try (Arena arena = Arena.ofConfined()) {
       var create =
           linker.downcallHandle(
-              lu.find("iovsResourcesCreate").orElseThrow(),
+              lu.find("ovvsResourcesCreate").orElseThrow(),
               FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
       var destroy =
           linker.downcallHandle(
-              lu.find("iovsResourcesDestroy").orElseThrow(),
+              lu.find("ovvsResourcesDestroy").orElseThrow(),
               FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
       var build =
           linker.downcallHandle(
-              lu.find("iovsBruteForceBuild").orElseThrow(),
+              lu.find("ovvsBruteForceBuild").orElseThrow(),
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT,
                   ValueLayout.ADDRESS,
@@ -66,7 +66,7 @@ public final class IoVS {
                   ValueLayout.ADDRESS));
       var search =
           linker.downcallHandle(
-              lu.find("iovsBruteForceSearch").orElseThrow(),
+              lu.find("ovvsBruteForceSearch").orElseThrow(),
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT,
                   ValueLayout.ADDRESS,
@@ -79,7 +79,7 @@ public final class IoVS {
                   ValueLayout.ADDRESS));
       var bfd =
           linker.downcallHandle(
-              lu.find("iovsBruteForceDestroy").orElseThrow(),
+              lu.find("ovvsBruteForceDestroy").orElseThrow(),
               FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
       MemorySegment resPtr = arena.allocate(ValueLayout.ADDRESS);
       int st = (int) create.invoke(resPtr);
@@ -113,15 +113,15 @@ public final class IoVS {
     try (Arena arena = Arena.ofConfined()) {
       var create =
           linker.downcallHandle(
-              lu.find("iovsResourcesCreate").orElseThrow(),
+              lu.find("ovvsResourcesCreate").orElseThrow(),
               FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
       var destroy =
           linker.downcallHandle(
-              lu.find("iovsResourcesDestroy").orElseThrow(),
+              lu.find("ovvsResourcesDestroy").orElseThrow(),
               FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
       var fit =
           linker.downcallHandle(
-              lu.find("iovsKMeansFit").orElseThrow(),
+              lu.find("ovvsKMeansFit").orElseThrow(),
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT,
                   ValueLayout.ADDRESS,
@@ -133,7 +133,7 @@ public final class IoVS {
                   ValueLayout.ADDRESS));
       var pred =
           linker.downcallHandle(
-              lu.find("iovsKMeansPredict").orElseThrow(),
+              lu.find("ovvsKMeansPredict").orElseThrow(),
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT,
                   ValueLayout.ADDRESS,
@@ -144,7 +144,7 @@ public final class IoVS {
                   ValueLayout.ADDRESS));
       var kmd =
           linker.downcallHandle(
-              lu.find("iovsKMeansDestroy").orElseThrow(),
+              lu.find("ovvsKMeansDestroy").orElseThrow(),
               FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
       MemorySegment resPtr = arena.allocate(ValueLayout.ADDRESS);
       int st = (int) create.invoke(resPtr);

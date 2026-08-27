@@ -1,10 +1,13 @@
 #include "internal.hpp"
 
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
 #include <openvino/openvino.hpp>
 #include <openvino/op/abs.hpp>
 #include <openvino/op/convert.hpp>
+#include <openvino/op/fake_quantize.hpp>
 #include <openvino/op/gather.hpp>
+#include <openvino/op/multiply.hpp>
+#include <openvino/op/negative.hpp>
 #include <openvino/op/greater_eq.hpp>
 #include <openvino/op/logical_xor.hpp>
 #include <openvino/op/power.hpp>
@@ -15,14 +18,18 @@
 #include <openvino/opsets/opset8.hpp>
 #endif
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
 static ov::Core& ov_core() {
   static ov::Core& core = *new ov::Core();
   return core;
@@ -31,7 +38,7 @@ static ov::Core& ov_core() {
 #endif
 
 static bool ov_has_device(const char* name) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   try {
     for (const auto& d : ov_core().get_available_devices()) {
       if (d == name || d.rfind(name, 0) == 0) return true;
@@ -47,7 +54,7 @@ static bool ov_has_device(const char* name) {
 bool ov_device_available(const char* name) { return ov_has_device(name); }
 
 bool npu_available() {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   return ov_has_device("NPU");
 #else
   return false;
@@ -56,7 +63,7 @@ bool npu_available() {
 
 bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float* b, float* c,
                int64_t m, int64_t n, int64_t k, bool trans_b) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device(device)) return false;
   try {
     using namespace ov;
@@ -106,22 +113,214 @@ bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float
 #endif
 }
 
-bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-              int64_t k, bool trans_b) {
-  if (ov_matmul(r, "NPU", a, b, c, m, n, k, trans_b)) return true;
-  /* HostCompile tiles: static M=256 blobs over a dynamic leading dimension. */
+#if defined(OVVS_WITH_OPENVINO)
+static const char* compute_tag(ovvsDType d) {
+  switch (d) {
+    case OVVS_DTYPE_F16:
+      return "f16";
+    case OVVS_DTYPE_I8:
+      return "i8";
+    case OVVS_DTYPE_F8E4M3:
+      return "f8e4m3";
+    case OVVS_DTYPE_F8E5M2:
+      return "f8e5m2";
+    case OVVS_DTYPE_F4E2M1:
+      return "f4e2m1";
+    default:
+      return "f32";
+  }
+}
+
+static ov::element::Type ov_compute_type(ovvsDType d) {
+  using ov::element::Type;
+  switch (d) {
+    case OVVS_DTYPE_F16:
+      return ov::element::f16;
+    case OVVS_DTYPE_I8:
+      return ov::element::i8;
+    case OVVS_DTYPE_F8E4M3:
+      return ov::element::f8e4m3;
+    case OVVS_DTYPE_F8E5M2:
+      return ov::element::f8e5m2;
+    case OVVS_DTYPE_F4E2M1:
+      return ov::element::f4e2m1;
+    default:
+      return ov::element::f32;
+  }
+}
+
+static float max_abs(const float* p, int64_t n) {
+  float m = 0.f;
+  for (int64_t i = 0; i < n; ++i) {
+    const float a = std::fabs(p[i]);
+    if (a > m) m = a;
+  }
+  return m;
+}
+
+#endif
+
+bool ov_matmul_compute(ResourcesData& r, const char* device, ovvsDType compute, const float* a,
+                       const float* b, float* c, int64_t m, int64_t n, int64_t k, bool trans_b) {
+  if (compute == OVVS_DTYPE_F32 || compute == OVVS_DTYPE_U8) {
+    const bool ok = ov_matmul(r, device, a, b, c, m, n, k, trans_b);
+    if (ok) r.last_compute_dtype = OVVS_DTYPE_F32;
+    return ok;
+  }
+#if defined(OVVS_WITH_OPENVINO)
+  if (!ov_has_device(device)) return false;
+  try {
+    using namespace ov;
+    const Shape sa{static_cast<size_t>(m), static_cast<size_t>(k)};
+    const Shape sb = trans_b ? Shape{static_cast<size_t>(n), static_cast<size_t>(k)}
+                             : Shape{static_cast<size_t>(k), static_cast<size_t>(n)};
+    const Shape scs{static_cast<size_t>(m), static_cast<size_t>(n)};
+    std::ostringstream key;
+    key << device << "_gemm_" << compute_tag(compute) << "_m" << m << "_n" << n << "_k" << k << "_tb"
+        << int(trans_b);
+    static auto& cache = *new std::unordered_map<std::string, CompiledModel>();
+    auto it = cache.find(key.str());
+    const bool i8 = compute == OVVS_DTYPE_I8;
+    if (it == cache.end()) {
+      if (i8) {
+        /* NPU MatMul rejects raw si8; FakeQuantize marks u8/i8 so the compiler emits SRAM INT8 GEMM. */
+        auto pA = std::make_shared<opset8::Parameter>(element::f32, sa);
+        auto pB = std::make_shared<opset8::Parameter>(element::f32, sb);
+        auto pRa = std::make_shared<opset8::Parameter>(element::f32, Shape{1});
+        auto pRb = std::make_shared<opset8::Parameter>(element::f32, Shape{1});
+        auto loA = std::make_shared<opset8::Negative>(pRa);
+        auto loB = std::make_shared<opset8::Negative>(pRb);
+        auto fqA = std::make_shared<opset8::FakeQuantize>(pA, loA, pRa, loA, pRa, 256);
+        auto fqB = std::make_shared<opset8::FakeQuantize>(pB, loB, pRb, loB, pRb, 256);
+        auto mm = std::make_shared<opset8::MatMul>(fqA, fqB, false, trans_b);
+        auto model = std::make_shared<Model>(OutputVector{mm}, ParameterVector{pA, pB, pRa, pRb});
+        cache[key.str()] = ov_core().compile_model(model, device);
+      } else {
+        auto pA = std::make_shared<opset8::Parameter>(element::f32, sa);
+        auto pB = std::make_shared<opset8::Parameter>(element::f32, sb);
+        const auto et = ov_compute_type(compute);
+        auto a_c = std::make_shared<opset8::Convert>(pA, et);
+        auto b_c = std::make_shared<opset8::Convert>(pB, et);
+        auto mm = std::make_shared<opset8::MatMul>(a_c, b_c, false, trans_b);
+        auto out = std::make_shared<opset8::Convert>(mm, element::f32);
+        auto model = std::make_shared<Model>(OutputVector{out}, ParameterVector{pA, pB});
+        cache[key.str()] = ov_core().compile_model(model, device);
+      }
+      it = cache.find(key.str());
+    }
+    auto req = it->second.create_infer_request();
+    if (i8) {
+      const int64_t na = m * k;
+      const int64_t nb = trans_b ? n * k : k * n;
+      float ra = std::max(max_abs(a, na), 1e-8f);
+      float rb = std::max(max_abs(b, nb), 1e-8f);
+      Tensor tA(element::f32, sa, const_cast<float*>(a));
+      Tensor tB(element::f32, sb, const_cast<float*>(b));
+      Tensor tRa(element::f32, Shape{1}, &ra);
+      Tensor tRb(element::f32, Shape{1}, &rb);
+      Tensor tC(element::f32, scs, c);
+      req.set_input_tensor(0, tA);
+      req.set_input_tensor(1, tB);
+      req.set_input_tensor(2, tRa);
+      req.set_input_tensor(3, tRb);
+      req.set_output_tensor(tC);
+      req.infer();
+    } else {
+      Tensor tA(element::f32, sa, const_cast<float*>(a));
+      Tensor tB(element::f32, sb, const_cast<float*>(b));
+      Tensor tC(element::f32, scs, c);
+      req.set_input_tensor(0, tA);
+      req.set_input_tensor(1, tB);
+      req.set_output_tensor(tC);
+      req.infer();
+    }
+    r.last_compute_dtype = compute;
+    return true;
+  } catch (...) {
+    ++r.npu_compile_fails;
+    return false;
+  }
+#else
+  (void)r;
+  (void)device;
+  (void)compute;
+  (void)a;
+  (void)b;
+  (void)c;
+  (void)m;
+  (void)n;
+  (void)k;
+  (void)trans_b;
+  return false;
+#endif
+}
+
+bool npu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const float* b, float* c,
+                      int64_t m, int64_t n, int64_t k, bool trans_b) {
+  if (ov_matmul_compute(r, "NPU", compute, a, b, c, m, n, k, trans_b)) return true;
   constexpr int64_t kTile = 256;
   if (m <= kTile) return false;
   for (int64_t i = 0; i < m; i += kTile) {
     const int64_t rows = std::min(kTile, m - i);
-    if (!ov_matmul(r, "NPU", a + i * k, b, c + i * n, rows, n, k, trans_b)) return false;
+    if (!ov_matmul_compute(r, "NPU", compute, a + i * k, b, c + i * n, rows, n, k, trans_b)) return false;
   }
   return true;
 }
 
+bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
+              int64_t k, bool trans_b) {
+  const bool large = (m * n * k) >= (64LL * 64LL * 32LL);
+  if (large && npu_gemm_compute(r, OVVS_DTYPE_F16, a, b, c, m, n, k, trans_b)) return true;
+  if (npu_gemm_compute(r, OVVS_DTYPE_F32, a, b, c, m, n, k, trans_b)) return true;
+  return false;
+}
+
+#if defined(OVVS_WITH_OPENVINO)
+static bool try_compile_lowbit(const char* device, ovvsDType compute) {
+  ResourcesData tmp;
+  const float a[16] = {0.1f, 0.2f, -0.3f, 0.4f, 0.5f, -0.1f, 0.2f, 0.3f,
+                       0.0f, 0.1f, 0.2f, -0.2f, 0.3f, 0.1f, -0.4f, 0.2f};
+  const float b[16] = {0.2f, -0.1f, 0.3f, 0.1f, 0.0f, 0.4f, -0.2f, 0.1f,
+                       0.3f, 0.2f, -0.1f, 0.2f, 0.1f, 0.0f, 0.2f, -0.3f};
+  float c[16] = {0};
+  return ov_matmul_compute(tmp, device, compute, a, b, c, 4, 4, 4, true);
+}
+#endif
+
+void append_lowbit_probe_json(std::ostringstream& o) {
+  static std::once_flag once;
+  static std::string cached;
+  std::call_once(once, [] {
+    std::ostringstream s;
+#if defined(OVVS_WITH_OPENVINO)
+    const bool npu = ov_has_device("NPU");
+    const bool gpu = ov_has_device("GPU");
+    auto one = [&](const char* dev, bool present, ovvsDType dt) {
+      if (!present) return std::string("absent");
+      return try_compile_lowbit(dev, dt) ? std::string("ok") : std::string("compile_fail");
+    };
+    s << "  \"npu_matmul_f16\": \"" << one("NPU", npu, OVVS_DTYPE_F16) << "\",\n";
+    s << "  \"npu_matmul_i8\": \"" << one("NPU", npu, OVVS_DTYPE_I8) << "\",\n";
+    s << "  \"npu_matmul_f8e4m3\": \"" << one("NPU", npu, OVVS_DTYPE_F8E4M3) << "\",\n";
+    s << "  \"npu_matmul_f4e2m1\": \"" << one("NPU", npu, OVVS_DTYPE_F4E2M1) << "\",\n";
+    s << "  \"gpu_matmul_f16\": \"" << one("GPU", gpu, OVVS_DTYPE_F16) << "\",\n";
+    s << "  \"gpu_matmul_i8\": \"" << one("GPU", gpu, OVVS_DTYPE_I8) << "\",\n";
+#else
+    s << "  \"npu_matmul_f16\": \"no_openvino\",\n";
+    s << "  \"npu_matmul_i8\": \"no_openvino\",\n";
+    s << "  \"npu_matmul_f8e4m3\": \"no_openvino\",\n";
+    s << "  \"npu_matmul_f4e2m1\": \"no_openvino\",\n";
+    s << "  \"gpu_matmul_f16\": \"no_openvino\",\n";
+    s << "  \"gpu_matmul_i8\": \"no_openvino\",\n";
+#endif
+    cached = s.str();
+  });
+  o << cached;
+}
+
 bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t rows, int64_t cols,
              int64_t k, int64_t* indices, float* values, bool largest) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device(device)) return false;
   k = std::min(k, cols);
   try {
@@ -180,7 +379,7 @@ bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t 
 
 bool ov_gather_rows(ResourcesData& r, const char* device, const float* src, int64_t src_rows,
                     int64_t dim, const int64_t* idx, int64_t nidx, float* out) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device(device)) return false;
   try {
     using namespace ov;
@@ -257,7 +456,7 @@ bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
 
 bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
                 int64_t ncodes, float* out) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device("NPU")) return false;
   constexpr int64_t kTile = 128;
   try {
@@ -315,11 +514,11 @@ bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
 #endif
 }
 
-bool ov_pairwise_npu(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+bool ov_pairwise_npu(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                      int64_t ny, int64_t dim, float* out, float metric_arg) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device("NPU")) return false;
-  if (metric != IOVS_METRIC_BITWISE_HAMMING && metric != IOVS_METRIC_LP_UNEXPANDED) return false;
+  if (metric != OVVS_METRIC_BITWISE_HAMMING && metric != OVVS_METRIC_LP_UNEXPANDED) return false;
   try {
     using namespace ov;
     const float p = metric_arg > 0.f ? metric_arg : 2.f;
@@ -338,7 +537,7 @@ bool ov_pairwise_npu(ResourcesData& r, iovsMetric metric, const float* x, int64_
       auto y3 = std::make_shared<ov::op::v0::Unsqueeze>(pY, uns0);
       auto axes = opset8::Constant::create(element::i64, Shape{1}, {2});
       std::shared_ptr<ov::Node> scores;
-      if (metric == IOVS_METRIC_BITWISE_HAMMING) {
+      if (metric == OVVS_METRIC_BITWISE_HAMMING) {
         auto zero = opset8::Constant::create(element::f32, Shape{}, {0.f});
         auto bx = std::make_shared<ov::op::v1::GreaterEqual>(x3, zero);
         auto by = std::make_shared<ov::op::v1::GreaterEqual>(y3, zero);
@@ -387,7 +586,7 @@ bool ov_pairwise_npu(ResourcesData& r, iovsMetric metric, const float* x, int64_
 #endif
 }
 
-bool npu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+bool npu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg) {
   if (ov_pairwise_npu(r, metric, x, nx, y, ny, dim, out, metric_arg)) return true;
   constexpr int64_t kTile = 32;
@@ -401,7 +600,7 @@ bool npu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t n
 
 bool npu_shave_profile_adc(int* shave_tasks, int* dpu_tasks, std::vector<uint8_t>* blob,
                            std::string* exec_types) {
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device("NPU")) return false;
   try {
     using namespace ov;
@@ -457,4 +656,4 @@ bool npu_shave_profile_adc(int* shave_tasks, int* dpu_tasks, std::vector<uint8_t
 }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs

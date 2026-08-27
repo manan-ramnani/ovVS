@@ -1,26 +1,26 @@
-#include "iovs/iovs.h"
+#include "ovvs/ovvs.h"
 
-const char* iovsGetVersion(void) { return IOVS_VERSION_STRING; }
+const char* ovvsGetVersion(void) { return OVVS_VERSION_STRING; }
 
-const char* iovsStatusString(iovsStatus status) {
+const char* ovvsStatusString(ovvsStatus status) {
   switch (status) {
-    case IOVS_STATUS_SUCCESS:
+    case OVVS_STATUS_SUCCESS:
       return "success";
-    case IOVS_STATUS_ERROR:
+    case OVVS_STATUS_ERROR:
       return "error";
-    case IOVS_STATUS_INVALID_ARGUMENT:
+    case OVVS_STATUS_INVALID_ARGUMENT:
       return "invalid argument";
-    case IOVS_STATUS_UNSUPPORTED:
+    case OVVS_STATUS_UNSUPPORTED:
       return "unsupported";
-    case IOVS_STATUS_OOM:
+    case OVVS_STATUS_OOM:
       return "out of memory";
-    case IOVS_STATUS_COMPILE_FAIL:
+    case OVVS_STATUS_COMPILE_FAIL:
       return "compile fail";
-    case IOVS_STATUS_SHAPE_MISMATCH:
+    case OVVS_STATUS_SHAPE_MISMATCH:
       return "shape mismatch";
-    case IOVS_STATUS_DEVICE_UNAVAILABLE:
+    case OVVS_STATUS_DEVICE_UNAVAILABLE:
       return "device unavailable";
-    case IOVS_STATUS_IO:
+    case OVVS_STATUS_IO:
       return "io error";
     default:
       return "unknown";

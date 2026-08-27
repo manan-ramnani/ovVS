@@ -1,7 +1,7 @@
-#include "iovs/iovs.h"
+#include "ovvs/ovvs.h"
 #include <stdio.h>
 
 int main(void) {
-  printf("ioVS %s\n", iovsGetVersion());
+  printf("ovVS %s\n", ovvsGetVersion());
   return 0;
 }

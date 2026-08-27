@@ -14,7 +14,7 @@ SIFT_URL = "http://ann-benchmarks.com/sift-128-euclidean.hdf5"
 
 
 def main() -> int:
-    print("ioVS dataset kit")
+    print("ovVS dataset kit")
     print(f"target: {ROOT}")
     marker = ROOT / "README.txt"
     marker.write_text(
@@ -28,7 +28,7 @@ def main() -> int:
         return 0
     print(f"fetch {SIFT_URL}")
     try:
-        req = urllib.request.Request(SIFT_URL, headers={"User-Agent": "ioVS-fetch/0.2"})
+        req = urllib.request.Request(SIFT_URL, headers={"User-Agent": "ovVS-fetch/0.2"})
         with urllib.request.urlopen(req, timeout=60) as r, dest.open("wb") as f:
             while True:
                 chunk = r.read(1 << 20)

@@ -1,10 +1,10 @@
-use iovs::Lib;
+use ovvs::Lib;
 use std::path::PathBuf;
 
 fn main() {
-    let path = std::env::var("IOVS_LIBRARY").unwrap_or_else(|_| {
+    let path = std::env::var("OVVS_LIBRARY").unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../build/bin/iovs.dll")
+            .join("../build/bin/ovvs.dll")
             .to_string_lossy()
             .into_owned()
     });

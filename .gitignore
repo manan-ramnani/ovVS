@@ -27,7 +27,7 @@ compile_commands.json
 
 # Rust / Go / Java build
 /rust/target/
-/go/iovs.test.exe
+/go/ovvs.test.exe
 *.class
 
 # Python
@@ -46,7 +46,7 @@ dist/
 /data/
 /.cache/
 *.bin
-*.iovs
+*.ovvs
 *.blob
 
 # Keep checked-in bakeoff JSON

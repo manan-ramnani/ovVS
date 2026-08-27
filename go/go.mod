@@ -1,3 +1,3 @@
-module github.com/iovs/iovs
+module github.com/manan-ramnani/ovVS
 
 go 1.22

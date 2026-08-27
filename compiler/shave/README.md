@@ -5,7 +5,7 @@ Intel documents SHAVE as the DSP next to the MAC array. Custom unsigned ELF is
 
 ## What runs on silicon today
 
-OpenVINO NPU compile of Gather+ReduceSum (ioVS PQ ADC) lowers to Intel's
+OpenVINO NPU compile of Gather+ReduceSum (ovVS PQ ADC) lowers to Intel's
 prebuilt ActShave kernels (`gather.3720xx.elf`, `reduce_sum.3720xx.elf` in
 `npu_compiler/sw_runtime_kernels`). Profiling (`PERF_COUNT`):
 
@@ -16,7 +16,7 @@ prebuilt ActShave kernels (`gather.3720xx.elf`, `reduce_sum.3720xx.elf` in
 
 The driver does **not** load those ELF32 files as graphs. The compiler copies
 `.text` into a graph ELF64 blob (`.text.KernelText`, `.text.ActKernelInvocations`)
-and firmware runs that blob. `iovs_probe` reports `shave_silicon_load: compiler_actshave`.
+and firmware runs that blob. `ovvs_probe` reports `shave_silicon_load: compiler_actshave`.
 
 ## What does not work (tried)
 

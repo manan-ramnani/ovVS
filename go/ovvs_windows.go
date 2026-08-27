@@ -1,6 +1,6 @@
 //go:build windows
 
-package iovs
+package ovvs
 
 import (
 	"errors"
@@ -9,17 +9,17 @@ import (
 )
 
 var (
-	mod         = syscall.NewLazyDLL("iovs.dll")
-	procVer     = mod.NewProc("iovsGetVersion")
-	procCre     = mod.NewProc("iovsResourcesCreate")
-	procDes     = mod.NewProc("iovsResourcesDestroy")
-	procGemm    = mod.NewProc("iovsGemm")
-	procBfBuild = mod.NewProc("iovsBruteForceBuild")
-	procBfSearch = mod.NewProc("iovsBruteForceSearch")
-	procBfDes   = mod.NewProc("iovsBruteForceDestroy")
-	procKmFit   = mod.NewProc("iovsKMeansFit")
-	procKmPred  = mod.NewProc("iovsKMeansPredict")
-	procKmDes   = mod.NewProc("iovsKMeansDestroy")
+	mod         = syscall.NewLazyDLL("ovvs.dll")
+	procVer     = mod.NewProc("ovvsGetVersion")
+	procCre     = mod.NewProc("ovvsResourcesCreate")
+	procDes     = mod.NewProc("ovvsResourcesDestroy")
+	procGemm    = mod.NewProc("ovvsGemm")
+	procBfBuild = mod.NewProc("ovvsBruteForceBuild")
+	procBfSearch = mod.NewProc("ovvsBruteForceSearch")
+	procBfDes   = mod.NewProc("ovvsBruteForceDestroy")
+	procKmFit   = mod.NewProc("ovvsKMeansFit")
+	procKmPred  = mod.NewProc("ovvsKMeansPredict")
+	procKmDes   = mod.NewProc("ovvsKMeansDestroy")
 )
 
 func windowsCString(p uintptr) string {

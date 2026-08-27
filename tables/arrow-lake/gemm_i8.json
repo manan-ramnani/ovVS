@@ -1,0 +1,14 @@
+{
+  "sku": "arrow-lake",
+  "op": "gemm-i8",
+  "shape": [100000, 32, 768],
+  "npu": true,
+  "gpu": true,
+  "sycl": true,
+  "runs": [
+    {"requested": "cpu", "last_device": "cpu", "ms": 203.4551, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 310.7626, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 662.0309, "status": "success"}
+  ],
+  "note": "FakeQuantize-marked INT8 MatMul (NPU rejects raw si8). Probe npu_matmul_i8=ok. At 1e5x32x768 FQ+INT8 is slower than FP16/FP32 NPU (311 vs 132/117 ms); launch/quant tax. Keep the path for SKUs where INT8 MAC wins."
+}

@@ -359,7 +359,7 @@ std::string silicon_evidence_fields() {
   int shave_n = 0, dpu_n = 0;
   std::vector<uint8_t> blob;
   std::string exec;
-  const bool ran = iovs::impl::npu_shave_profile_adc(&shave_n, &dpu_n, &blob, &exec);
+  const bool ran = ovvs::impl::npu_shave_profile_adc(&shave_n, &dpu_n, &blob, &exec);
   std::vector<uint8_t> signed_bytes;
   const std::string signed_path = find_signed_elf();
   if (!signed_path.empty()) {
@@ -534,7 +534,7 @@ std::string build_shave_probe() {
 
 }  // namespace
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
 void append_shave_elf_probe_json(std::ostringstream& o) {
@@ -545,4 +545,4 @@ void append_shave_elf_probe_json(std::ostringstream& o) {
 }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs

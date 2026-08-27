@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 
 fn main() {
-    let dll = std::env::var("IOVS_LIBRARY").unwrap_or_else(|_| {
+    let dll = std::env::var("OVVS_LIBRARY").unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("build-icpx")
             .join("bin")
-            .join("iovs.dll")
+            .join("ovvs.dll")
             .to_string_lossy()
             .into_owned()
     });
-    let lib = iovs::Lib::load(std::path::Path::new(&dll)).expect("load");
+    let lib = ovvs::Lib::load(std::path::Path::new(&dll)).expect("load");
     let n: i64 = 20;
     let dim: i64 = 4;
     let mut data = vec![0f32; (n * dim) as usize];

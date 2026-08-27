@@ -1,4 +1,4 @@
-#include "iovs/iovs.h"
+#include "ovvs/ovvs.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -14,8 +14,8 @@ static float l2sq(const float* a, const float* b, int64_t d) {
 }
 
 int main(void) {
-  iovsResources_t res = NULL;
-  if (iovsResourcesCreate(&res) != IOVS_STATUS_SUCCESS) {
+  ovvsResources_t res = NULL;
+  if (ovvsResourcesCreate(&res) != OVVS_STATUS_SUCCESS) {
     fprintf(stderr, "create failed\n");
     return 1;
   }
@@ -24,14 +24,14 @@ int main(void) {
   float q[4] = {0.1f, -0.2f, 0.3f, 0.0f};
   for (int64_t i = 0; i < n * dim; ++i) data[i] = ((i * 17) % 100) / 50.f - 1.f;
 
-  iovsBruteForceIndex_t ix = NULL;
-  if (iovsBruteForceBuild(res, data, n, dim, IOVS_METRIC_L2_EXPANDED, &ix) != IOVS_STATUS_SUCCESS) {
+  ovvsBruteForceIndex_t ix = NULL;
+  if (ovvsBruteForceBuild(res, data, n, dim, OVVS_METRIC_L2_EXPANDED, &ix) != OVVS_STATUS_SUCCESS) {
     fprintf(stderr, "build failed\n");
     return 1;
   }
   int64_t nb[3];
   float ds[3];
-  if (iovsBruteForceSearch(res, ix, q, 1, k, NULL, nb, ds) != IOVS_STATUS_SUCCESS) {
+  if (ovvsBruteForceSearch(res, ix, q, 1, k, NULL, nb, ds) != OVVS_STATUS_SUCCESS) {
     fprintf(stderr, "search failed\n");
     return 1;
   }
@@ -61,8 +61,8 @@ int main(void) {
     }
   }
   printf("consumer ok neighbors=%lld,%lld,%lld version=%s\n", (long long)nb[0], (long long)nb[1],
-         (long long)nb[2], iovsGetVersion());
-  iovsBruteForceDestroy(ix);
-  iovsResourcesDestroy(res);
+         (long long)nb[2], ovvsGetVersion());
+  ovvsBruteForceDestroy(ix);
+  ovvsResourcesDestroy(res);
   return 0;
 }

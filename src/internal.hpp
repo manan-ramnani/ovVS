@@ -1,6 +1,6 @@
 #pragma once
 
-#include "iovs/iovs.h"
+#include "ovvs/ovvs.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,14 +30,14 @@
 #include <unistd.h>
 #endif
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
 constexpr float kInf = std::numeric_limits<float>::infinity();
 
 /* Pairwise scores are always distances (smaller is better): L2, -IP, 1-cos, Hamming.
    Search must take the minimum. INNER_PRODUCT is converted back to +IP after topk. */
-inline bool metric_largest(iovsMetric) { return false; }
+inline bool metric_largest(ovvsMetric) { return false; }
 
 inline float l2sq(const float* a, const float* b, int64_t d) {
   float s = 0.f;
@@ -73,21 +73,21 @@ inline int hamming_u8(const uint8_t* a, const uint8_t* b, int64_t nbytes) {
   return s;
 }
 
-inline float distance_one(iovsMetric metric, const float* x, const float* y, int64_t d,
+inline float distance_one(ovvsMetric metric, const float* x, const float* y, int64_t d,
                           float metric_arg) {
   switch (metric) {
-    case IOVS_METRIC_L2_EXPANDED:
+    case OVVS_METRIC_L2_EXPANDED:
       return l2sq(x, y, d);
-    case IOVS_METRIC_L2_SQRT_EXPANDED:
+    case OVVS_METRIC_L2_SQRT_EXPANDED:
       return std::sqrt(l2sq(x, y, d));
-    case IOVS_METRIC_INNER_PRODUCT:
+    case OVVS_METRIC_INNER_PRODUCT:
       return -dot(x, y, d);
-    case IOVS_METRIC_COSINE_EXPANDED: {
+    case OVVS_METRIC_COSINE_EXPANDED: {
       const float nx = std::sqrt(std::max(nrm2sq(x, d), 1e-12f));
       const float ny = std::sqrt(std::max(nrm2sq(y, d), 1e-12f));
       return 1.f - dot(x, y, d) / (nx * ny);
     }
-    case IOVS_METRIC_BITWISE_HAMMING: {
+    case OVVS_METRIC_BITWISE_HAMMING: {
       int s = 0;
       for (int64_t i = 0; i < d; ++i) {
         const uint32_t ax = static_cast<uint32_t>(x[i] >= 0.f);
@@ -96,7 +96,7 @@ inline float distance_one(iovsMetric metric, const float* x, const float* y, int
       }
       return static_cast<float>(s);
     }
-    case IOVS_METRIC_LP_UNEXPANDED: {
+    case OVVS_METRIC_LP_UNEXPANDED: {
       const float p = metric_arg > 0.f ? metric_arg : 2.f;
       float s = 0.f;
       for (int64_t i = 0; i < d; ++i) s += std::pow(std::fabs(x[i] - y[i]), p);
@@ -113,16 +113,17 @@ inline bool allowed(const uint8_t* bitset, int64_t i) {
 }
 
 struct MixerDecision {
-  iovsDevice device = IOVS_DEVICE_CPU;
+  ovvsDevice device = OVVS_DEVICE_CPU;
   bool npu_attempted = false;
   bool npu_failed = false;
 };
 
 struct ResourcesData {
-  iovsPolicy policy = IOVS_POLICY_AUTO;
+  ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
   bool gpu_available = false;
-  iovsDevice last_device = IOVS_DEVICE_CPU;
+  ovvsDevice last_device = OVVS_DEVICE_CPU;
+  ovvsDType last_compute_dtype = OVVS_DTYPE_F32;
   std::string sku = "generic-cpu";
   std::string npu_name;
   std::string gpu_name;
@@ -130,7 +131,7 @@ struct ResourcesData {
   int32_t npu_compile_fails = 0;
   int32_t npu_fallbacks = 0;
   bool npu_busy = false;
-  iovsDevice large_gemm_winner = IOVS_DEVICE_AUTO;
+  ovvsDevice large_gemm_winner = OVVS_DEVICE_AUTO;
   int64_t large_gemm_flops = 100000LL * 32LL * 768LL;
   std::vector<float> scratch;
 
@@ -140,7 +141,7 @@ struct ResourcesData {
   }
 };
 
-inline ResourcesData* rd(iovsResources_t r) { return reinterpret_cast<ResourcesData*>(r); }
+inline ResourcesData* rd(ovvsResources_t r) { return reinterpret_cast<ResourcesData*>(r); }
 
 void probe_fill(ResourcesData& r);
 std::string probe_json();
@@ -150,9 +151,9 @@ bool npu_shave_profile_adc(int* shave_tasks, int* dpu_tasks, std::vector<uint8_t
                            std::string* exec_types);
 
 /* Shared USM (SYCL) or heap. Dataset/graph vectors use UsmAllocator so iGPU binds these pointers. */
-void* iovs_usm_malloc(size_t bytes);
-void iovs_usm_free(void* p);
-bool iovs_usm_is_shared(const void* p);
+void* ovvs_usm_malloc(size_t bytes);
+void ovvs_usm_free(void* p);
+bool ovvs_usm_is_shared(const void* p);
 
 template <typename T>
 struct UsmAllocator {
@@ -164,11 +165,11 @@ struct UsmAllocator {
   template <typename U>
   UsmAllocator(const UsmAllocator<U>&) noexcept {}
   T* allocate(std::size_t n) {
-    void* p = iovs_usm_malloc(n == 0 ? sizeof(T) : n * sizeof(T));
+    void* p = ovvs_usm_malloc(n == 0 ? sizeof(T) : n * sizeof(T));
     if (!p) throw std::bad_alloc();
     return static_cast<T*>(p);
   }
-  void deallocate(T* p, std::size_t) noexcept { iovs_usm_free(p); }
+  void deallocate(T* p, std::size_t) noexcept { ovvs_usm_free(p); }
   template <typename U>
   bool operator==(const UsmAllocator<U>&) const noexcept {
     return true;
@@ -188,30 +189,37 @@ bool gpu_available();
 bool ov_device_available(const char* name);
 bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float* b, float* c,
                int64_t m, int64_t n, int64_t k, bool trans_b);
+bool ov_matmul_compute(ResourcesData& r, const char* device, ovvsDType compute, const float* a,
+                       const float* b, float* c, int64_t m, int64_t n, int64_t k, bool trans_b);
+void append_lowbit_probe_json(std::ostringstream& o);
 bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t rows, int64_t cols,
              int64_t k, int64_t* indices, float* values, bool largest);
 bool ov_gather_rows(ResourcesData& r, const char* device, const float* src, int64_t src_rows,
                     int64_t dim, const int64_t* idx, int64_t nidx, float* out);
 bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b);
+bool npu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const float* b, float* c,
+                      int64_t m, int64_t n, int64_t k, bool trans_b);
 bool npu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
               int64_t* indices, float* values, bool largest);
 bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out);
 bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b);
+bool gpu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const float* b, float* c,
+                      int64_t m, int64_t n, int64_t k, bool trans_b);
 bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
               int64_t* indices, float* values, bool largest);
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out);
 bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n);
-bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, iovsMetric metric,
+bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances);
-bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg);
-bool npu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+bool npu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg);
 bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
                 int64_t ncodes, float* out);
@@ -225,23 +233,25 @@ void cpu_topk(const float* scores, int64_t rows, int64_t cols, int64_t k, int64_
               float* values, bool largest);
 void cpu_gather_rows(const float* src, int64_t src_rows, int64_t dim, const int64_t* idx,
                      int64_t nidx, float* out);
-void cpu_pairwise(iovsMetric metric, const float* x, int64_t nx, const float* y, int64_t ny,
+void cpu_pairwise(ovvsMetric metric, const float* x, int64_t nx, const float* y, int64_t ny,
                   int64_t dim, float* out, float metric_arg);
 
-iovsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elems);
+ovvsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elems);
 
-iovsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
+ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
                      int64_t k, bool trans_b);
-iovsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
+ovvsStatus prim_gemm_compute(ResourcesData& r, const float* a, const float* b, float* c, int64_t m,
+                             int64_t n, int64_t k, bool trans_b, ovvsDType compute);
+ovvsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
                      int64_t* indices, float* values, bool largest);
-iovsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
+ovvsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                             const int64_t* idx, int64_t nidx, float* out);
-iovsStatus prim_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx,
+ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx,
                          const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
-iovsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
+ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
                        const uint8_t* codes, int64_t ncodes, float* out);
-iovsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
-                           iovsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
+ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                           ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances);
 
@@ -296,19 +306,19 @@ inline uint16_t f32_to_f16(float f) {
 }
 
 template <typename FloatVec>
-inline void convert_to_f32(iovsDType dtype, const void* src, int64_t n, int64_t dim, FloatVec& out) {
+inline void convert_to_f32(ovvsDType dtype, const void* src, int64_t n, int64_t dim, FloatVec& out) {
   const int64_t cells = n * dim;
   out.resize(static_cast<size_t>(cells));
-  if (dtype == IOVS_DTYPE_F32) {
+  if (dtype == OVVS_DTYPE_F32) {
     std::memcpy(out.data(), src, static_cast<size_t>(cells) * sizeof(float));
     return;
   }
-  if (dtype == IOVS_DTYPE_F16) {
+  if (dtype == OVVS_DTYPE_F16) {
     const auto* h = static_cast<const uint16_t*>(src);
     for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = f16_to_f32(h[i]);
     return;
   }
-  if (dtype == IOVS_DTYPE_I8) {
+  if (dtype == OVVS_DTYPE_I8) {
     const auto* p = static_cast<const int8_t*>(src);
     for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = static_cast<float>(p[i]);
     return;
@@ -317,14 +327,14 @@ inline void convert_to_f32(iovsDType dtype, const void* src, int64_t n, int64_t 
   for (int64_t i = 0; i < cells; ++i) out[static_cast<size_t>(i)] = static_cast<float>(p[i]);
 }
 
-iovsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
-                             const float* queries, int64_t nq, iovsMetric metric, int64_t k,
+ovvsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                             const float* queries, int64_t nq, ovvsMetric metric, int64_t k,
                              const uint8_t* bitset, int64_t* neighbors, float* distances);
 
 void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
                      int32_t iters, std::vector<float>& centroids);
 
-int64_t brute_force_dim(iovsBruteForceIndex_t index);
+int64_t brute_force_dim(ovvsBruteForceIndex_t index);
 
 inline uint32_t fnv1a(const void* data, size_t n) {
   const auto* p = static_cast<const uint8_t*>(data);
@@ -339,4 +349,4 @@ inline uint32_t fnv1a(const void* data, size_t n) {
 inline std::mt19937 rng_from(uint32_t seed) { return std::mt19937(seed); }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs

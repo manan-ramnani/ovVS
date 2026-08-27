@@ -13,17 +13,17 @@
 #include <windows.h>
 #endif
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
 static std::string cache_home() {
-  if (const char* e = std::getenv("IOVS_CACHE_DIR")) return e;
+  if (const char* e = std::getenv("OVVS_CACHE_DIR")) return e;
 #if defined(_WIN32)
-  if (const char* u = std::getenv("USERPROFILE")) return std::string(u) + "\\.cache\\iovs";
-  return ".cache/iovs";
+  if (const char* u = std::getenv("USERPROFILE")) return std::string(u) + "\\.cache\\ovvs";
+  return ".cache/ovvs";
 #else
-  if (const char* h = std::getenv("HOME")) return std::string(h) + "/.cache/iovs";
-  return ".cache/iovs";
+  if (const char* h = std::getenv("HOME")) return std::string(h) + "/.cache/ovvs";
+  return ".cache/ovvs";
 #endif
 }
 
@@ -78,7 +78,7 @@ static float json_run_ms(const std::string& s, const char* requested) {
 
 static std::vector<std::string> table_candidates(const std::string& sku) {
   std::vector<std::string> out;
-  if (const char* e = std::getenv("IOVS_TABLES")) {
+  if (const char* e = std::getenv("OVVS_TABLES")) {
     out.push_back(std::string(e) + "/" + sku + "/gemm_large.json");
     out.push_back(std::string(e) + "/gemm_large.json");
   }
@@ -104,20 +104,20 @@ static void load_large_gemm_table(ResourcesData& r) {
     const float npu = json_run_ms(s, "npu");
     const float gpu = json_run_ms(s, "gpu");
     float best = 1e30f;
-    iovsDevice win = IOVS_DEVICE_AUTO;
+    ovvsDevice win = OVVS_DEVICE_AUTO;
     if (cpu > 0 && cpu < best) {
       best = cpu;
-      win = IOVS_DEVICE_CPU;
+      win = OVVS_DEVICE_CPU;
     }
     if (npu > 0 && npu < best) {
       best = npu;
-      win = IOVS_DEVICE_NPU;
+      win = OVVS_DEVICE_NPU;
     }
     if (gpu > 0 && gpu < best) {
       best = gpu;
-      win = IOVS_DEVICE_GPU;
+      win = OVVS_DEVICE_GPU;
     }
-    if (win != IOVS_DEVICE_AUTO) {
+    if (win != OVVS_DEVICE_AUTO) {
       r.large_gemm_winner = win;
       return;
     }
@@ -147,14 +147,14 @@ std::string probe_json() {
   o << "  \"gpu_name\": \"" << r.gpu_name << "\",\n";
   o << "  \"cache_dir\": \"" << r.cache_dir << "\",\n";
   o << "  \"openvino_built\": "
-#if defined(IOVS_WITH_OPENVINO)
+#if defined(OVVS_WITH_OPENVINO)
     << "true"
 #else
     << "false"
 #endif
     << ",\n";
   o << "  \"sycl_built\": "
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
     << "true"
 #else
     << "false"
@@ -162,10 +162,11 @@ std::string probe_json() {
     << ",\n";
   append_energy_probe_json(o);
   append_shave_elf_probe_json(o);
-  o << "  \"version\": \"" << IOVS_VERSION_STRING << "\"\n";
+  append_lowbit_probe_json(o);
+  o << "  \"version\": \"" << OVVS_VERSION_STRING << "\"\n";
   o << "}\n";
   return o.str();
 }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs

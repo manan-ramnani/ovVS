@@ -1,4 +1,4 @@
-//! Loads libiovs at runtime and calls the C ABI.
+//! Loads libovvs at runtime and calls the C ABI.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::Path;
@@ -50,16 +50,16 @@ impl Lib {
                 }
             };
             Ok(Self {
-                version: std::mem::transmute(sym(b"iovsGetVersion\0")?),
-                create: std::mem::transmute(sym(b"iovsResourcesCreate\0")?),
-                destroy: std::mem::transmute(sym(b"iovsResourcesDestroy\0")?),
-                gemm: std::mem::transmute(sym(b"iovsGemm\0")?),
-                bf_build: std::mem::transmute(sym(b"iovsBruteForceBuild\0")?),
-                bf_search: std::mem::transmute(sym(b"iovsBruteForceSearch\0")?),
-                bf_destroy: std::mem::transmute(sym(b"iovsBruteForceDestroy\0")?),
-                km_fit: std::mem::transmute(sym(b"iovsKMeansFit\0")?),
-                km_predict: std::mem::transmute(sym(b"iovsKMeansPredict\0")?),
-                km_destroy: std::mem::transmute(sym(b"iovsKMeansDestroy\0")?),
+                version: std::mem::transmute(sym(b"ovvsGetVersion\0")?),
+                create: std::mem::transmute(sym(b"ovvsResourcesCreate\0")?),
+                destroy: std::mem::transmute(sym(b"ovvsResourcesDestroy\0")?),
+                gemm: std::mem::transmute(sym(b"ovvsGemm\0")?),
+                bf_build: std::mem::transmute(sym(b"ovvsBruteForceBuild\0")?),
+                bf_search: std::mem::transmute(sym(b"ovvsBruteForceSearch\0")?),
+                bf_destroy: std::mem::transmute(sym(b"ovvsBruteForceDestroy\0")?),
+                km_fit: std::mem::transmute(sym(b"ovvsKMeansFit\0")?),
+                km_predict: std::mem::transmute(sym(b"ovvsKMeansPredict\0")?),
+                km_destroy: std::mem::transmute(sym(b"ovvsKMeansDestroy\0")?),
             })
         }
         #[cfg(not(windows))]

@@ -218,24 +218,24 @@ int64_t read_intel_power_gadget() {
 
 }  // namespace
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
 void append_energy_probe_json(std::ostringstream& o) {
   int64_t uj = 0;
-  const iovsStatus st = iovsResourcesEnergyUj(nullptr, &uj);
+  const ovvsStatus st = ovvsResourcesEnergyUj(nullptr, &uj);
   o << "  \"energy_source\": \"" << g_energy_source << "\",\n";
   o << "  \"energy_channel\": \"" << g_energy_channel << "\",\n";
-  o << "  \"energy_uj\": " << (st == IOVS_STATUS_SUCCESS ? uj : 0) << ",\n";
-  o << "  \"energy_status\": \"" << iovsStatusString(st) << "\",\n";
+  o << "  \"energy_uj\": " << (st == OVVS_STATUS_SUCCESS ? uj : 0) << ",\n";
+  o << "  \"energy_status\": \"" << ovvsStatusString(st) << "\",\n";
 }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs
 
-iovsStatus iovsResourcesEnergyUj(iovsResources_t res, int64_t* uj) {
+ovvsStatus ovvsResourcesEnergyUj(ovvsResources_t res, int64_t* uj) {
   (void)res;
-  if (!uj) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!uj) return OVVS_STATUS_INVALID_ARGUMENT;
   int64_t v = read_rapl_sysfs();
 #ifdef _WIN32
   if (v < 0) v = read_emi_intelppm();
@@ -245,8 +245,8 @@ iovsStatus iovsResourcesEnergyUj(iovsResources_t res, int64_t* uj) {
   if (v < 0) {
     g_energy_source = "unsupported";
     *uj = 0;
-    return IOVS_STATUS_UNSUPPORTED;
+    return OVVS_STATUS_UNSUPPORTED;
   }
   *uj = v;
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }

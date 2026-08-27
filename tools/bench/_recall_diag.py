@@ -9,8 +9,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
-os.environ["IOVS_LIBRARY"] = str(ROOT / "build-icpx" / "bin" / "iovs.dll")
-import iovs as m  # noqa: E402
+os.environ["OVVS_LIBRARY"] = str(ROOT / "build-icpx" / "bin" / "ovvs.dll")
+import ovvs as m  # noqa: E402
 
 
 def rec(got, truth, nq, k):

@@ -14,14 +14,14 @@ static std::vector<TestRec>& tests() {
   return t;
 }
 
-int iovs_register_test(const char* name, void (*fn)()) {
+int ovvs_register_test(const char* name, void (*fn)()) {
   tests().push_back({name, fn});
   return 0;
 }
 
-#define IOVS_TEST(name)                                          \
+#define OVVS_TEST(name)                                          \
   static void test_##name();                                     \
-  static int reg_##name = iovs_register_test(#name, test_##name); \
+  static int reg_##name = ovvs_register_test(#name, test_##name); \
   static void test_##name()
 
 int main() {

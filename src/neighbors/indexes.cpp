@@ -1,6 +1,6 @@
 #include "internal.hpp"
 
-using namespace iovs::impl;
+using namespace ovvs::impl;
 
 namespace {
 
@@ -8,10 +8,10 @@ struct Dataset {
   UsmFloatVec x;
   int64_t n = 0;
   int64_t dim = 0;
-  iovsMetric metric = IOVS_METRIC_L2_EXPANDED;
+  ovvsMetric metric = OVVS_METRIC_L2_EXPANDED;
 };
 
-void copy_ds(Dataset& d, const float* x, int64_t n, int64_t dim, iovsMetric m) {
+void copy_ds(Dataset& d, const float* x, int64_t n, int64_t dim, ovvsMetric m) {
   d.n = n;
   d.dim = dim;
   d.metric = m;
@@ -19,7 +19,7 @@ void copy_ds(Dataset& d, const float* x, int64_t n, int64_t dim, iovsMetric m) {
 }
 
 struct BruteIndex : Dataset {
-  iovsDType dtype = IOVS_DTYPE_F32;
+  ovvsDType dtype = OVVS_DTYPE_F32;
 };
 
 struct IvfFlat {
@@ -93,54 +93,54 @@ void pq_encode(const float* x, int64_t n, int64_t dim, int32_t pq_m, int32_t ks,
 
 /* ---------------- brute ---------------- */
 
-iovsStatus iovsBruteForceBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                               iovsMetric metric, iovsBruteForceIndex_t* index) {
-  return iovsBruteForceBuildTyped(res, dataset, n, dim, metric, IOVS_DTYPE_F32, index);
+ovvsStatus ovvsBruteForceBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                               ovvsMetric metric, ovvsBruteForceIndex_t* index) {
+  return ovvsBruteForceBuildTyped(res, dataset, n, dim, metric, OVVS_DTYPE_F32, index);
 }
 
-iovsStatus iovsBruteForceBuildTyped(iovsResources_t res, const void* dataset, int64_t n, int64_t dim,
-                                    iovsMetric metric, iovsDType dtype, iovsBruteForceIndex_t* index) {
-  if (!res || !dataset || !index || n <= 0 || dim <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsBruteForceBuildTyped(ovvsResources_t res, const void* dataset, int64_t n, int64_t dim,
+                                    ovvsMetric metric, ovvsDType dtype, ovvsBruteForceIndex_t* index) {
+  if (!res || !dataset || !index || n <= 0 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = new BruteIndex();
   ix->n = n;
   ix->dim = dim;
   ix->metric = metric;
   ix->dtype = dtype;
   convert_to_f32(dtype, dataset, n, dim, ix->x);
-  *index = reinterpret_cast<iovsBruteForceIndex_t>(ix);
-  return IOVS_STATUS_SUCCESS;
+  *index = reinterpret_cast<ovvsBruteForceIndex_t>(ix);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsBruteForceSearch(iovsResources_t res, iovsBruteForceIndex_t index, const float* queries,
+ovvsStatus ovvsBruteForceSearch(ovvsResources_t res, ovvsBruteForceIndex_t index, const float* queries,
                                 int64_t nq, int64_t k, const uint8_t* bitset, int64_t* neighbors,
                                 float* distances) {
   if (!res || !index || !queries || !neighbors || !distances || nq <= 0 || k <= 0) {
-    return IOVS_STATUS_INVALID_ARGUMENT;
+    return OVVS_STATUS_INVALID_ARGUMENT;
   }
   auto* ix = reinterpret_cast<BruteIndex*>(index);
   return brute_search_impl(*rd(res), ix->x.data(), ix->n, ix->dim, queries, nq, ix->metric, k, bitset,
                            neighbors, distances);
 }
 
-iovsStatus iovsBruteForceDestroy(iovsBruteForceIndex_t index) {
+ovvsStatus ovvsBruteForceDestroy(ovvsBruteForceIndex_t index) {
   delete reinterpret_cast<BruteIndex*>(index);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
-int64_t brute_force_dim(iovsBruteForceIndex_t index) {
+int64_t brute_force_dim(ovvsBruteForceIndex_t index) {
   if (!index) return 0;
   return reinterpret_cast<BruteIndex*>(index)->dim;
 }
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs
 
 /* ---------------- IVF-Flat ---------------- */
 
-iovsStatus iovsIvfFlatBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                            iovsMetric metric, int32_t nlist, iovsIvfFlatIndex_t* index) {
-  if (!res || !dataset || !index || n <= 0 || dim <= 0 || nlist <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsIvfFlatBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                            ovvsMetric metric, int32_t nlist, ovvsIvfFlatIndex_t* index) {
+  if (!res || !dataset || !index || n <= 0 || dim <= 0 || nlist <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   nlist = std::min(nlist, static_cast<int32_t>(n));
   auto* ix = new IvfFlat();
   copy_ds(ix->ds, dataset, n, dim, metric);
@@ -149,26 +149,26 @@ iovsStatus iovsIvfFlatBuild(iovsResources_t res, const float* dataset, int64_t n
   std::vector<int64_t> labels(static_cast<size_t>(n));
   std::vector<float> d(static_cast<size_t>(n));
   std::vector<float> scores(static_cast<size_t>(n) * static_cast<size_t>(nlist));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, dataset, n, ix->centroids.data(), nlist, dim,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, dataset, n, ix->centroids.data(), nlist, dim,
                 scores.data(), 2.f);
   prim_topk(*rd(res), scores.data(), n, nlist, 1, labels.data(), d.data(), false);
   std::vector<int32_t> assign(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) assign[static_cast<size_t>(i)] = static_cast<int32_t>(labels[static_cast<size_t>(i)]);
   build_ivf_lists(assign.data(), n, nlist, ix->lists);
-  *index = reinterpret_cast<iovsIvfFlatIndex_t>(ix);
-  return IOVS_STATUS_SUCCESS;
+  *index = reinterpret_cast<ovvsIvfFlatIndex_t>(ix);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsIvfFlatSearch(iovsResources_t res, iovsIvfFlatIndex_t index, const float* queries,
+ovvsStatus ovvsIvfFlatSearch(ovvsResources_t res, ovvsIvfFlatIndex_t index, const float* queries,
                              int64_t nq, int64_t k, int32_t nprobe, const uint8_t* bitset,
                              int64_t* neighbors, float* distances) {
-  if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!res || !index || !queries || !neighbors || !distances) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<IvfFlat*>(index);
   nprobe = std::max(1, std::min(nprobe, ix->nlist));
   std::vector<int64_t> cl(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
   std::vector<float> cd(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
   std::vector<float> cscores(static_cast<size_t>(nq) * static_cast<size_t>(ix->nlist));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, queries, nq, ix->centroids.data(), ix->nlist,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, queries, nq, ix->centroids.data(), ix->nlist,
                 ix->ds.dim, cscores.data(), 2.f);
   prim_topk(*rd(res), cscores.data(), nq, ix->nlist, nprobe, cl.data(), cd.data(), false);
   const int64_t dim = ix->ds.dim;
@@ -207,7 +207,7 @@ iovsStatus iovsIvfFlatSearch(iovsResources_t res, iovsIvfFlatIndex_t index, cons
       if (t < kk) {
         neighbors[q * k + t] = ids[static_cast<size_t>(ti[static_cast<size_t>(t)])];
         float d = tv[static_cast<size_t>(t)];
-        if (ix->ds.metric == IOVS_METRIC_INNER_PRODUCT) d = -d;
+        if (ix->ds.metric == OVVS_METRIC_INNER_PRODUCT) d = -d;
         distances[q * k + t] = d;
       } else {
         neighbors[q * k + t] = -1;
@@ -215,21 +215,21 @@ iovsStatus iovsIvfFlatSearch(iovsResources_t res, iovsIvfFlatIndex_t index, cons
       }
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsIvfFlatDestroy(iovsIvfFlatIndex_t index) {
+ovvsStatus ovvsIvfFlatDestroy(ovvsIvfFlatIndex_t index) {
   delete reinterpret_cast<IvfFlat*>(index);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
 constexpr uint32_t kIvfFlatMagic = 0x31465649u; /* 'IVF1' */
 
-iovsStatus iovsIvfFlatSerialize(iovsIvfFlatIndex_t index, const char* path) {
-  if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsIvfFlatSerialize(ovvsIvfFlatIndex_t index, const char* path) {
+  if (!index || !path) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<IvfFlat*>(index);
   std::ofstream f(path, std::ios::binary);
-  if (!f) return IOVS_STATUS_IO;
+  if (!f) return OVVS_STATUS_IO;
   f.write(reinterpret_cast<const char*>(&kIvfFlatMagic), 4);
   int32_t ver = 1;
   f.write(reinterpret_cast<const char*>(&ver), 4);
@@ -250,16 +250,16 @@ iovsStatus iovsIvfFlatSerialize(iovsIvfFlatIndex_t index, const char* path) {
               static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
     }
   }
-  return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+  return f.good() ? OVVS_STATUS_SUCCESS : OVVS_STATUS_IO;
 }
 
-iovsStatus iovsIvfFlatDeserialize(iovsResources_t res, const char* path, iovsIvfFlatIndex_t* index) {
-  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsIvfFlatDeserialize(ovvsResources_t res, const char* path, ovvsIvfFlatIndex_t* index) {
+  if (!res || !path || !index) return OVVS_STATUS_INVALID_ARGUMENT;
   std::ifstream f(path, std::ios::binary);
-  if (!f) return IOVS_STATUS_IO;
+  if (!f) return OVVS_STATUS_IO;
   uint32_t magic = 0;
   f.read(reinterpret_cast<char*>(&magic), 4);
-  if (magic != kIvfFlatMagic) return IOVS_STATUS_IO;
+  if (magic != kIvfFlatMagic) return OVVS_STATUS_IO;
   int32_t ver = 0;
   f.read(reinterpret_cast<char*>(&ver), 4);
   auto* ix = new IvfFlat();
@@ -268,7 +268,7 @@ iovsStatus iovsIvfFlatDeserialize(iovsResources_t res, const char* path, iovsIvf
   f.read(reinterpret_cast<char*>(&ix->nlist), 4);
   int32_t metric = 0;
   f.read(reinterpret_cast<char*>(&metric), 4);
-  ix->ds.metric = static_cast<iovsMetric>(metric);
+  ix->ds.metric = static_cast<ovvsMetric>(metric);
   ix->centroids.resize(static_cast<size_t>(ix->nlist) * static_cast<size_t>(ix->ds.dim));
   ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
   f.read(reinterpret_cast<char*>(ix->centroids.data()),
@@ -287,15 +287,15 @@ iovsStatus iovsIvfFlatDeserialize(iovsResources_t res, const char* path, iovsIvf
   }
   if (!f) {
     delete ix;
-    return IOVS_STATUS_IO;
+    return OVVS_STATUS_IO;
   }
-  *index = reinterpret_cast<iovsIvfFlatIndex_t>(ix);
-  return IOVS_STATUS_SUCCESS;
+  *index = reinterpret_cast<ovvsIvfFlatIndex_t>(ix);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsIvfFlatExtend(iovsResources_t res, iovsIvfFlatIndex_t index, const float* extra,
+ovvsStatus ovvsIvfFlatExtend(ovvsResources_t res, ovvsIvfFlatIndex_t index, const float* extra,
                              int64_t nextra) {
-  if (!res || !index || !extra || nextra <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!res || !index || !extra || nextra <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<IvfFlat*>(index);
   const int64_t dim = ix->ds.dim;
   const int64_t old_n = ix->ds.n;
@@ -304,25 +304,25 @@ iovsStatus iovsIvfFlatExtend(iovsResources_t res, iovsIvfFlatIndex_t index, cons
   std::vector<int64_t> labels(static_cast<size_t>(nextra));
   std::vector<float> d(static_cast<size_t>(nextra));
   std::vector<float> scores(static_cast<size_t>(nextra) * static_cast<size_t>(ix->nlist));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
                 scores.data(), 2.f);
   prim_topk(*rd(res), scores.data(), nextra, ix->nlist, 1, labels.data(), d.data(), false);
   for (int64_t i = 0; i < nextra; ++i) {
     const int32_t a = static_cast<int32_t>(labels[static_cast<size_t>(i)]);
     if (a >= 0 && a < ix->nlist) ix->lists[static_cast<size_t>(a)].push_back(old_n + i);
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
 /* ---------------- IVF-PQ ---------------- */
 
-iovsStatus iovsIvfPqBuild(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                          iovsMetric metric, int32_t nlist, int32_t pq_m, int32_t pq_nbits,
-                          iovsIvfPqIndex_t* index) {
+ovvsStatus ovvsIvfPqBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                          ovvsMetric metric, int32_t nlist, int32_t pq_m, int32_t pq_nbits,
+                          ovvsIvfPqIndex_t* index) {
   if (!res || !dataset || !index || n <= 0 || dim <= 0 || nlist <= 0 || pq_m <= 0) {
-    return IOVS_STATUS_INVALID_ARGUMENT;
+    return OVVS_STATUS_INVALID_ARGUMENT;
   }
-  if (dim % pq_m != 0) return IOVS_STATUS_SHAPE_MISMATCH;
+  if (dim % pq_m != 0) return OVVS_STATUS_SHAPE_MISMATCH;
   nlist = std::min(nlist, static_cast<int32_t>(n));
   const int32_t ks = 1 << std::min(std::max(pq_nbits, 4), 8);
   auto* ix = new IvfPq();
@@ -335,7 +335,7 @@ iovsStatus iovsIvfPqBuild(iovsResources_t res, const float* dataset, int64_t n, 
   std::vector<int64_t> labels(static_cast<size_t>(n));
   std::vector<float> d(static_cast<size_t>(n));
   std::vector<float> scores(static_cast<size_t>(n) * static_cast<size_t>(nlist));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, dataset, n, ix->centroids.data(), nlist, dim,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, dataset, n, ix->centroids.data(), nlist, dim,
                 scores.data(), 2.f);
   prim_topk(*rd(res), scores.data(), n, nlist, 1, labels.data(), d.data(), false);
   ix->assign.resize(static_cast<size_t>(n));
@@ -350,21 +350,21 @@ iovsStatus iovsIvfPqBuild(iovsResources_t res, const float* dataset, int64_t n, 
   pq_train(*rd(res), resid.data(), n, dim, pq_m, ks, ix->codebooks);
   ix->codes.resize(static_cast<size_t>(n) * static_cast<size_t>(pq_m));
   pq_encode(resid.data(), n, dim, pq_m, ks, ix->dsub, ix->codebooks.data(), ix->codes.data());
-  *index = reinterpret_cast<iovsIvfPqIndex_t>(ix);
-  return IOVS_STATUS_SUCCESS;
+  *index = reinterpret_cast<ovvsIvfPqIndex_t>(ix);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsIvfPqSearch(iovsResources_t res, iovsIvfPqIndex_t index, const float* queries,
+ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const float* queries,
                            int64_t nq, int64_t k, int32_t nprobe, int32_t krefine,
                            const uint8_t* bitset, int64_t* neighbors, float* distances) {
-  if (!res || !index || !queries || !neighbors || !distances) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!res || !index || !queries || !neighbors || !distances) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<IvfPq*>(index);
   nprobe = std::max(1, std::min(nprobe, ix->nlist));
   if (krefine < static_cast<int32_t>(k)) krefine = static_cast<int32_t>(k);
   std::vector<int64_t> cl(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
   std::vector<float> cd(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
   std::vector<float> cscores(static_cast<size_t>(nq) * static_cast<size_t>(ix->nlist));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, queries, nq, ix->centroids.data(), ix->nlist,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, queries, nq, ix->centroids.data(), ix->nlist,
                 ix->ds.dim, cscores.data(), 2.f);
   prim_topk(*rd(res), cscores.data(), nq, ix->nlist, nprobe, cl.data(), cd.data(), false);
   const int64_t dim = ix->ds.dim;
@@ -396,10 +396,10 @@ iovsStatus iovsIvfPqSearch(iovsResources_t res, iovsIvfPqIndex_t index, const fl
       }
       if (!list_ids.empty()) {
         std::vector<float> scores(list_ids.size());
-        const iovsStatus as =
+        const ovvsStatus as =
             prim_pq_adc(*rd(res), tables.data(), ix->pq_m, ix->pq_ks, list_codes.data(),
                         static_cast<int64_t>(list_ids.size()), scores.data());
-        if (as != IOVS_STATUS_SUCCESS) return as;
+        if (as != OVVS_STATUS_SUCCESS) return as;
         ids.insert(ids.end(), list_ids.begin(), list_ids.end());
         adc.insert(adc.end(), scores.begin(), scores.end());
       }
@@ -429,7 +429,7 @@ iovsStatus iovsIvfPqSearch(iovsResources_t res, iovsIvfPqIndex_t index, const fl
       if (t < kk) {
         neighbors[q * k + t] = cand[static_cast<size_t>(fi[static_cast<size_t>(t)])];
         float d = fv[static_cast<size_t>(t)];
-        if (ix->ds.metric == IOVS_METRIC_INNER_PRODUCT) d = -d;
+        if (ix->ds.metric == OVVS_METRIC_INNER_PRODUCT) d = -d;
         distances[q * k + t] = d;
       } else {
         neighbors[q * k + t] = -1;
@@ -437,21 +437,21 @@ iovsStatus iovsIvfPqSearch(iovsResources_t res, iovsIvfPqIndex_t index, const fl
       }
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsIvfPqDestroy(iovsIvfPqIndex_t index) {
+ovvsStatus ovvsIvfPqDestroy(ovvsIvfPqIndex_t index) {
   delete reinterpret_cast<IvfPq*>(index);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
 constexpr uint32_t kIvfPqMagic = 0x31515049u; /* 'IPQ1' */
 
-iovsStatus iovsIvfPqSerialize(iovsIvfPqIndex_t index, const char* path) {
-  if (!index || !path) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsIvfPqSerialize(ovvsIvfPqIndex_t index, const char* path) {
+  if (!index || !path) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<IvfPq*>(index);
   std::ofstream f(path, std::ios::binary);
-  if (!f) return IOVS_STATUS_IO;
+  if (!f) return OVVS_STATUS_IO;
   f.write(reinterpret_cast<const char*>(&kIvfPqMagic), 4);
   int32_t ver = 1;
   f.write(reinterpret_cast<const char*>(&ver), 4);
@@ -479,16 +479,16 @@ iovsStatus iovsIvfPqSerialize(iovsIvfPqIndex_t index, const char* path) {
       f.write(reinterpret_cast<const char*>(ix->lists[static_cast<size_t>(c)].data()),
               static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
   }
-  return f.good() ? IOVS_STATUS_SUCCESS : IOVS_STATUS_IO;
+  return f.good() ? OVVS_STATUS_SUCCESS : OVVS_STATUS_IO;
 }
 
-iovsStatus iovsIvfPqDeserialize(iovsResources_t res, const char* path, iovsIvfPqIndex_t* index) {
-  if (!res || !path || !index) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsIvfPqDeserialize(ovvsResources_t res, const char* path, ovvsIvfPqIndex_t* index) {
+  if (!res || !path || !index) return OVVS_STATUS_INVALID_ARGUMENT;
   std::ifstream f(path, std::ios::binary);
-  if (!f) return IOVS_STATUS_IO;
+  if (!f) return OVVS_STATUS_IO;
   uint32_t magic = 0;
   f.read(reinterpret_cast<char*>(&magic), 4);
-  if (magic != kIvfPqMagic) return IOVS_STATUS_IO;
+  if (magic != kIvfPqMagic) return OVVS_STATUS_IO;
   int32_t ver = 0;
   f.read(reinterpret_cast<char*>(&ver), 4);
   auto* ix = new IvfPq();
@@ -500,7 +500,7 @@ iovsStatus iovsIvfPqDeserialize(iovsResources_t res, const char* path, iovsIvfPq
   f.read(reinterpret_cast<char*>(&ix->dsub), 4);
   int32_t metric = 0;
   f.read(reinterpret_cast<char*>(&metric), 4);
-  ix->ds.metric = static_cast<iovsMetric>(metric);
+  ix->ds.metric = static_cast<ovvsMetric>(metric);
   ix->centroids.resize(static_cast<size_t>(ix->nlist) * static_cast<size_t>(ix->ds.dim));
   ix->codebooks.resize(static_cast<size_t>(ix->pq_m) * ix->pq_ks * ix->dsub);
   ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
@@ -526,14 +526,14 @@ iovsStatus iovsIvfPqDeserialize(iovsResources_t res, const char* path, iovsIvfPq
   }
   if (!f) {
     delete ix;
-    return IOVS_STATUS_IO;
+    return OVVS_STATUS_IO;
   }
-  *index = reinterpret_cast<iovsIvfPqIndex_t>(ix);
-  return IOVS_STATUS_SUCCESS;
+  *index = reinterpret_cast<ovvsIvfPqIndex_t>(ix);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsIvfPqExtend(iovsResources_t res, iovsIvfPqIndex_t index, const float* extra, int64_t nextra) {
-  if (!res || !index || !extra || nextra <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsIvfPqExtend(ovvsResources_t res, ovvsIvfPqIndex_t index, const float* extra, int64_t nextra) {
+  if (!res || !index || !extra || nextra <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<IvfPq*>(index);
   const int64_t dim = ix->ds.dim;
   const int64_t old_n = ix->ds.n;
@@ -542,7 +542,7 @@ iovsStatus iovsIvfPqExtend(iovsResources_t res, iovsIvfPqIndex_t index, const fl
   std::vector<int64_t> labels(static_cast<size_t>(nextra));
   std::vector<float> d(static_cast<size_t>(nextra));
   std::vector<float> scores(static_cast<size_t>(nextra) * static_cast<size_t>(ix->nlist));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
                 scores.data(), 2.f);
   prim_topk(*rd(res), scores.data(), nextra, ix->nlist, 1, labels.data(), d.data(), false);
   std::vector<float> resid(static_cast<size_t>(nextra) * static_cast<size_t>(dim));
@@ -557,5 +557,5 @@ iovsStatus iovsIvfPqExtend(iovsResources_t res, iovsIvfPqIndex_t index, const fl
   ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
   pq_encode(resid.data(), nextra, dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
             ix->codes.data() + old_n * ix->pq_m);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }

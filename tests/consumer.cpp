@@ -1,4 +1,4 @@
-#include "iovs/iovs.hpp"
+#include "ovvs/ovvs.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -15,12 +15,12 @@ static float l2sq(const float* a, const float* b, int64_t d) {
 }
 
 int main() {
-  iovs::Resources res;
+  ovvs::Resources res;
   const int64_t n = 12, dim = 4, k = 3;
   std::vector<float> data(static_cast<size_t>(n * dim));
   for (int64_t i = 0; i < n * dim; ++i) data[static_cast<size_t>(i)] = ((i * 17) % 100) / 50.f - 1.f;
   const float q[4] = {0.1f, -0.2f, 0.3f, 0.0f};
-  iovs::BruteForceIndex ix(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED);
+  ovvs::BruteForceIndex ix(res, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED);
   int64_t nb[3];
   float ds[3];
   ix.search(q, 1, k, nb, ds);
@@ -48,11 +48,11 @@ int main() {
     }
   }
   std::printf("cxx consumer ok neighbors=%lld,%lld,%lld version=%s\n", static_cast<long long>(nb[0]),
-              static_cast<long long>(nb[1]), static_cast<long long>(nb[2]), iovsGetVersion());
+              static_cast<long long>(nb[1]), static_cast<long long>(nb[2]), ovvsGetVersion());
 
   const int64_t allow[4] = {truth[0], truth[1], 0, 1};
   std::vector<uint8_t> bits(static_cast<size_t>((n + 7) / 8), 0);
-  iovs::bitset_from_allow_list(n, allow, 4, bits.data());
+  ovvs::bitset_from_allow_list(n, allow, 4, bits.data());
   int64_t fnb[3];
   float fds[3];
   ix.search(q, 1, k, fnb, fds, bits.data());
@@ -64,7 +64,7 @@ int main() {
     return 1;
   }
 
-  iovs::BruteForceIndex ham(res, data.data(), n, dim, IOVS_METRIC_BITWISE_HAMMING);
+  ovvs::BruteForceIndex ham(res, data.data(), n, dim, OVVS_METRIC_BITWISE_HAMMING);
   int64_t hnb[3];
   float hds[3];
   ham.search(q, 1, k, hnb, hds);
@@ -97,7 +97,7 @@ int main() {
     return 1;
   }
 
-  iovs::IvfFlatIndex ivf(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4);
+  ovvs::IvfFlatIndex ivf(res, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4);
   int64_t inb[3];
   float ids[3];
   ivf.search(q, 1, k, 4, inb, ids);
@@ -106,7 +106,7 @@ int main() {
     return 1;
   }
 
-  iovs::CagraIndex cagra(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 8);
+  ovvs::CagraIndex cagra(res, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8);
   int64_t cnb[3];
   float cds[3];
   cagra.search(q, 1, k, 8, 2, cnb, cds);
@@ -115,7 +115,7 @@ int main() {
     return 1;
   }
 
-  iovs::IvfPqIndex pq(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 2, 8);
+  ovvs::IvfPqIndex pq(res, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 2, 8);
   int64_t pnb[3];
   float pds[3];
   pq.search(q, 1, k, 4, 8, pnb, pds);
@@ -124,7 +124,7 @@ int main() {
     return 1;
   }
 
-  iovs::VamanaIndex vam(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 1.2f);
+  ovvs::VamanaIndex vam(res, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 1.2f);
   int64_t vnb[3];
   float vds[3];
   vam.search(q, 1, k, 4, vnb, vds);
@@ -132,7 +132,7 @@ int main() {
     std::fprintf(stderr, "cxx vamana id out of range\n");
     return 1;
   }
-  iovs::ScannIndex scann(res, data.data(), n, dim, IOVS_METRIC_L2_EXPANDED, 4, 2);
+  ovvs::ScannIndex scann(res, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 2);
   int64_t snb[3];
   float sds[3];
   scann.search(q, 1, k, 4, 8, snb, sds);
@@ -140,7 +140,7 @@ int main() {
     std::fprintf(stderr, "cxx scann id out of range\n");
     return 1;
   }
-  iovs::HnswIndex hnsw(res, cagra);
+  ovvs::HnswIndex hnsw(res, cagra);
   int64_t wnb[3];
   float wds[3];
   hnsw.search(q, 1, k, 8, wnb, wds);
@@ -148,7 +148,7 @@ int main() {
     std::fprintf(stderr, "cxx hnsw id out of range\n");
     return 1;
   }
-  iovs::KMeans km(res, data.data(), n, dim, 2, 8);
+  ovvs::KMeans km(res, data.data(), n, dim, 2, 8);
   int64_t labs[12];
   float kmd[12];
   km.predict(data.data(), n, labs, kmd);
@@ -158,7 +158,7 @@ int main() {
     std::fprintf(stderr, "cxx kmeans inertia\n");
     return 1;
   }
-  iovs::Batcher batch(res, ix, 4, 0);
+  ovvs::Batcher batch(res, ix, 4, 0);
   int64_t bnb[3];
   float bds[3];
   batch.search(q, 1, k, bnb, bds);

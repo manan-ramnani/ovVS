@@ -7,4 +7,4 @@ cached static graph — the HostCompile idea without a vendored `npu_compiler` i
 
 PQ ADC on NPU is OpenVINO Gather+ReduceSum tiles; those ops already execute as
 ActShave + DPU (see `compiler/shave/README.md`). Host-linked `adc.c` is the
-correctness oracle. A custom `iovs_pq_adc` SHAVE ELF still needs MoviTools.
+correctness oracle. A custom `ovvs_pq_adc` SHAVE ELF still needs MoviTools.

@@ -1,26 +1,26 @@
 #pragma once
 
-#include "iovs/iovs.h"
+#include "ovvs/ovvs.h"
 
 #include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-int iovs_register_test(const char* name, void (*fn)());
+int ovvs_register_test(const char* name, void (*fn)());
 
-#define IOVS_TEST(name)                                          \
+#define OVVS_TEST(name)                                          \
   static void test_##name();                                     \
-  static int reg_##name = iovs_register_test(#name, test_##name); \
+  static int reg_##name = ovvs_register_test(#name, test_##name); \
   static void test_##name()
 
 inline void expect(bool cond, const std::string& msg) {
   if (!cond) throw std::runtime_error(msg);
 }
 
-inline void expect_status(iovsStatus s, const char* what) {
-  if (s != IOVS_STATUS_SUCCESS) {
-    throw std::runtime_error(std::string(what) + ": " + iovsStatusString(s));
+inline void expect_status(ovvsStatus s, const char* what) {
+  if (s != OVVS_STATUS_SUCCESS) {
+    throw std::runtime_error(std::string(what) + ": " + ovvsStatusString(s));
   }
 }
 
@@ -71,7 +71,7 @@ inline std::vector<float> make_data(int64_t n, int64_t dim, uint32_t seed) {
 }
 
 struct Res {
-  iovsResources_t r = nullptr;
-  Res() { expect_status(iovsResourcesCreate(&r), "ResourcesCreate"); }
-  ~Res() { iovsResourcesDestroy(r); }
+  ovvsResources_t r = nullptr;
+  Res() { expect_status(ovvsResourcesCreate(&r), "ResourcesCreate"); }
+  ~Res() { ovvsResourcesDestroy(r); }
 };

@@ -1,9 +1,9 @@
 [package]
-name = "iovs"
+name = "ovvs"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Rust FFI for ioVS (links libiovs C ABI)"
+description = "Rust FFI for ovVS (links libovvs C ABI)"
 
 [lib]
 path = "src/lib.rs"

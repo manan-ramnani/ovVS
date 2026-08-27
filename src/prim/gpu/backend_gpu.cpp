@@ -6,21 +6,21 @@
 #include <cstdlib>
 #include <new>
 
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
 #include <sycl/sycl.hpp>
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
 #include <oneapi/mkl.hpp>
 #endif
 #endif
 
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
 #include <mkl_lapacke.h>
 #endif
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
 static sycl::queue& gpu_queue() {
   static sycl::queue q{sycl::gpu_selector_v};
   return q;
@@ -43,9 +43,9 @@ static float* usm_f(size_t n) { return usm_scratch<float>(n); }
 static int64_t* usm_i64(size_t n) { return usm_scratch<int64_t>(n); }
 #endif
 
-void* iovs_usm_malloc(size_t bytes) {
+void* ovvs_usm_malloc(size_t bytes) {
   if (bytes == 0) bytes = 1;
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     void* p = sycl::malloc_shared(bytes, gpu_queue());
     if (p) return p;
@@ -55,9 +55,9 @@ void* iovs_usm_malloc(size_t bytes) {
   return std::malloc(bytes);
 }
 
-void iovs_usm_free(void* p) {
+void ovvs_usm_free(void* p) {
   if (!p) return;
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     if (sycl::get_pointer_type(p, gpu_queue().get_context()) != sycl::usm::alloc::unknown) {
       sycl::free(p, gpu_queue());
@@ -69,9 +69,9 @@ void iovs_usm_free(void* p) {
   std::free(p);
 }
 
-bool iovs_usm_is_shared(const void* p) {
+bool ovvs_usm_is_shared(const void* p) {
   if (!p) return false;
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     auto k = sycl::get_pointer_type(const_cast<void*>(p), gpu_queue().get_context());
     return k == sycl::usm::alloc::shared || k == sycl::usm::alloc::host;
@@ -84,7 +84,7 @@ bool iovs_usm_is_shared(const void* p) {
 
 
 bool gpu_available() {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     auto d = gpu_queue().get_device();
     if (d.is_gpu()) return true;
@@ -95,7 +95,7 @@ bool gpu_available() {
 }
 
 bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n) {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     auto& q = gpu_queue();
     sycl::buffer<float, 1> ba(const_cast<float*>(a), sycl::range<1>(static_cast<size_t>(n)));
@@ -121,15 +121,15 @@ bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n) {
 #endif
 }
 
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
 static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
                           bool trans_b) {
   auto& q = gpu_queue();
   const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
   const size_t bsz = trans_b ? N * K : K * N;
-  const bool a_usm = iovs_usm_is_shared(a);
-  const bool b_usm = iovs_usm_is_shared(b);
-  const bool c_usm = iovs_usm_is_shared(c);
+  const bool a_usm = ovvs_usm_is_shared(a);
+  const bool b_usm = ovvs_usm_is_shared(b);
+  const bool c_usm = ovvs_usm_is_shared(c);
   size_t scratch_n = 0;
   if (!a_usm) scratch_n += M * K;
   if (!b_usm) scratch_n += bsz;
@@ -159,15 +159,15 @@ static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, i
   return true;
 }
 
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
 static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
                          bool trans_b) {
   auto& q = gpu_queue();
   const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
   const size_t bsz = trans_b ? N * K : K * N;
-  const bool a_usm = iovs_usm_is_shared(a);
-  const bool b_usm = iovs_usm_is_shared(b);
-  const bool c_usm = iovs_usm_is_shared(c);
+  const bool a_usm = ovvs_usm_is_shared(a);
+  const bool b_usm = ovvs_usm_is_shared(b);
+  const bool c_usm = ovvs_usm_is_shared(c);
   size_t scratch_n = 0;
   if (!a_usm) scratch_n += M * K;
   if (!b_usm) scratch_n += bsz;
@@ -198,7 +198,7 @@ static GpuGemmKind g_gpu_gemm = GpuGemmKind::Unset;
 static void pick_gpu_gemm() {
   if (g_gpu_gemm != GpuGemmKind::Unset) return;
   g_gpu_gemm = GpuGemmKind::Sycl;
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
   try {
     const int64_t m = 64, n = 128, k = 32;
     std::vector<float> A(static_cast<size_t>(m * k), 0.1f), B(static_cast<size_t>(n * k), 0.2f);
@@ -231,33 +231,99 @@ static void pick_gpu_gemm() {
 }
 #endif
 
+#if defined(OVVS_WITH_SYCL)
+static bool gemm_sycl_f16(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
+                          bool trans_b) {
+  auto& q = gpu_queue();
+  const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
+  const size_t bsz = trans_b ? N * K : K * N;
+  sycl::half* Ah = sycl::malloc_shared<sycl::half>(M * K, q);
+  sycl::half* Bh = sycl::malloc_shared<sycl::half>(bsz, q);
+  float* C = ovvs_usm_is_shared(c) ? c : static_cast<float*>(ovvs_usm_malloc(M * N * sizeof(float)));
+  if (!Ah || !Bh || !C) {
+    if (Ah) sycl::free(Ah, q);
+    if (Bh) sycl::free(Bh, q);
+    if (C && !ovvs_usm_is_shared(c)) ovvs_usm_free(C);
+    return false;
+  }
+  for (size_t i = 0; i < M * K; ++i) Ah[i] = static_cast<sycl::half>(a[i]);
+  for (size_t i = 0; i < bsz; ++i) Bh[i] = static_cast<sycl::half>(b[i]);
+  const bool tb = trans_b;
+  q.parallel_for(sycl::range<2>(M, N), [=](sycl::id<2> id) {
+    const size_t i = id[0];
+    const size_t j = id[1];
+    sycl::half s(0.f);
+    if (!tb) {
+      for (size_t t = 0; t < K; ++t) s += Ah[i * K + t] * Bh[t * N + j];
+    } else {
+      for (size_t t = 0; t < K; ++t) s += Ah[i * K + t] * Bh[j * K + t];
+    }
+    C[i * N + j] = static_cast<float>(s);
+  });
+  q.wait();
+  if (!ovvs_usm_is_shared(c)) {
+    std::memcpy(c, C, M * N * sizeof(float));
+    ovvs_usm_free(C);
+  }
+  sycl::free(Ah, q);
+  sycl::free(Bh, q);
+  return true;
+}
+#endif
+
+bool gpu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const float* b, float* c,
+                      int64_t m, int64_t n, int64_t k, bool trans_b) {
+  if (compute == OVVS_DTYPE_F32) return gpu_gemm(r, a, b, c, m, n, k, trans_b);
+#if defined(OVVS_WITH_SYCL)
+  if (compute == OVVS_DTYPE_F16 && gpu_available()) {
+    try {
+      if (gemm_sycl_f16(a, b, c, m, n, k, trans_b)) {
+        r.last_compute_dtype = OVVS_DTYPE_F16;
+        return true;
+      }
+    } catch (...) {
+    }
+  }
+#endif
+  if (ov_matmul_compute(r, "GPU", compute, a, b, c, m, n, k, trans_b)) return true;
+  return false;
+}
+
 bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b) {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     pick_gpu_gemm();
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
     if (g_gpu_gemm == GpuGemmKind::Mkl) {
-      if (gemm_mkl_usm(a, b, c, m, n, k, trans_b)) return true;
+      if (gemm_mkl_usm(a, b, c, m, n, k, trans_b)) {
+        r.last_compute_dtype = OVVS_DTYPE_F32;
+        return true;
+      }
     }
 #endif
-    if (gemm_sycl_usm(a, b, c, m, n, k, trans_b)) return true;
+    if (gemm_sycl_usm(a, b, c, m, n, k, trans_b)) {
+      r.last_compute_dtype = OVVS_DTYPE_F32;
+      return true;
+    }
   } catch (...) {
   }
 #endif
-  return ov_matmul(r, "GPU", a, b, c, m, n, k, trans_b);
+  const bool ok = ov_matmul(r, "GPU", a, b, c, m, n, k, trans_b);
+  if (ok) r.last_compute_dtype = OVVS_DTYPE_F32;
+  return ok;
 }
 
 bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
               int64_t* indices, float* values, bool largest) {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   /* Subgroup-friendly per-row partial select on USM shared; correctness first. */
   try {
     auto& q = gpu_queue();
     const size_t R = static_cast<size_t>(rows);
     const size_t C = static_cast<size_t>(cols);
     const size_t KK = static_cast<size_t>(std::min(k, cols));
-    const bool s_usm = iovs_usm_is_shared(scores);
+    const bool s_usm = ovvs_usm_is_shared(scores);
     float* S = s_usm ? const_cast<float*>(scores) : usm_f(R * C + R * KK);
     int64_t* I = usm_i64(R * KK);
     if (!S || !I) throw std::bad_alloc();
@@ -302,20 +368,20 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
 
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out) {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   try {
     auto& q = gpu_queue();
     const size_t D = static_cast<size_t>(dim);
     const size_t N = static_cast<size_t>(nidx);
     const size_t SR = static_cast<size_t>(src_rows);
-    const bool src_usm = iovs_usm_is_shared(src);
+    const bool src_usm = ovvs_usm_is_shared(src);
     float* S = src_usm ? const_cast<float*>(src) : usm_f(SR * D + N * D);
     int64_t* I = usm_i64(N);
     if (!S || !I) throw std::bad_alloc();
     float* O = src_usm ? usm_f(N * D) : (S + SR * D);
     if (!O) throw std::bad_alloc();
     if (!src_usm) std::memcpy(S, src, SR * D * sizeof(float));
-    if (iovs_usm_is_shared(idx)) {
+    if (ovvs_usm_is_shared(idx)) {
       I = const_cast<int64_t*>(idx);
     } else {
       std::memcpy(I, idx, N * sizeof(int64_t));
@@ -336,18 +402,18 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
 }
 
 int32_t sycl_enabled() {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   return 1;
 #else
   return 0;
 #endif
 }
 
-bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, iovsMetric metric,
+bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances) {
-#if defined(IOVS_WITH_SYCL)
+#if defined(OVVS_WITH_SYCL)
   /* Fused iGPU walk: one work-item per query, global itopk heap + per-vertex seen[n], in-kernel L2.
      Heaps and seen are sized to the real itopk and n (not 64 / 4096). Host prim walk if they cannot fit. */
   if (!gpu_available()) return false;
@@ -370,33 +436,33 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t SW = static_cast<size_t>(search_width);
     const int met = static_cast<int>(metric);
     const int max_iters = std::max(24, itopk * 6);
-    float* DS = iovs_usm_is_shared(dataset) ? const_cast<float*>(dataset)
-                                           : static_cast<float*>(iovs_usm_malloc(N * D * sizeof(float)));
-    int32_t* G = iovs_usm_is_shared(graph) ? const_cast<int32_t*>(graph)
-                                          : static_cast<int32_t*>(iovs_usm_malloc(N * DEG * sizeof(int32_t)));
-    float* Q = iovs_usm_is_shared(queries) ? const_cast<float*>(queries)
-                                          : static_cast<float*>(iovs_usm_malloc(NQ * D * sizeof(float)));
-    int64_t* OUTI = iovs_usm_is_shared(neighbors) ? neighbors
-                                                 : static_cast<int64_t*>(iovs_usm_malloc(NQ * KK * sizeof(int64_t)));
-    float* OUTD = iovs_usm_is_shared(distances) ? distances
-                                               : static_cast<float*>(iovs_usm_malloc(NQ * KK * sizeof(float)));
+    float* DS = ovvs_usm_is_shared(dataset) ? const_cast<float*>(dataset)
+                                           : static_cast<float*>(ovvs_usm_malloc(N * D * sizeof(float)));
+    int32_t* G = ovvs_usm_is_shared(graph) ? const_cast<int32_t*>(graph)
+                                          : static_cast<int32_t*>(ovvs_usm_malloc(N * DEG * sizeof(int32_t)));
+    float* Q = ovvs_usm_is_shared(queries) ? const_cast<float*>(queries)
+                                          : static_cast<float*>(ovvs_usm_malloc(NQ * D * sizeof(float)));
+    int64_t* OUTI = ovvs_usm_is_shared(neighbors) ? neighbors
+                                                 : static_cast<int64_t*>(ovvs_usm_malloc(NQ * KK * sizeof(int64_t)));
+    float* OUTD = ovvs_usm_is_shared(distances) ? distances
+                                               : static_cast<float*>(ovvs_usm_malloc(NQ * KK * sizeof(float)));
     if (!DS || !G || !Q || !OUTI || !OUTD) throw std::bad_alloc();
-    if (!iovs_usm_is_shared(dataset)) std::memcpy(DS, dataset, N * D * sizeof(float));
-    if (!iovs_usm_is_shared(graph)) std::memcpy(G, graph, N * DEG * sizeof(int32_t));
-    if (!iovs_usm_is_shared(queries)) std::memcpy(Q, queries, NQ * D * sizeof(float));
+    if (!ovvs_usm_is_shared(dataset)) std::memcpy(DS, dataset, N * D * sizeof(float));
+    if (!ovvs_usm_is_shared(graph)) std::memcpy(G, graph, N * DEG * sizeof(int32_t));
+    if (!ovvs_usm_is_shared(queries)) std::memcpy(Q, queries, NQ * D * sizeof(float));
     const uint8_t* bits = bitset;
     std::vector<uint8_t> all_one;
     if (!bits) {
       all_one.assign((N + 7) / 8, 0xff);
       bits = all_one.data();
     }
-    uint8_t* BS = iovs_usm_is_shared(bits) ? const_cast<uint8_t*>(bits)
-                                          : static_cast<uint8_t*>(iovs_usm_malloc(((N + 7) / 8)));
+    uint8_t* BS = ovvs_usm_is_shared(bits) ? const_cast<uint8_t*>(bits)
+                                          : static_cast<uint8_t*>(ovvs_usm_malloc(((N + 7) / 8)));
     if (!BS) throw std::bad_alloc();
-    if (!iovs_usm_is_shared(bits)) std::memcpy(BS, bits, (N + 7) / 8);
-    uint8_t* Seen = static_cast<uint8_t*>(iovs_usm_malloc(NQ * N));
-    int64_t* HID = static_cast<int64_t*>(iovs_usm_malloc(NQ * BEAM * sizeof(int64_t)));
-    float* HD = static_cast<float*>(iovs_usm_malloc(NQ * BEAM * sizeof(float)));
+    if (!ovvs_usm_is_shared(bits)) std::memcpy(BS, bits, (N + 7) / 8);
+    uint8_t* Seen = static_cast<uint8_t*>(ovvs_usm_malloc(NQ * N));
+    int64_t* HID = static_cast<int64_t*>(ovvs_usm_malloc(NQ * BEAM * sizeof(int64_t)));
+    float* HD = static_cast<float*>(ovvs_usm_malloc(NQ * BEAM * sizeof(float)));
     if (!Seen || !HID || !HD) throw std::bad_alloc();
     q.parallel_for(sycl::range<1>(NQ), [=](sycl::id<1> qiid) {
         const size_t qi = qiid[0];
@@ -509,17 +575,17 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
         }
       });
     q.wait();
-    if (!iovs_usm_is_shared(neighbors)) std::memcpy(neighbors, OUTI, NQ * KK * sizeof(int64_t));
-    if (!iovs_usm_is_shared(distances)) std::memcpy(distances, OUTD, NQ * KK * sizeof(float));
-    if (!iovs_usm_is_shared(dataset)) iovs_usm_free(DS);
-    if (!iovs_usm_is_shared(graph)) iovs_usm_free(G);
-    if (!iovs_usm_is_shared(queries)) iovs_usm_free(Q);
-    if (!iovs_usm_is_shared(neighbors)) iovs_usm_free(OUTI);
-    if (!iovs_usm_is_shared(distances)) iovs_usm_free(OUTD);
-    if (!iovs_usm_is_shared(bits)) iovs_usm_free(BS);
-    iovs_usm_free(Seen);
-    iovs_usm_free(HID);
-    iovs_usm_free(HD);
+    if (!ovvs_usm_is_shared(neighbors)) std::memcpy(neighbors, OUTI, NQ * KK * sizeof(int64_t));
+    if (!ovvs_usm_is_shared(distances)) std::memcpy(distances, OUTD, NQ * KK * sizeof(float));
+    if (!ovvs_usm_is_shared(dataset)) ovvs_usm_free(DS);
+    if (!ovvs_usm_is_shared(graph)) ovvs_usm_free(G);
+    if (!ovvs_usm_is_shared(queries)) ovvs_usm_free(Q);
+    if (!ovvs_usm_is_shared(neighbors)) ovvs_usm_free(OUTI);
+    if (!ovvs_usm_is_shared(distances)) ovvs_usm_free(OUTD);
+    if (!ovvs_usm_is_shared(bits)) ovvs_usm_free(BS);
+    ovvs_usm_free(Seen);
+    ovvs_usm_free(HID);
+    ovvs_usm_free(HD);
     (void)r;
     return true;
   } catch (...) {
@@ -545,19 +611,19 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 #endif
 }
 
-bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t nx, const float* y,
+bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg) {
-#if defined(IOVS_WITH_SYCL)
-  if (metric == IOVS_METRIC_L2_EXPANDED || metric == IOVS_METRIC_INNER_PRODUCT ||
-      metric == IOVS_METRIC_COSINE_EXPANDED) {
+#if defined(OVVS_WITH_SYCL)
+  if (metric == OVVS_METRIC_L2_EXPANDED || metric == OVVS_METRIC_INNER_PRODUCT ||
+      metric == OVVS_METRIC_COSINE_EXPANDED) {
     return false;
   }
   try {
     auto& q = gpu_queue();
     const size_t NX = static_cast<size_t>(nx), NY = static_cast<size_t>(ny), D = static_cast<size_t>(dim);
-    const bool x_usm = iovs_usm_is_shared(x);
-    const bool y_usm = iovs_usm_is_shared(y);
-    const bool o_usm = iovs_usm_is_shared(out);
+    const bool x_usm = ovvs_usm_is_shared(x);
+    const bool y_usm = ovvs_usm_is_shared(y);
+    const bool o_usm = ovvs_usm_is_shared(out);
     size_t need = 0;
     if (!x_usm) need += NX * D;
     if (!y_usm) need += NY * D;
@@ -590,7 +656,7 @@ bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t n
       }
     });
     q.wait();
-    if (!iovs_usm_is_shared(out)) std::memcpy(out, O, NX * NY * sizeof(float));
+    if (!ovvs_usm_is_shared(out)) std::memcpy(out, O, NX * NY * sizeof(float));
     (void)r;
     return true;
   } catch (...) {
@@ -611,7 +677,7 @@ bool gpu_pairwise(ResourcesData& r, iovsMetric metric, const float* x, int64_t n
 }
 
 bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components) {
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
   if (!centered || !components || n <= 0 || dim <= 0 || ncomp <= 0) return false;
   ncomp = std::min(ncomp, static_cast<int32_t>(std::min(n, dim)));
   std::vector<float> a(centered, centered + n * dim);
@@ -639,7 +705,7 @@ bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t
 }
 
 bool mkl_syev_smallest(float* a, int64_t n, int32_t ncomp, float* embed) {
-#if defined(IOVS_WITH_MKL)
+#if defined(OVVS_WITH_MKL)
   if (!a || !embed || n <= 0 || ncomp <= 0) return false;
   ncomp = std::min(ncomp, static_cast<int32_t>(n));
   std::vector<float> w(static_cast<size_t>(n));
@@ -665,4 +731,4 @@ bool mkl_syev_smallest(float* a, int64_t n, int32_t ncomp, float* embed) {
 }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs

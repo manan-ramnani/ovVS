@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recall-QPS: ioVS brute / IVF vs FAISS-CPU, CAGRA vs hnswlib when packages exist."""
+"""Recall-QPS: ovVS brute / IVF vs FAISS-CPU, CAGRA vs hnswlib when packages exist."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 
-def load_iovs():
-    if "IOVS_LIBRARY" not in os.environ:
+def load_ovvs():
+    if "OVVS_LIBRARY" not in os.environ:
         for cand in (
-            ROOT / "build-icpx" / "bin" / "iovs.dll",
-            ROOT / "build-sycl" / "bin" / "iovs.dll",
-            ROOT / "build" / "bin" / "iovs.dll",
+            ROOT / "build-icpx" / "bin" / "ovvs.dll",
+            ROOT / "build-sycl" / "bin" / "ovvs.dll",
+            ROOT / "build" / "bin" / "ovvs.dll",
         ):
             if cand.exists():
-                os.environ["IOVS_LIBRARY"] = str(cand)
+                os.environ["OVVS_LIBRARY"] = str(cand)
                 break
-    import iovs as m
+    import ovvs as m
 
     return m
 
@@ -84,7 +84,7 @@ def main() -> int:
     else:
         print("SIFT hdf5 absent; generated stand-in n=800 dim=32 nq=32")
 
-    lib = load_iovs()
+    lib = load_ovvs()
     policies = [("cpu", 6), ("npu", 4), ("gpu", 5)]
     nb = None
     for name, pol in policies:
@@ -97,12 +97,12 @@ def main() -> int:
             t1 = time.perf_counter()
             ujq = energy_uj_per_query(res_p, lambda: idx_p.search(queries, k=k), nq)
             print(
-                f"iovs brute policy={name} n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f} last_device={res_p.last_device()} uj/q={fmt_ujq(ujq)}"
+                f"ovvs brute policy={name} n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f} last_device={res_p.last_device()} uj/q={fmt_ujq(ujq)}"
             )
             if name == "cpu":
                 nb = nbp
         except Exception as e:
-            print(f"iovs brute policy={name} failed: {e}")
+            print(f"ovvs brute policy={name} failed: {e}")
     res = lib.Resources()
     res.set_policy(6)  # FORCE_CPU for comparable FAISS/hnswlib host bench
     if nb is None:
@@ -110,7 +110,7 @@ def main() -> int:
         t0 = time.perf_counter()
         nb, _ = idx.search(queries, k=k)
         t1 = time.perf_counter()
-        print(f"iovs brute n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f}")
+        print(f"ovvs brute n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f}")
 
     faiss_ok = False
     try:
@@ -122,7 +122,7 @@ def main() -> int:
         _, I = index.search(queries, k)
         t1 = time.perf_counter()
         rec = recall_at_k(np.asarray(nb).reshape(-1), I.reshape(-1), nq, k)
-        print(f"faiss brute ms={(t1 - t0) * 1000:.3f} iovs-vs-faiss-recall={rec:.3f}")
+        print(f"faiss brute ms={(t1 - t0) * 1000:.3f} ovvs-vs-faiss-recall={rec:.3f}")
         nlist, nprobe = 32, 8
         quant = faiss.IndexFlatL2(dim)
         ivf = faiss.IndexIVFFlat(quant, dim, nlist)
@@ -139,7 +139,7 @@ def main() -> int:
         t1 = time.perf_counter()
         rec_i = recall_at_k(np.asarray(inb).reshape(-1), Iivf.reshape(-1), nq, k)
         ujq = energy_uj_per_query(res, lambda: ivf_ix.search(queries, k=k, nprobe=nprobe), nq)
-        print(f"iovs ivf-flat ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_i:.3f} uj/q={fmt_ujq(ujq)}")
+        print(f"ovvs ivf-flat ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_i:.3f} uj/q={fmt_ujq(ujq)}")
         pq_m, nbits, krefine = 8, 8, 32
         quant_pq = faiss.IndexFlatL2(dim)
         faiss_pq = faiss.IndexIVFPQ(quant_pq, dim, nlist, pq_m, nbits)
@@ -160,7 +160,7 @@ def main() -> int:
         ujq = energy_uj_per_query(
             res, lambda: pq_ix.search(queries, k=k, nprobe=nprobe, krefine=krefine), nq
         )
-        print(f"iovs ivf-pq ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_p:.3f} uj/q={fmt_ujq(ujq)}")
+        print(f"ovvs ivf-pq ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_p:.3f} uj/q={fmt_ujq(ujq)}")
         faiss_ok = True
     except Exception as e:
         print(f"faiss unavailable: {e}")
@@ -184,12 +184,12 @@ def main() -> int:
         ujq = energy_uj_per_query(
             res, lambda: cg.search(queries, k=k, itopk_size=32, search_width=2), nq
         )
-        print(f"iovs cagra ms={(t1 - t0) * 1000:.3f} vs-hnswlib-recall={rec_c:.3f} uj/q={fmt_ujq(ujq)}")
+        print(f"ovvs cagra ms={(t1 - t0) * 1000:.3f} vs-hnswlib-recall={rec_c:.3f} uj/q={fmt_ujq(ujq)}")
     except Exception as e:
         print(f"hnswlib unavailable: {e}")
 
     if not faiss_ok:
-        print("ioVS-only numbers emitted; FAISS did not import.")
+        print("ovVS-only numbers emitted; FAISS did not import.")
     return 0
 
 

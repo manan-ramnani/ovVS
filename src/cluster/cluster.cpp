@@ -1,6 +1,6 @@
 #include "internal.hpp"
 
-using namespace iovs::impl;
+using namespace ovvs::impl;
 
 namespace {
 
@@ -43,55 +43,55 @@ void unite(std::vector<int64_t>& p, std::vector<int64_t>& r, int64_t a, int64_t 
 
 }  // namespace
 
-iovsStatus iovsKMeansFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                         int32_t nclusters, int32_t iters, iovsKMeansModel_t* model) {
+ovvsStatus ovvsKMeansFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                         int32_t nclusters, int32_t iters, ovvsKMeansModel_t* model) {
   if (!res || !dataset || !model || n <= 0 || dim <= 0 || nclusters <= 0) {
-    return IOVS_STATUS_INVALID_ARGUMENT;
+    return OVVS_STATUS_INVALID_ARGUMENT;
   }
   auto* m = new KMeans();
   m->k = nclusters;
   m->dim = dim;
   kmeans_fit_impl(*rd(res), dataset, n, dim, nclusters, std::max(4, iters), m->centroids);
-  *model = reinterpret_cast<iovsKMeansModel_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsKMeansModel_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsKMeansPredict(iovsResources_t res, iovsKMeansModel_t model, const float* x, int64_t n,
+ovvsStatus ovvsKMeansPredict(ovvsResources_t res, ovvsKMeansModel_t model, const float* x, int64_t n,
                              int64_t* labels, float* distances) {
-  if (!res || !model || !x || !labels || n <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!res || !model || !x || !labels || n <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<KMeans*>(model);
   std::vector<float> scores(static_cast<size_t>(n) * static_cast<size_t>(m->k));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, x, n, m->centroids.data(), m->k, m->dim,
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, x, n, m->centroids.data(), m->k, m->dim,
                 scores.data(), 2.f);
   std::vector<float> tmp(static_cast<size_t>(n));
   prim_topk(*rd(res), scores.data(), n, m->k, 1, labels, distances ? distances : tmp.data(), false);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsKMeansCentroids(iovsKMeansModel_t model, const float** data, int32_t* nclusters,
+ovvsStatus ovvsKMeansCentroids(ovvsKMeansModel_t model, const float** data, int32_t* nclusters,
                                int64_t* dim) {
-  if (!model || !data || !nclusters || !dim) return IOVS_STATUS_INVALID_ARGUMENT;
+  if (!model || !data || !nclusters || !dim) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<KMeans*>(model);
   *data = m->centroids.data();
   *nclusters = m->k;
   *dim = m->dim;
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsKMeansDestroy(iovsKMeansModel_t model) {
+ovvsStatus ovvsKMeansDestroy(ovvsKMeansModel_t model) {
   delete reinterpret_cast<KMeans*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSlinkFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                        int32_t nclusters, int32_t knn, iovsSlinkModel_t* model) {
-  if (!res || !dataset || !model || n <= 0 || nclusters <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSlinkFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                        int32_t nclusters, int32_t knn, ovvsSlinkModel_t* model) {
+  if (!res || !dataset || !model || n <= 0 || nclusters <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   knn = std::max(1, std::min(knn, static_cast<int32_t>(n - 1)));
   std::vector<int64_t> nbr(static_cast<size_t>(n) * static_cast<size_t>(knn));
   std::vector<float> dist(static_cast<size_t>(n) * static_cast<size_t>(knn));
-  const iovsStatus st =
-      iovsAllNeighbors(res, dataset, n, dim, IOVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
-  if (st != IOVS_STATUS_SUCCESS) return st;
+  const ovvsStatus st =
+      ovvsAllNeighbors(res, dataset, n, dim, OVVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
+  if (st != OVVS_STATUS_SUCCESS) return st;
   struct Edge {
     float d;
     int64_t a, b;
@@ -125,30 +125,30 @@ iovsStatus iovsSlinkFit(iovsResources_t res, const float* dataset, int64_t n, in
     if (map[static_cast<size_t>(r)] < 0) map[static_cast<size_t>(r)] = next++;
     m->labels[static_cast<size_t>(i)] = map[static_cast<size_t>(r)];
   }
-  *model = reinterpret_cast<iovsSlinkModel_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsSlinkModel_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSlinkLabels(iovsSlinkModel_t model, const int64_t** labels, int64_t* n) {
-  if (!model || !labels || !n) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSlinkLabels(ovvsSlinkModel_t model, const int64_t** labels, int64_t* n) {
+  if (!model || !labels || !n) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Slink*>(model);
   *labels = m->labels.data();
   *n = static_cast<int64_t>(m->labels.size());
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSlinkDestroy(iovsSlinkModel_t model) {
+ovvsStatus ovvsSlinkDestroy(ovvsSlinkModel_t model) {
   delete reinterpret_cast<Slink*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSpectralFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                           int32_t nclusters, int32_t knn, iovsSpectralModel_t* model) {
-  if (!res || !dataset || !model || n <= 0 || nclusters <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSpectralFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                           int32_t nclusters, int32_t knn, ovvsSpectralModel_t* model) {
+  if (!res || !dataset || !model || n <= 0 || nclusters <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   knn = std::max(1, std::min(knn, static_cast<int32_t>(n - 1)));
   std::vector<int64_t> nbr(static_cast<size_t>(n) * static_cast<size_t>(knn));
   std::vector<float> dist(static_cast<size_t>(n) * static_cast<size_t>(knn));
-  iovsAllNeighbors(res, dataset, n, dim, IOVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
+  ovvsAllNeighbors(res, dataset, n, dim, OVVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
   float mean = 0.f;
   for (float v : dist) mean += v;
   mean /= static_cast<float>(std::max<size_t>(dist.size(), 1));
@@ -215,37 +215,37 @@ iovsStatus iovsSpectralFit(iovsResources_t res, const float* dataset, int64_t n,
   std::vector<int64_t> labels(static_cast<size_t>(n));
   std::vector<float> dd(static_cast<size_t>(n));
   std::vector<float> sc(static_cast<size_t>(n) * static_cast<size_t>(nclusters));
-  prim_pairwise(*rd(res), IOVS_METRIC_L2_EXPANDED, embed.data(), n, cents.data(), nclusters, k, sc.data(),
+  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, embed.data(), n, cents.data(), nclusters, k, sc.data(),
                 2.f);
   prim_topk(*rd(res), sc.data(), n, nclusters, 1, labels.data(), dd.data(), false);
   auto* m = new Spectral();
   m->labels = std::move(labels);
-  *model = reinterpret_cast<iovsSpectralModel_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsSpectralModel_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSpectralLabels(iovsSpectralModel_t model, const int64_t** labels, int64_t* n) {
-  if (!model || !labels || !n) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSpectralLabels(ovvsSpectralModel_t model, const int64_t** labels, int64_t* n) {
+  if (!model || !labels || !n) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Spectral*>(model);
   *labels = m->labels.data();
   *n = static_cast<int64_t>(m->labels.size());
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSpectralDestroy(iovsSpectralModel_t model) {
+ovvsStatus ovvsSpectralDestroy(ovvsSpectralModel_t model) {
   delete reinterpret_cast<Spectral*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-static iovsStatus spectral_embed_fill(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
+static ovvsStatus spectral_embed_fill(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
                                       int32_t ncomp, int32_t knn, std::vector<float>& embed) {
   knn = std::max(1, std::min(knn, static_cast<int32_t>(n - 1)));
   ncomp = std::max(1, ncomp);
   std::vector<int64_t> nbr(static_cast<size_t>(n) * static_cast<size_t>(knn));
   std::vector<float> dist(static_cast<size_t>(n) * static_cast<size_t>(knn));
-  const iovsStatus st =
-      iovsAllNeighbors(res, dataset, n, dim, IOVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
-  if (st != IOVS_STATUS_SUCCESS) return st;
+  const ovvsStatus st =
+      ovvsAllNeighbors(res, dataset, n, dim, OVVS_METRIC_L2_EXPANDED, knn, nbr.data(), dist.data());
+  if (st != OVVS_STATUS_SUCCESS) return st;
   float mean = 0.f;
   for (float v : dist) mean += v;
   mean /= static_cast<float>(std::max<size_t>(dist.size(), 1));
@@ -304,34 +304,34 @@ static iovsStatus spectral_embed_fill(iovsResources_t res, const float* dataset,
     }
     for (int64_t i = 0; i < n; ++i) embed[static_cast<size_t>(i * ncomp + c)] = v[static_cast<size_t>(i)];
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSpectralEmbedFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                                int32_t ncomp, int32_t knn, iovsSpectralEmbed_t* model) {
-  if (!res || !dataset || !model || n <= 0 || dim <= 0 || ncomp <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSpectralEmbedFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                                int32_t ncomp, int32_t knn, ovvsSpectralEmbed_t* model) {
+  if (!res || !dataset || !model || n <= 0 || dim <= 0 || ncomp <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = new SpectralEmbed();
   m->n = n;
   m->ncomp = ncomp;
-  const iovsStatus st = spectral_embed_fill(res, dataset, n, dim, ncomp, knn, m->z);
-  if (st != IOVS_STATUS_SUCCESS) {
+  const ovvsStatus st = spectral_embed_fill(res, dataset, n, dim, ncomp, knn, m->z);
+  if (st != OVVS_STATUS_SUCCESS) {
     delete m;
     return st;
   }
-  *model = reinterpret_cast<iovsSpectralEmbed_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsSpectralEmbed_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSpectralEmbedData(iovsSpectralEmbed_t model, const float** data, int64_t* n, int32_t* ncomp) {
-  if (!model || !data || !n || !ncomp) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSpectralEmbedData(ovvsSpectralEmbed_t model, const float** data, int64_t* n, int32_t* ncomp) {
+  if (!model || !data || !n || !ncomp) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<SpectralEmbed*>(model);
   *data = m->z.data();
   *n = m->n;
   *ncomp = m->ncomp;
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSpectralEmbedDestroy(iovsSpectralEmbed_t model) {
+ovvsStatus ovvsSpectralEmbedDestroy(ovvsSpectralEmbed_t model) {
   delete reinterpret_cast<SpectralEmbed*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }

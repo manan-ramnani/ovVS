@@ -1,6 +1,6 @@
 #include "internal.hpp"
 
-using namespace iovs::impl;
+using namespace ovvs::impl;
 
 namespace {
 
@@ -32,9 +32,9 @@ struct Pca {
 
 }  // namespace
 
-iovsStatus iovsSqFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                     iovsSqModel_t* model) {
-  if (!res || !dataset || !model || n <= 0 || dim <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSqFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                     ovvsSqModel_t* model) {
+  if (!res || !dataset || !model || n <= 0 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = new Sq();
   m->dim = dim;
   m->lo.assign(static_cast<size_t>(dim), kInf);
@@ -52,12 +52,12 @@ iovsStatus iovsSqFit(iovsResources_t res, const float* dataset, int64_t n, int64
         (hi[static_cast<size_t>(d)] - m->lo[static_cast<size_t>(d)]) / 255.f;
     if (m->scale[static_cast<size_t>(d)] < 1e-12f) m->scale[static_cast<size_t>(d)] = 1.f;
   }
-  *model = reinterpret_cast<iovsSqModel_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsSqModel_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSqEncode(iovsSqModel_t model, const float* x, int64_t n, uint8_t* codes) {
-  if (!model || !x || !codes || n <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSqEncode(ovvsSqModel_t model, const float* x, int64_t n, uint8_t* codes) {
+  if (!model || !x || !codes || n <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Sq*>(model);
   for (int64_t i = 0; i < n; ++i) {
     for (int64_t d = 0; d < m->dim; ++d) {
@@ -66,11 +66,11 @@ iovsStatus iovsSqEncode(iovsSqModel_t model, const float* x, int64_t n, uint8_t*
       codes[i * m->dim + d] = static_cast<uint8_t>(t + 0.5f);
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSqDecode(iovsSqModel_t model, const uint8_t* codes, int64_t n, float* x) {
-  if (!model || !codes || !x || n <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsSqDecode(ovvsSqModel_t model, const uint8_t* codes, int64_t n, float* x) {
+  if (!model || !codes || !x || n <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Sq*>(model);
   for (int64_t i = 0; i < n; ++i) {
     for (int64_t d = 0; d < m->dim; ++d) {
@@ -78,18 +78,18 @@ iovsStatus iovsSqDecode(iovsSqModel_t model, const uint8_t* codes, int64_t n, fl
           m->lo[static_cast<size_t>(d)] + m->scale[static_cast<size_t>(d)] * codes[i * m->dim + d];
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsSqDestroy(iovsSqModel_t model) {
+ovvsStatus ovvsSqDestroy(ovvsSqModel_t model) {
   delete reinterpret_cast<Sq*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPqFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim, int32_t pq_m,
-                     int32_t pq_nbits, iovsPqModel_t* model) {
-  if (!res || !dataset || !model || n <= 0 || dim <= 0 || pq_m <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
-  if (dim % pq_m != 0) return IOVS_STATUS_SHAPE_MISMATCH;
+ovvsStatus ovvsPqFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim, int32_t pq_m,
+                     int32_t pq_nbits, ovvsPqModel_t* model) {
+  if (!res || !dataset || !model || n <= 0 || dim <= 0 || pq_m <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (dim % pq_m != 0) return OVVS_STATUS_SHAPE_MISMATCH;
   auto* m = new Pq();
   m->dim = dim;
   m->pq_m = pq_m;
@@ -107,12 +107,12 @@ iovsStatus iovsPqFit(iovsResources_t res, const float* dataset, int64_t n, int64
     std::memcpy(m->codebooks.data() + static_cast<size_t>(s) * m->ks * m->dsub, cents.data(),
                 cents.size() * sizeof(float));
   }
-  *model = reinterpret_cast<iovsPqModel_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsPqModel_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPqEncode(iovsPqModel_t model, const float* x, int64_t n, uint8_t* codes) {
-  if (!model || !x || !codes) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsPqEncode(ovvsPqModel_t model, const float* x, int64_t n, uint8_t* codes) {
+  if (!model || !x || !codes) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Pq*>(model);
   for (int64_t i = 0; i < n; ++i) {
     for (int32_t s = 0; s < m->pq_m; ++s) {
@@ -130,11 +130,11 @@ iovsStatus iovsPqEncode(iovsPqModel_t model, const float* x, int64_t n, uint8_t*
       codes[i * m->pq_m + s] = static_cast<uint8_t>(best);
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPqDecode(iovsPqModel_t model, const uint8_t* codes, int64_t n, float* x) {
-  if (!model || !codes || !x) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsPqDecode(ovvsPqModel_t model, const uint8_t* codes, int64_t n, float* x) {
+  if (!model || !codes || !x) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Pq*>(model);
   for (int64_t i = 0; i < n; ++i) {
     for (int32_t s = 0; s < m->pq_m; ++s) {
@@ -144,27 +144,27 @@ iovsStatus iovsPqDecode(iovsPqModel_t model, const uint8_t* codes, int64_t n, fl
                   static_cast<size_t>(m->dsub) * sizeof(float));
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPqDestroy(iovsPqModel_t model) {
+ovvsStatus ovvsPqDestroy(ovvsPqModel_t model) {
   delete reinterpret_cast<Pq*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsBinaryFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                         iovsBinaryQuantizer_t* model) {
-  if (!res || !dataset || !model || n <= 0 || dim <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsBinaryFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                         ovvsBinaryQuantizer_t* model) {
+  if (!res || !dataset || !model || n <= 0 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = new BinQ();
   m->dim = dim;
   m->nbytes = (dim + 7) / 8;
   (void)dataset;
-  *model = reinterpret_cast<iovsBinaryQuantizer_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsBinaryQuantizer_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsBinaryEncode(iovsBinaryQuantizer_t model, const float* x, int64_t n, uint8_t* codes) {
-  if (!model || !x || !codes) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsBinaryEncode(ovvsBinaryQuantizer_t model, const float* x, int64_t n, uint8_t* codes) {
+  if (!model || !x || !codes) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<BinQ*>(model);
   std::fill(codes, codes + n * m->nbytes, 0);
   for (int64_t i = 0; i < n; ++i) {
@@ -173,17 +173,17 @@ iovsStatus iovsBinaryEncode(iovsBinaryQuantizer_t model, const float* x, int64_t
       if (x[i * m->dim + d] >= 0.f) row[d >> 3] |= static_cast<uint8_t>(1u << (d & 7));
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsBinaryDestroy(iovsBinaryQuantizer_t model) {
+ovvsStatus ovvsBinaryDestroy(ovvsBinaryQuantizer_t model) {
   delete reinterpret_cast<BinQ*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPcaFit(iovsResources_t res, const float* dataset, int64_t n, int64_t dim, int32_t ncomp,
-                      iovsPcaModel_t* model) {
-  if (!res || !dataset || !model || n <= 0 || dim <= 0 || ncomp <= 0) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsPcaFit(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim, int32_t ncomp,
+                      ovvsPcaModel_t* model) {
+  if (!res || !dataset || !model || n <= 0 || dim <= 0 || ncomp <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   ncomp = std::min(ncomp, static_cast<int32_t>(dim));
   auto* m = new Pca();
   m->dim = dim;
@@ -207,8 +207,8 @@ iovsStatus iovsPcaFit(iovsResources_t res, const float* dataset, int64_t n, int6
   for (float& v : cov) v *= invn;
   m->components.assign(static_cast<size_t>(ncomp) * static_cast<size_t>(dim), 0.f);
   if (mkl_gesvd_components(xc.data(), n, dim, ncomp, m->components.data())) {
-    *model = reinterpret_cast<iovsPcaModel_t>(m);
-    return IOVS_STATUS_SUCCESS;
+    *model = reinterpret_cast<ovvsPcaModel_t>(m);
+    return OVVS_STATUS_SUCCESS;
   }
   auto rng = rng_from(11);
   std::uniform_real_distribution<float> u(-1.f, 1.f);
@@ -234,12 +234,12 @@ iovsStatus iovsPcaFit(iovsResources_t res, const float* dataset, int64_t n, int6
     std::memcpy(m->components.data() + static_cast<size_t>(c) * dim, v.data(),
                 static_cast<size_t>(dim) * sizeof(float));
   }
-  *model = reinterpret_cast<iovsPcaModel_t>(m);
-  return IOVS_STATUS_SUCCESS;
+  *model = reinterpret_cast<ovvsPcaModel_t>(m);
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPcaTransform(iovsPcaModel_t model, const float* x, int64_t n, float* out) {
-  if (!model || !x || !out) return IOVS_STATUS_INVALID_ARGUMENT;
+ovvsStatus ovvsPcaTransform(ovvsPcaModel_t model, const float* x, int64_t n, float* out) {
+  if (!model || !x || !out) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* m = reinterpret_cast<Pca*>(model);
   for (int64_t i = 0; i < n; ++i) {
     for (int32_t c = 0; c < m->ncomp; ++c) {
@@ -249,10 +249,10 @@ iovsStatus iovsPcaTransform(iovsPcaModel_t model, const float* x, int64_t n, flo
       out[i * m->ncomp + c] = s;
     }
   }
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }
 
-iovsStatus iovsPcaDestroy(iovsPcaModel_t model) {
+ovvsStatus ovvsPcaDestroy(ovvsPcaModel_t model) {
   delete reinterpret_cast<Pca*>(model);
-  return IOVS_STATUS_SUCCESS;
+  return OVVS_STATUS_SUCCESS;
 }

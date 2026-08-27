@@ -1,6 +1,6 @@
 #include "internal.hpp"
 
-namespace iovs {
+namespace ovvs {
 namespace impl {
 
 void cpu_gemm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
@@ -51,10 +51,10 @@ void cpu_gather_rows(const float* src, int64_t src_rows, int64_t dim, const int6
   }
 }
 
-void cpu_pairwise(iovsMetric metric, const float* x, int64_t nx, const float* y, int64_t ny,
+void cpu_pairwise(ovvsMetric metric, const float* x, int64_t nx, const float* y, int64_t ny,
                   int64_t dim, float* out, float metric_arg) {
-  if (metric == IOVS_METRIC_L2_EXPANDED || metric == IOVS_METRIC_INNER_PRODUCT ||
-      metric == IOVS_METRIC_COSINE_EXPANDED) {
+  if (metric == OVVS_METRIC_L2_EXPANDED || metric == OVVS_METRIC_INNER_PRODUCT ||
+      metric == OVVS_METRIC_COSINE_EXPANDED) {
     std::vector<float> xnorm(static_cast<size_t>(nx)), ynorm(static_cast<size_t>(ny));
     for (int64_t i = 0; i < nx; ++i) xnorm[static_cast<size_t>(i)] = nrm2sq(x + i * dim, dim);
     for (int64_t j = 0; j < ny; ++j) ynorm[static_cast<size_t>(j)] = nrm2sq(y + j * dim, dim);
@@ -62,9 +62,9 @@ void cpu_pairwise(iovsMetric metric, const float* x, int64_t nx, const float* y,
     for (int64_t i = 0; i < nx; ++i) {
       for (int64_t j = 0; j < ny; ++j) {
         const float ip = out[i * ny + j];
-        if (metric == IOVS_METRIC_INNER_PRODUCT) {
+        if (metric == OVVS_METRIC_INNER_PRODUCT) {
           out[i * ny + j] = -ip;
-        } else if (metric == IOVS_METRIC_COSINE_EXPANDED) {
+        } else if (metric == OVVS_METRIC_COSINE_EXPANDED) {
           const float nxv = std::sqrt(std::max(xnorm[static_cast<size_t>(i)], 1e-12f));
           const float nyv = std::sqrt(std::max(ynorm[static_cast<size_t>(j)], 1e-12f));
           out[i * ny + j] = 1.f - ip / (nxv * nyv);
@@ -83,4 +83,4 @@ void cpu_pairwise(iovsMetric metric, const float* x, int64_t nx, const float* y,
 }
 
 }  // namespace impl
-}  // namespace iovs
+}  // namespace ovvs
