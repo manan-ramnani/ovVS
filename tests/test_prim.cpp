@@ -125,6 +125,34 @@ OVVS_TEST(gemm_gpu_f16_vs_cpu) {
   expect(maxe < 0.15f, "gpu f16 vs cpu " + std::to_string(maxe));
 }
 
+OVVS_TEST(gemm_gpu_i8_vs_cpu) {
+  Res res;
+  int32_t gpu = 0;
+  ovvsResourcesGpuAvailable(res.r, &gpu);
+  if (!gpu) return;
+  const int64_t m = 32, n = 32, k = 64;
+  auto A = make_data(m, k, 95);
+  auto B = make_data(n, k, 96);
+  std::vector<float> cpu(static_cast<size_t>(m * n)), got(static_cast<size_t>(m * n));
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(ovvsGemm(res.r, A.data(), B.data(), cpu.data(), m, n, k, 1), "cpu");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  const ovvsStatus st = ovvsGemmEx(res.r, A.data(), B.data(), got.data(), m, n, k, 1, OVVS_DTYPE_I8);
+  if (st != OVVS_STATUS_SUCCESS) {
+    expect(st == OVVS_STATUS_DEVICE_UNAVAILABLE, "gpu i8");
+    return;
+  }
+  ovvsDType dt = OVVS_DTYPE_F32;
+  ovvsResourcesLastComputeDtype(res.r, &dt);
+  expect(dt == OVVS_DTYPE_I8, "gpu i8 compute dtype");
+  float maxe = 0.f;
+  for (size_t i = 0; i < cpu.size(); ++i) {
+    const float denom = std::max(1.f, std::fabs(cpu[i]));
+    maxe = std::max(maxe, std::fabs(cpu[i] - got[i]) / denom);
+  }
+  expect(maxe < 0.25f, "gpu i8 rel err " + std::to_string(maxe));
+}
+
 OVVS_TEST(gemm_npu_matches_cpu_when_present) {
   Res res;
   int32_t npu = 0;

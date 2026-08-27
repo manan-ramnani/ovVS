@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 203.4551, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 310.7626, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 662.0309, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 228.7991, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 309.7696, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 172.4225, "status": "success"}
   ],
-  "note": "FakeQuantize-marked INT8 MatMul (NPU rejects raw si8). Probe npu_matmul_i8=ok. At 1e5x32x768 FQ+INT8 is slower than FP16/FP32 NPU (311 vs 132/117 ms); launch/quant tax. Keep the path for SKUs where INT8 MAC wins."
+  "note": "oneMKL int8×int8→float on Xe-LPG XMX. iGPU 172 ms beats CPU 229 and NPU FakeQuantize-INT8 310. NCE INT8 TOPS are not visible through FQ MatMul on this SKU; AUTO I8 → GPU. FORCE_NPU still runs the NPU path."
 }

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 
 #if defined(OVVS_WITH_SYCL)
@@ -41,6 +43,8 @@ static T* usm_scratch(size_t n) {
 
 static float* usm_f(size_t n) { return usm_scratch<float>(n); }
 static int64_t* usm_i64(size_t n) { return usm_scratch<int64_t>(n); }
+static sycl::half* usm_h(size_t n) { return usm_scratch<sycl::half>(n); }
+static std::int8_t* usm_i8(size_t n) { return usm_scratch<std::int8_t>(n); }
 #endif
 
 void* ovvs_usm_malloc(size_t bytes) {
@@ -190,6 +194,73 @@ static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, in
   if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
   return true;
 }
+
+static bool gemm_mkl_f16(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
+                         bool trans_b) {
+  auto& q = gpu_queue();
+  const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
+  const size_t bsz = trans_b ? N * K : K * N;
+  sycl::half* packed = usm_h(M * K + bsz);
+  float* C = ovvs_usm_is_shared(c) ? c : usm_f(M * N);
+  if (!packed || !C) return false;
+  sycl::half* A = packed;
+  sycl::half* B = packed + M * K;
+  for (size_t i = 0; i < M * K; ++i) A[i] = static_cast<sycl::half>(a[i]);
+  for (size_t i = 0; i < bsz; ++i) B[i] = static_cast<sycl::half>(b[i]);
+  const auto transA = oneapi::mkl::transpose::nontrans;
+  const auto transB = trans_b ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans;
+  const std::int64_t lda = static_cast<std::int64_t>(K);
+  const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
+  const std::int64_t ldc = static_cast<std::int64_t>(N);
+  oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, 1.f, A, lda, B, ldb, 0.f, C, ldc);
+  q.wait();
+  if (!ovvs_usm_is_shared(c)) std::memcpy(c, C, M * N * sizeof(float));
+  return true;
+}
+
+static bool gemm_mkl_i8(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
+                        bool trans_b) {
+  auto& q = gpu_queue();
+  const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
+  const size_t asz = M * K;
+  const size_t bsz = trans_b ? N * K : K * N;
+  std::int8_t* packed = usm_i8(asz + bsz);
+  float* C = ovvs_usm_is_shared(c) ? c : usm_f(M * N);
+  if (!packed || !C) return false;
+  std::int8_t* A = packed;
+  std::int8_t* B = packed + asz;
+  auto maxabs = [](const float* p, size_t n) {
+    float m = 0.f;
+    for (size_t i = 0; i < n; ++i) {
+      const float v = std::fabs(p[i]);
+      if (v > m) m = v;
+    }
+    return m;
+  };
+  const float sa = std::max(maxabs(a, asz) / 127.f, 1e-8f);
+  const float sb = std::max(maxabs(b, bsz) / 127.f, 1e-8f);
+  auto quant = [](const float* src, std::int8_t* dst, size_t n, float scale) {
+    const float inv = 1.f / scale;
+    for (size_t i = 0; i < n; ++i) {
+      float v = src[i] * inv;
+      if (v > 127.f) v = 127.f;
+      if (v < -127.f) v = -127.f;
+      dst[i] = static_cast<std::int8_t>(std::lrintf(v));
+    }
+  };
+  quant(a, A, asz, sa);
+  quant(b, B, bsz, sb);
+  const float alpha = sa * sb;
+  const auto transA = oneapi::mkl::transpose::nontrans;
+  const auto transB = trans_b ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans;
+  const std::int64_t lda = static_cast<std::int64_t>(K);
+  const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
+  const std::int64_t ldc = static_cast<std::int64_t>(N);
+  oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, alpha, A, lda, B, ldb, 0.f, C, ldc);
+  q.wait();
+  if (!ovvs_usm_is_shared(c)) std::memcpy(c, C, M * N * sizeof(float));
+  return true;
+}
 #endif
 
 enum class GpuGemmKind { Unset, Mkl, Sycl };
@@ -275,9 +346,19 @@ bool gpu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const
                       int64_t m, int64_t n, int64_t k, bool trans_b) {
   if (compute == OVVS_DTYPE_F32) return gpu_gemm(r, a, b, c, m, n, k, trans_b);
 #if defined(OVVS_WITH_SYCL)
-  if (compute == OVVS_DTYPE_F16 && gpu_available()) {
+  if (gpu_available()) {
     try {
-      if (gemm_sycl_f16(a, b, c, m, n, k, trans_b)) {
+#if defined(OVVS_WITH_MKL)
+      if (compute == OVVS_DTYPE_F16 && gemm_mkl_f16(a, b, c, m, n, k, trans_b)) {
+        r.last_compute_dtype = OVVS_DTYPE_F16;
+        return true;
+      }
+      if (compute == OVVS_DTYPE_I8 && gemm_mkl_i8(a, b, c, m, n, k, trans_b)) {
+        r.last_compute_dtype = OVVS_DTYPE_I8;
+        return true;
+      }
+#endif
+      if (compute == OVVS_DTYPE_F16 && gemm_sycl_f16(a, b, c, m, n, k, trans_b)) {
         r.last_compute_dtype = OVVS_DTYPE_F16;
         return true;
       }

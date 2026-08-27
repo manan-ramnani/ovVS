@@ -270,7 +270,8 @@ bool npu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const
 bool npu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
               int64_t k, bool trans_b) {
   const bool large = (m * n * k) >= (64LL * 64LL * 32LL);
-  if (large && npu_gemm_compute(r, OVVS_DTYPE_F16, a, b, c, m, n, k, trans_b)) return true;
+  /* NCE MACs are INT8-native (FP16 at half rate). Prefer quantized INT8 on large GEMM. */
+  if (large && npu_gemm_compute(r, OVVS_DTYPE_I8, a, b, c, m, n, k, trans_b)) return true;
   if (npu_gemm_compute(r, OVVS_DTYPE_F32, a, b, c, m, n, k, trans_b)) return true;
   return false;
 }

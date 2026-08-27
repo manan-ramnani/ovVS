@@ -6,9 +6,9 @@
   "gpu": true,
   "sycl": true,
   "runs": [
-    {"requested": "cpu", "last_device": "cpu", "ms": 200.2876, "status": "success"},
-    {"requested": "npu", "last_device": "npu", "ms": 131.6027, "status": "success"},
-    {"requested": "gpu", "last_device": "gpu", "ms": 213.5924, "status": "success"}
+    {"requested": "cpu", "last_device": "cpu", "ms": 223.8595, "status": "success"},
+    {"requested": "npu", "last_device": "npu", "ms": 148.1814, "status": "success"},
+    {"requested": "gpu", "last_device": "gpu", "ms": 108.3167, "status": "success"}
   ],
-  "note": "Host fp32, NPU Convert+FP16 MatMul (static). NPU 132 ms vs CPU 200 vs GPU SYCL-half 214. Probe npu_matmul_f16=ok. f8e4m3/f4e2m1 compile_fail on this 3720-class NPU."
+  "note": "oneMKL sycl::half GEMM on Xe-LPG XMX. iGPU 108 ms beats NPU Convert+FP16 148 and CPU 224. AUTO F16 → GPU."
 }

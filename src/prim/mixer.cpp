@@ -49,23 +49,43 @@ static ovvsStatus finish_forced_fail(ResourcesData& r) {
 ovvsStatus prim_gemm_compute(ResourcesData& r, const float* a, const float* b, float* c, int64_t m,
                              int64_t n, int64_t k, bool trans_b, ovvsDType compute) {
   r.last_compute_dtype = OVVS_DTYPE_F32;
-  const ovvsDevice d = choose_device(r, "gemm", m * n * k);
-  if (d == OVVS_DEVICE_NPU) {
+  const ovvsDevice forced = policy_force(r.policy);
+  auto try_npu = [&]() {
     if (npu_gemm_compute(r, compute, a, b, c, m, n, k, trans_b)) {
       r.last_device = OVVS_DEVICE_NPU;
-      return OVVS_STATUS_SUCCESS;
+      return true;
     }
-    if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
-  }
-  if (d == OVVS_DEVICE_GPU || (d == OVVS_DEVICE_NPU && r.policy != OVVS_POLICY_FORCE_CPU)) {
+    return false;
+  };
+  auto try_gpu = [&]() {
     if (gpu_gemm_compute(r, compute, a, b, c, m, n, k, trans_b)) {
       r.last_device = OVVS_DEVICE_GPU;
-      return OVVS_STATUS_SUCCESS;
+      return true;
     }
-    if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
-  }
-  if (r.policy == OVVS_POLICY_FORCE_NPU || r.policy == OVVS_POLICY_FORCE_GPU) {
+    return false;
+  };
+  if (forced == OVVS_DEVICE_NPU) {
+    if (try_npu()) return OVVS_STATUS_SUCCESS;
     return finish_forced_fail(r);
+  }
+  if (forced == OVVS_DEVICE_GPU) {
+    if (try_gpu()) return OVVS_STATUS_SUCCESS;
+    return finish_forced_fail(r);
+  }
+  if (forced == OVVS_DEVICE_CPU) {
+    cpu_gemm(a, b, c, m, n, k, trans_b);
+    r.last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  }
+  /* AUTO: iGPU XMX is the FP16 *and* INT8 winner on Arrow Lake (oneMKL).
+     NPU INT8 TOPS are real, but OpenVINO FQ MatMul is slower than XMX here; FORCE_NPU still hits NPU. */
+  if (compute == OVVS_DTYPE_F16 || compute == OVVS_DTYPE_I8) {
+    if (r.gpu_available && try_gpu()) return OVVS_STATUS_SUCCESS;
+    if (r.npu_available && !r.npu_busy && try_npu()) return OVVS_STATUS_SUCCESS;
+  } else {
+    const ovvsDevice d = choose_device(r, "gemm", m * n * k);
+    if (d == OVVS_DEVICE_NPU && try_npu()) return OVVS_STATUS_SUCCESS;
+    if ((d == OVVS_DEVICE_GPU || d == OVVS_DEVICE_NPU) && try_gpu()) return OVVS_STATUS_SUCCESS;
   }
   cpu_gemm(a, b, c, m, n, k, trans_b);
   r.last_device = OVVS_DEVICE_CPU;
