@@ -33,6 +33,15 @@ and firmware runs that blob. `ovvs_probe` reports `shave_silicon_load: compiler_
 OpenVINO issue [31847](https://github.com/openvinotoolkit/openvino/issues/31847):
 NPU kernels are closed relative to GPU OpenCL custom ops.
 
+OpenVINO 2026 does not change that public boundary. Its custom-operation extension
+defines graph semantics, shape inference, serialization, and optional CPU
+`evaluate`; it is not a target-specific NPU kernel registration API. The 2026
+compiler-in-plugin path may shorten the firmware/compiler release loop, but it
+still compiles supported OpenVINO graphs to the proprietary NPU format. Treat an
+NPU custom op as unsupported until the compiler accepts it and profiling proves
+device execution. References: [custom operations](https://docs.openvino.ai/2026/documentation/openvino-extensibility/custom-openvino-operations.html),
+[NPU plugin design](https://github.com/openvinotoolkit/openvino/blob/master/src/plugins/intel_npu/README.md).
+
 ## How a new SHAVE kernel would land
 
 1. SHAVE C in this directory (`adc.c`, `topk.c`) — host-linked oracles today.
