@@ -26,6 +26,7 @@ from _common import (
     load_ovvs,
     measure_energy,
     measure_search,
+    ovvs_loaded_library_identity,
     ovvs_resource_metadata,
     package_version,
     point_failure_reason,
@@ -39,7 +40,11 @@ from _common import (
 
 
 def exception_point_status(exc: Exception) -> str:
-    return "unavailable" if getattr(exc, "status", None) == 7 else "failed"
+    unavailable = isinstance(
+        exc,
+        (UnavailableError, ImportError, FileNotFoundError, OSError),
+    ) or getattr(exc, "status", None) == 7
+    return "unavailable" if unavailable else "failed"
 
 
 def process_peak_rss() -> dict[str, Any]:
@@ -825,11 +830,50 @@ def _selected_points(spec: dict[str, Any], algorithm: str) -> list[dict[str, Any
     return points
 
 
-def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
-    import numpy as np
+def _loaded_ovvs_metadata(module: Any, loaded_library: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "library": os.environ.get("OVVS_LIBRARY"),
+        "loaded_library": loaded_library,
+    }
+    try:
+        metadata["ovvs_version"] = module.version()
+    except Exception as exc:
+        metadata["ovvs_version_error"] = f"{type(exc).__name__}: {exc}"
+    return metadata
 
+
+def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     started_at, started = utc_now(), time.perf_counter()
     module = load_ovvs(spec.get("library"))
+    loaded_library = ovvs_loaded_library_identity(module, spec.get("library"))
+    try:
+        return _run_loaded_ovvs(
+            spec,
+            lane,
+            module,
+            loaded_library,
+            started_at,
+            started,
+        )
+    except Exception as exc:
+        return _error(
+            lane,
+            exception_point_status(exc),
+            exc,
+            implementation_metadata=_loaded_ovvs_metadata(module, loaded_library),
+        )
+
+
+def _run_loaded_ovvs(
+    spec: dict[str, Any],
+    lane: dict[str, Any],
+    module: Any,
+    loaded_library: dict[str, Any],
+    started_at: str,
+    started: float,
+) -> dict[str, Any]:
+    import numpy as np
+
     resources, index = module.Resources(), None
     try:
         before = ovvs_resource_metadata(module, resources)
@@ -908,6 +952,7 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 "implementation_metadata": {
                     "ovvs_version": module.version(),
                     "library": os.environ.get("OVVS_LIBRARY"),
+                    "loaded_library": loaded_library,
                     "resource_before": before,
                     "resource_after": build_after,
                     "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence",
@@ -972,6 +1017,7 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 "implementation_metadata": {
                     "ovvs_version": module.version(),
                     "library": os.environ.get("OVVS_LIBRARY"),
+                    "loaded_library": loaded_library,
                     "resource_before": before,
                     "resource_after": build_after,
                     "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence",
@@ -1147,6 +1193,7 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
             "implementation_metadata": {
                 "ovvs_version": module.version(),
                 "library": os.environ.get("OVVS_LIBRARY"),
+                "loaded_library": loaded_library,
                 "resource_before": before,
                 "resource_after": ovvs_resource_metadata(module, resources),
                 "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence",
@@ -1487,8 +1534,6 @@ def _hnsw_export_graph_stats(path: Path) -> dict[str, Any]:
 def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     """Build with ovVS CAGRA, export, then search through unmodified hnswlib."""
 
-    import numpy as np
-
     try:
         import hnswlib
     except ImportError as exc:
@@ -1496,6 +1541,39 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
 
     started_at, started = utc_now(), time.perf_counter()
     module = load_ovvs(spec.get("library"))
+    loaded_library = ovvs_loaded_library_identity(module, spec.get("library"))
+    try:
+        return _run_loaded_hnsw_export(
+            spec,
+            lane,
+            module,
+            hnswlib,
+            loaded_library,
+            started_at,
+            started,
+        )
+    except Exception as exc:
+        metadata = _loaded_ovvs_metadata(module, loaded_library)
+        metadata["hnswlib_version"] = package_version("hnswlib")
+        return _error(
+            lane,
+            exception_point_status(exc),
+            exc,
+            implementation_metadata=metadata,
+        )
+
+
+def _run_loaded_hnsw_export(
+    spec: dict[str, Any],
+    lane: dict[str, Any],
+    module: Any,
+    hnswlib: Any,
+    loaded_library: dict[str, Any],
+    started_at: str,
+    started: float,
+) -> dict[str, Any]:
+    import numpy as np
+
     base, queries = load_dataset(spec["dataset"])
     truth = np.load(spec["truth_path"], allow_pickle=False).tolist() if Path(spec["truth_path"]).exists() else None
     profile = spec["profile"]
@@ -1694,6 +1772,7 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
                 "implementation_metadata": {
                     "ovvs_version": module.version(),
                     "hnswlib_version": package_version("hnswlib"),
+                    "loaded_library": loaded_library,
                     "build_policy": POLICY_LABELS[build_policy],
                     "cagra_build_algo": cagra_build_algo,
                 },
@@ -1786,6 +1865,7 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
                 "ovvs_version": module.version(),
                 "hnswlib_version": package_version("hnswlib"),
                 "library": os.environ.get("OVVS_LIBRARY"),
+                "loaded_library": loaded_library,
                 "producer": "ovVS CAGRA build plus single-layer hnswlib export",
                 "build_policy": POLICY_LABELS[build_policy],
                 "cagra_build_algo": cagra_build_algo,
@@ -1804,8 +1884,13 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
         }
 
 
-def _error(lane: dict[str, Any], status: str, exc: Exception) -> dict[str, Any]:
-    return {
+def _error(
+    lane: dict[str, Any],
+    status: str,
+    exc: Exception,
+    implementation_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
         **lane,
         "status": status,
         "reason": str(exc),
@@ -1815,6 +1900,9 @@ def _error(lane: dict[str, Any], status: str, exc: Exception) -> dict[str, Any]:
             "traceback_tail": traceback.format_exc().splitlines()[-12:],
         },
     }
+    if implementation_metadata is not None:
+        result["implementation_metadata"] = implementation_metadata
+    return result
 
 
 def run_worker(spec: dict[str, Any], lane_id: str) -> dict[str, Any]:

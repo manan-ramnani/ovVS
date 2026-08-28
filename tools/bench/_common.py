@@ -445,6 +445,69 @@ def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def ovvs_loaded_library_identity(module: Any, requested_library: str | None) -> dict[str, Any]:
+    """Bind benchmark evidence to the actual shared library loaded by ctypes."""
+
+    raw_name = getattr(getattr(module, "_lib", None), "_name", None)
+    if not raw_name:
+        return {
+            "status": "unavailable",
+            "reason": "the ovVS ctypes library has no loaded-module name",
+        }
+    try:
+        loaded = Path(str(raw_name)).expanduser().resolve(strict=True)
+        stat = loaded.stat()
+        requested = (
+            Path(requested_library).expanduser().resolve(strict=True)
+            if requested_library
+            else None
+        )
+        matches_requested = (
+            os.path.samefile(loaded, requested) if requested is not None else None
+        )
+        identity = {
+            "status": "success" if requested is None or matches_requested else "invalid",
+            "resolved_path": str(loaded),
+            "sha256": sha256_file(loaded),
+            "size_bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "requested_path": str(requested) if requested is not None else None,
+            "matches_requested_path": matches_requested,
+        }
+        if requested is not None and not matches_requested:
+            identity["reason"] = "the loaded ovVS library does not match --library"
+        return identity
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "unavailable",
+            "loaded_name": str(raw_name),
+            "requested_path": requested_library,
+            "reason": f"could not fingerprint the loaded ovVS library: {exc}",
+        }
+
+
+def fixed_ovvs_library_issue(lane: dict[str, Any]) -> str | None:
+    """Return why a fixed gate is not bound to an explicitly requested binary."""
+
+    identity = lane.get("implementation_metadata", {}).get("loaded_library")
+    if not isinstance(identity, dict) or identity.get("status") != "success":
+        return "loaded ovVS library identity is unavailable or invalid"
+    sha256 = identity.get("sha256")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(char not in "0123456789abcdef" for char in sha256)
+        or type(identity.get("size_bytes")) is not int
+        or identity["size_bytes"] <= 0
+        or type(identity.get("mtime_ns")) is not int
+        or identity["mtime_ns"] <= 0
+    ):
+        return "loaded ovVS library fingerprint is incomplete"
+    if identity.get("matches_requested_path") is not True:
+        return "fixed evidence was not tied to an explicit matching --library path"
+    return None
+
+
 def load_ovvs(explicit_library: str | None = None):
     if explicit_library:
         path = Path(explicit_library).expanduser().resolve()
@@ -1012,6 +1075,9 @@ def cagra_recall_gate_result(
     build_stats_issue = fixed_cagra_build_stats_issue(build)
     if build_stats_issue:
         issues.append(f"ovVS CAGRA gate build: {build_stats_issue}")
+    library_issue = fixed_ovvs_library_issue(cagra_lane)
+    if library_issue:
+        issues.append(f"ovVS CAGRA gate binary: {library_issue}")
     contract = cagra_point.get("policy_contract", {})
     if (
         contract.get("requested") != "FORCE_GPU"
@@ -1271,6 +1337,9 @@ def cagra_sift100k_preflight_result(
     build_stats_issue = fixed_cagra_build_stats_issue(build)
     if build_stats_issue:
         issues.append(f"ovVS CAGRA preflight build: {build_stats_issue}")
+    library_issue = fixed_ovvs_library_issue(cagra_lane)
+    if library_issue:
+        issues.append(f"ovVS CAGRA preflight binary: {library_issue}")
     contract = cagra_point.get("policy_contract", {})
     if (
         contract.get("requested") != "FORCE_GPU"

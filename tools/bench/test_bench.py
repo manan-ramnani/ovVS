@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import importlib.util
 import json
 import struct
@@ -200,6 +201,18 @@ def gate_truth() -> dict:
     }
 
 
+def valid_loaded_library_identity() -> dict:
+    return {
+        "status": "success",
+        "resolved_path": "C:/Personal/ioVS/build-icpx/bin/ovvs.dll",
+        "sha256": "a" * 64,
+        "size_bytes": 1_048_576,
+        "mtime_ns": 1_000_000_000,
+        "requested_path": "C:/Personal/ioVS/build-icpx/bin/ovvs.dll",
+        "matches_requested_path": True,
+    }
+
+
 def gate_lanes(cagra_recall: float = 0.88, hnsw_recall: float = 0.90,
                walks: int = 192, threads: int = 20) -> list[dict]:
     transfer = _cagra_transfer_evidence(
@@ -212,6 +225,9 @@ def gate_lanes(cagra_recall: float = 0.88, hnsw_recall: float = 0.90,
         },
     )
     cagra = successful_gpu_cagra_lane(transfer)
+    cagra["implementation_metadata"] = {
+        "loaded_library": valid_loaded_library_identity(),
+    }
     measurement = {
         "warmup_passes": 1,
         "measured_passes": 5,
@@ -325,6 +341,26 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(summary["count"], 3)
         self.assertEqual(summary["median"], 2.0)
         self.assertAlmostEqual(summary["p95"], 2.9)
+
+    def test_loaded_ovvs_library_identity_hashes_actual_binary_and_matches_request(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            library = Path(raw) / "ovvs.dll"
+            library.write_bytes(b"ovvs-test-binary")
+            module = SimpleNamespace(_lib=SimpleNamespace(_name=str(library)))
+            identity = _common.ovvs_loaded_library_identity(module, str(library))
+            self.assertEqual(identity["status"], "success")
+            self.assertEqual(
+                identity["sha256"],
+                hashlib.sha256(b"ovvs-test-binary").hexdigest(),
+            )
+            self.assertEqual(identity["size_bytes"], 16)
+            self.assertTrue(identity["matches_requested_path"])
+
+            other = Path(raw) / "other.dll"
+            other.write_bytes(b"other")
+            mismatch = _common.ovvs_loaded_library_identity(module, str(other))
+            self.assertEqual(mismatch["status"], "invalid")
+            self.assertFalse(mismatch["matches_requested_path"])
 
     def test_neighbor_validation_checks_duplicates_range_and_finiteness(self) -> None:
         result = validate_neighbors(
@@ -458,6 +494,28 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(cpu["status"], "invalid")
         self.assertTrue(
             any("instrumented GPU" in issue for issue in cpu["validation"]["issues"])
+        )
+
+    def test_fixed_gate_requires_loaded_binary_fingerprint_and_explicit_match(self) -> None:
+        lanes = gate_lanes()
+        del lanes[0]["implementation_metadata"]["loaded_library"]
+        missing = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(missing["status"], "invalid")
+        self.assertTrue(
+            any("gate binary" in issue for issue in missing["validation"]["issues"])
+        )
+
+        lanes = gate_lanes()
+        identity = lanes[0]["implementation_metadata"]["loaded_library"]
+        identity["matches_requested_path"] = None
+        unmatched = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(unmatched["status"], "invalid")
+        self.assertTrue(
+            any("explicit matching --library" in issue for issue in unmatched["validation"]["issues"])
         )
 
     def test_cagra_recall_gate_rejects_wrong_transfer_count_and_truth(self) -> None:
@@ -1670,6 +1728,60 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         self.assertEqual(result["build"]["resource_deltas"]["npu_compile_fails"], 2)
         self.assertEqual(result["build"]["fallback_telemetry"]["npu_compile_fails"]["delta"], 2)
         self.assertEqual(result["build"]["fallback_telemetry"]["npu_fallbacks"]["delta"], 5)
+
+    def test_early_loaded_ovvs_failure_retains_binary_identity(self) -> None:
+        resources = self.FakeResources()
+        identity = valid_loaded_library_identity()
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(
+                _worker,
+                "ovvs_loaded_library_identity",
+                return_value=identity,
+            ),
+            patch.object(
+                _worker,
+                "ovvs_resource_metadata",
+                return_value={"gpu_available": 0, "npu_available": 1},
+            ),
+        ):
+            result = _worker.run_ovvs(self.spec(), self.lane("gpu"))
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("resource probe reports no GPU", result["reason"])
+        self.assertEqual(result["implementation_metadata"]["loaded_library"], identity)
+        self.assertEqual(result["implementation_metadata"]["ovvs_version"], "test")
+        self.assertTrue(resources.closed)
+
+    def test_early_loaded_hnsw_export_failure_retains_binary_identity(self) -> None:
+        resources = self.FakeResources()
+        identity = valid_loaded_library_identity()
+        spec = self.spec()
+        lane = {
+            "id": "ovvs.cagra-hnsw-export.auto",
+            "implementation": "hnswlib-export",
+            "algorithm": "cagra-hnsw-export",
+        }
+        with (
+            patch.dict(sys.modules, {"hnswlib": SimpleNamespace()}),
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(
+                _worker,
+                "ovvs_loaded_library_identity",
+                return_value=identity,
+            ),
+            patch.object(
+                _worker,
+                "load_dataset",
+                side_effect=FileNotFoundError("fixture is missing"),
+            ),
+        ):
+            result = _worker.run_hnsw_export(spec, lane)
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("fixture is missing", result["reason"])
+        self.assertEqual(result["implementation_metadata"]["loaded_library"], identity)
+        self.assertEqual(result["implementation_metadata"]["ovvs_version"], "test")
 
     def test_failed_build_keeps_status_reason_duration_and_telemetry(self) -> None:
         resources = self.FakeResources()
