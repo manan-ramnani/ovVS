@@ -135,10 +135,16 @@ void record_ivf_pq_rebuild(ResourcesData& resources, int64_t rows) noexcept {
 }
 
 void record_ivf_pq_search_layout(ResourcesData& resources, int64_t direct_rows,
+                                 int64_t id_copy_bytes_avoided,
+                                 int64_t selected_id_resolutions,
                                  int64_t filtered_copy_bytes) noexcept {
   try {
     std::lock_guard<std::mutex> lock(resources.ivfpq_stats_mutex);
     saturating_add(resources.ivfpq_unfiltered_direct_rows, direct_rows);
+    saturating_add(resources.ivfpq_unfiltered_id_copy_bytes_avoided,
+                   id_copy_bytes_avoided);
+    saturating_add(resources.ivfpq_selected_id_resolutions,
+                   selected_id_resolutions);
     saturating_add(resources.ivfpq_filtered_code_copy_bytes, filtered_copy_bytes);
   } catch (...) {
   }
@@ -529,6 +535,8 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
   if (krefine < static_cast<int32_t>(k)) krefine = static_cast<int32_t>(k);
   try {
     int64_t direct_rows = 0;
+    int64_t id_copy_bytes_avoided = 0;
+    int64_t selected_id_resolutions = 0;
     int64_t filtered_copy_bytes = 0;
     std::vector<int64_t> cl(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
     std::vector<float> cd(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
@@ -648,7 +656,11 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         return OVVS_STATUS_SHAPE_MISMATCH;
       }
 
-      candidate_ids.resize(candidate_count);
+      if (bitset) {
+        candidate_ids.resize(candidate_count);
+      } else {
+        candidate_ids.clear();
+      }
       adc.resize(candidate_count);
       tasks.resize(plans.size());
       lut_storage.resize(plans.size() * table_elements);
@@ -681,12 +693,16 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         const uint8_t* task_codes = nullptr;
         if (!bitset) {
           const size_t list_begin = static_cast<size_t>(plan.list_begin);
-          const size_t rows = static_cast<size_t>(plan.rows);
-          std::memcpy(candidate_ids.data() + output_offset,
-                      ix->packed_ids.data() + list_begin, rows * sizeof(int64_t));
           task_codes =
               ix->packed_codes.data() + list_begin * static_cast<size_t>(ix->pq_m);
           saturating_add(direct_rows, plan.rows);
+          if (plan.rows > std::numeric_limits<int64_t>::max() /
+                              static_cast<int64_t>(sizeof(int64_t))) {
+            id_copy_bytes_avoided = std::numeric_limits<int64_t>::max();
+          } else {
+            saturating_add(id_copy_bytes_avoided,
+                           plan.rows * static_cast<int64_t>(sizeof(int64_t)));
+          }
         } else {
           size_t destination = output_offset;
           for (int64_t position = plan.list_begin; position < plan.list_end; ++position) {
@@ -726,6 +742,28 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         return OVVS_STATUS_ERROR;
       }
 
+      auto resolve_unfiltered_id = [&](int64_t dense_offset, int64_t& id) {
+        const auto found = std::upper_bound(
+            plans.begin(), plans.end(), dense_offset,
+            [](int64_t offset, const AdcPlan& plan) {
+              return offset < plan.output_offset;
+            });
+        if (found == plans.begin()) return false;
+        const AdcPlan& plan = *std::prev(found);
+        const int64_t in_plan = dense_offset - plan.output_offset;
+        if (in_plan < 0 || in_plan >= plan.rows ||
+            plan.list_begin > std::numeric_limits<int64_t>::max() - in_plan) {
+          return false;
+        }
+        const int64_t packed_position = plan.list_begin + in_plan;
+        if (packed_position < 0 ||
+            packed_position >= static_cast<int64_t>(ix->packed_ids.size())) {
+          return false;
+        }
+        id = ix->packed_ids[static_cast<size_t>(packed_position)];
+        return id >= 0 && id < ix->ds.n;
+      };
+
       int64_t max_refine = 0;
       for (int64_t local_query = 0; local_query < block_queries; ++local_query) {
         const int64_t count = query_offsets[static_cast<size_t>(local_query + 1)] -
@@ -760,8 +798,17 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         for (int64_t t = 0; t < kr; ++t) {
           const int64_t selected = topk_indices[static_cast<size_t>(t)];
           if (selected < 0 || selected >= query_rows) return OVVS_STATUS_ERROR;
-          candidates[static_cast<size_t>(t)] =
-              candidate_ids[static_cast<size_t>(query_begin + selected)];
+          const int64_t dense_offset = query_begin + selected;
+          if (bitset) {
+            candidates[static_cast<size_t>(t)] =
+                candidate_ids[static_cast<size_t>(dense_offset)];
+          } else {
+            if (!resolve_unfiltered_id(
+                    dense_offset, candidates[static_cast<size_t>(t)])) {
+              return OVVS_STATUS_ERROR;
+            }
+            saturating_add(selected_id_resolutions, 1);
+          }
         }
         status = prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim,
                                   candidates.data(), kr,
@@ -791,7 +838,8 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
 
     std::memcpy(neighbors, staged_neighbors.data(), staged_neighbors.size() * sizeof(int64_t));
     std::memcpy(distances, staged_distances.data(), staged_distances.size() * sizeof(float));
-    record_ivf_pq_search_layout(*rd(res), direct_rows, filtered_copy_bytes);
+    record_ivf_pq_search_layout(*rd(res), direct_rows, id_copy_bytes_avoided,
+                                selected_id_resolutions, filtered_copy_bytes);
     return OVVS_STATUS_SUCCESS;
   } catch (const std::length_error&) {
     return OVVS_STATUS_SHAPE_MISMATCH;

@@ -165,6 +165,8 @@ struct ResourcesData {
   int64_t ivfpq_packed_rebuilds = 0;
   int64_t ivfpq_packed_rebuild_rows = 0;
   int64_t ivfpq_unfiltered_direct_rows = 0;
+  int64_t ivfpq_unfiltered_id_copy_bytes_avoided = 0;
+  int64_t ivfpq_selected_id_resolutions = 0;
   int64_t ivfpq_filtered_code_copy_bytes = 0;
   std::mutex pq_adc_stats_mutex;
   int64_t pq_adc_calls = 0;

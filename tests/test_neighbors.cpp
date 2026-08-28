@@ -142,6 +142,8 @@ struct IvfPqStatsSnapshot {
   int64_t packed_rebuilds = 0;
   int64_t packed_rebuild_rows = 0;
   int64_t unfiltered_direct_rows = 0;
+  int64_t unfiltered_id_copy_bytes_avoided = 0;
+  int64_t selected_id_resolutions = 0;
   int64_t filtered_code_copy_bytes = 0;
 };
 
@@ -149,7 +151,10 @@ static IvfPqStatsSnapshot ivfpq_stats(ovvsResources_t resources) {
   auto* data = ovvs::impl::rd(resources);
   std::lock_guard<std::mutex> lock(data->ivfpq_stats_mutex);
   return {data->ivfpq_packed_rebuilds, data->ivfpq_packed_rebuild_rows,
-          data->ivfpq_unfiltered_direct_rows, data->ivfpq_filtered_code_copy_bytes};
+          data->ivfpq_unfiltered_direct_rows,
+          data->ivfpq_unfiltered_id_copy_bytes_avoided,
+          data->ivfpq_selected_id_resolutions,
+          data->ivfpq_filtered_code_copy_bytes};
 }
 
 struct PqAdcStatsSnapshot {
@@ -690,6 +695,13 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
   expect(direct.unfiltered_direct_rows ==
              built.unfiltered_direct_rows + 2 * nq * n,
          "packed-layout direct search records rows without repacking");
+  expect(direct.unfiltered_id_copy_bytes_avoided ==
+             built.unfiltered_id_copy_bytes_avoided +
+                 2 * nq * n * static_cast<int64_t>(sizeof(int64_t)),
+         "packed-layout direct search avoids dense candidate-ID copies");
+  expect(direct.selected_id_resolutions ==
+             built.selected_id_resolutions + 2 * nq * n,
+         "packed-layout direct search resolves only shortlisted IDs");
   expect(direct.filtered_code_copy_bytes == built.filtered_code_copy_bytes,
          "packed-layout direct search copies no PQ codes");
   const PqAdcStatsSnapshot adc_direct = pq_adc_stats(res.r);
@@ -719,6 +731,11 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
   const IvfPqStatsSnapshot all_allowed_stats = ivfpq_stats(res.r);
   expect(all_allowed_stats.unfiltered_direct_rows == direct.unfiltered_direct_rows,
          "filtered search does not count direct rows");
+  expect(all_allowed_stats.unfiltered_id_copy_bytes_avoided ==
+             direct.unfiltered_id_copy_bytes_avoided &&
+             all_allowed_stats.selected_id_resolutions ==
+                 direct.selected_id_resolutions,
+         "filtered search uses compact candidate IDs rather than direct resolution");
   expect(all_allowed_stats.filtered_code_copy_bytes ==
              direct.filtered_code_copy_bytes + nq * n * pq_m,
          "all-allowed filter records aligned PQ scratch copies");
@@ -762,6 +779,24 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
              adc_selective.cpu_rows ==
                  adc_all_allowed.cpu_rows + static_cast<int64_t>(allowed_ids.size()),
          "selective filter batches only allowed candidate rows");
+
+  constexpr int64_t split_nq = 33;
+  auto split_queries = make_data(split_nq, dim, 218);
+  std::vector<int64_t> split_direct_ids(static_cast<size_t>(split_nq * k));
+  std::vector<int64_t> split_filtered_ids(static_cast<size_t>(split_nq * k));
+  std::vector<float> split_direct_distances(static_cast<size_t>(split_nq * k));
+  std::vector<float> split_filtered_distances(static_cast<size_t>(split_nq * k));
+  expect_status(ovvsIvfPqSearch(res.r, index, split_queries.data(), split_nq, k,
+                                nlist, static_cast<int32_t>(n), nullptr,
+                                split_direct_ids.data(), split_direct_distances.data()),
+                "packed-layout block-split direct search");
+  expect_status(ovvsIvfPqSearch(res.r, index, split_queries.data(), split_nq, k,
+                                nlist, static_cast<int32_t>(n), all_allowed.data(),
+                                split_filtered_ids.data(), split_filtered_distances.data()),
+                "packed-layout block-split filtered search");
+  expect(split_filtered_ids == split_direct_ids &&
+             split_filtered_distances == split_direct_distances,
+         "block-split direct ID resolution preserves filtered-reference results");
 
   std::vector<int64_t> final_ids(static_cast<size_t>(nq * k));
   std::vector<float> final_distances(static_cast<size_t>(nq * k));
