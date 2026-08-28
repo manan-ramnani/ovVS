@@ -2,9 +2,60 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <limits>
 #include <numeric>
+
+namespace {
+
+bool ref_topk_before(float lhs, int64_t lhs_ordinal, float rhs, int64_t rhs_ordinal,
+                     bool largest) {
+  const bool lhs_nan = std::isnan(lhs);
+  const bool rhs_nan = std::isnan(rhs);
+  if (lhs_nan != rhs_nan) return !lhs_nan;
+  if (!lhs_nan) {
+    if (lhs < rhs) return !largest;
+    if (lhs > rhs) return largest;
+  }
+  return lhs_ordinal < rhs_ordinal;
+}
+
+void expect_cpu_topk_matches_total_order(ovvsResources_t res, const std::vector<float>& scores,
+                                         int64_t rows, int64_t cols, int64_t k, bool largest,
+                                         const std::string& label) {
+  std::vector<int64_t> indices(static_cast<size_t>(rows * k), -1);
+  std::vector<float> values(static_cast<size_t>(rows * k), 0.0f);
+  expect_status(ovvsTopk(res, scores.data(), rows, cols, k, indices.data(), values.data(), largest),
+                label.c_str());
+
+  for (int64_t row_index = 0; row_index < rows; ++row_index) {
+    const float* row = scores.data() + row_index * cols;
+    std::vector<int64_t> expected(static_cast<size_t>(cols));
+    std::iota(expected.begin(), expected.end(), 0);
+    std::sort(expected.begin(), expected.end(), [&](int64_t lhs, int64_t rhs) {
+      return ref_topk_before(row[lhs], lhs, row[rhs], rhs, largest);
+    });
+    for (int64_t rank = 0; rank < k; ++rank) {
+      const size_t out_offset = static_cast<size_t>(row_index * k + rank);
+      const int64_t expected_index = expected[static_cast<size_t>(rank)];
+      expect(indices[out_offset] == expected_index,
+             label + " index at row " + std::to_string(row_index) + " rank " +
+                 std::to_string(rank));
+      const float expected_value = row[expected_index];
+      if (std::isnan(expected_value)) {
+        expect(std::isnan(values[out_offset]), label + " NaN value");
+      } else {
+        expect(std::bit_cast<uint32_t>(values[out_offset]) ==
+                   std::bit_cast<uint32_t>(expected_value),
+               label + " exact value at row " + std::to_string(row_index) + " rank " +
+                   std::to_string(rank));
+      }
+    }
+  }
+}
+
+}  // namespace
 
 OVVS_TEST(gemm_matches_cpu_reference) {
   Res res;
@@ -42,13 +93,98 @@ OVVS_TEST(topk_matches_partial_sort) {
     std::vector<int64_t> order(static_cast<size_t>(cols));
     std::iota(order.begin(), order.end(), 0);
     std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int64_t a, int64_t b) {
-      return scores[static_cast<size_t>(r * cols + a)] < scores[static_cast<size_t>(r * cols + b)];
+      return ref_topk_before(scores[static_cast<size_t>(r * cols + a)], a,
+                             scores[static_cast<size_t>(r * cols + b)], b, false);
     });
     for (int64_t t = 0; t < k; ++t) {
       expect(idx[static_cast<size_t>(r * k + t)] == order[static_cast<size_t>(t)], "topk idx");
       expect(std::fabs(val[static_cast<size_t>(r * k + t)] -
                        scores[static_cast<size_t>(r * cols + order[static_cast<size_t>(t)])]) < 1e-6f,
              "topk val");
+    }
+  }
+}
+
+OVVS_TEST(topk_cpu_small_k_has_deterministic_total_order) {
+  Res res;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  constexpr int64_t rows = 3;
+  constexpr int64_t cols = 97;
+  std::vector<float> scores(static_cast<size_t>(rows * cols));
+  for (int64_t row = 0; row < rows; ++row) {
+    for (int64_t col = 0; col < cols; ++col) {
+      scores[static_cast<size_t>(row * cols + col)] =
+          static_cast<float>(((col * 11 + row * 7) % 19) - 9);
+    }
+    float* current = scores.data() + row * cols;
+    current[0] = std::numeric_limits<float>::infinity();
+    current[1] = -std::numeric_limits<float>::infinity();
+    current[2] = 0.0f;
+    current[3] = -0.0f;
+    current[4] = std::numeric_limits<float>::quiet_NaN();
+    current[5] = std::numeric_limits<float>::quiet_NaN();
+    current[6] = current[7] = 3.5f;
+  }
+
+  for (const bool largest : {false, true}) {
+    for (const int64_t k : {int64_t{1}, int64_t{10}, int64_t{32}, int64_t{64}}) {
+      expect_cpu_topk_matches_total_order(res.r, scores, rows, cols, k, largest,
+                                          std::string("small-k ") +
+                                              (largest ? "largest" : "smallest") + " k=" +
+                                              std::to_string(k));
+    }
+  }
+}
+
+OVVS_TEST(topk_cpu_nonfinite_zero_and_equal_score_order) {
+  Res res;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  const std::vector<float> scores = {
+      std::numeric_limits<float>::quiet_NaN(), 0.0f,
+      -0.0f,                                     std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),  1.0f,
+      1.0f,                                      std::numeric_limits<float>::quiet_NaN(),
+  };
+  expect_cpu_topk_matches_total_order(res.r, scores, 1, 8, 8, false, "nonfinite smallest");
+  expect_cpu_topk_matches_total_order(res.r, scores, 1, 8, 8, true, "nonfinite largest");
+}
+
+OVVS_TEST(topk_cpu_k64_k65_boundary_matches) {
+  Res res;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  constexpr int64_t rows = 2;
+  constexpr int64_t cols = 71;
+  std::vector<float> scores(static_cast<size_t>(rows * cols));
+  for (int64_t row = 0; row < rows; ++row) {
+    for (int64_t col = 0; col < cols; ++col) {
+      float value = static_cast<float>(((col * 5 + row * 3) % 13) - 6);
+      if ((col % 17) == 0) value = (col % 34) == 0 ? -0.0f : 0.0f;
+      scores[static_cast<size_t>(row * cols + col)] = value;
+    }
+  }
+
+  for (const bool largest : {false, true}) {
+    expect_cpu_topk_matches_total_order(res.r, scores, rows, cols, 64, largest,
+                                        largest ? "boundary largest k64" : "boundary smallest k64");
+    expect_cpu_topk_matches_total_order(res.r, scores, rows, cols, 65, largest,
+                                        largest ? "boundary largest k65" : "boundary smallest k65");
+
+    std::vector<int64_t> k64_indices(static_cast<size_t>(rows * 64));
+    std::vector<int64_t> k65_indices(static_cast<size_t>(rows * 65));
+    std::vector<float> k64_values(static_cast<size_t>(rows * 64));
+    std::vector<float> k65_values(static_cast<size_t>(rows * 65));
+    expect_status(ovvsTopk(res.r, scores.data(), rows, cols, 64, k64_indices.data(),
+                           k64_values.data(), largest),
+                  "boundary k64");
+    expect_status(ovvsTopk(res.r, scores.data(), rows, cols, 65, k65_indices.data(),
+                           k65_values.data(), largest),
+                  "boundary k65");
+    for (int64_t row = 0; row < rows; ++row) {
+      for (int64_t rank = 0; rank < 64; ++rank) {
+        expect(k64_indices[static_cast<size_t>(row * 64 + rank)] ==
+                   k65_indices[static_cast<size_t>(row * 65 + rank)],
+               "k64/k65 prefix mismatch");
+      }
     }
   }
 }

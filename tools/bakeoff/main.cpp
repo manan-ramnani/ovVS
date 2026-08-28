@@ -48,6 +48,11 @@ int main(int argc, char** argv) {
     N = 8;      /* PQ subquantizers */
     K = 256;    /* codes per subquantizer */
   }
+  if (op == "topk-small" && argc <= 4) {
+    M = 32;     /* rows */
+    N = 100000; /* columns */
+    K = 10;     /* selected columns */
+  }
   if (argc > 4) {
     M = std::strtoll(argv[2], nullptr, 10);
     N = std::strtoll(argv[3], nullptr, 10);
@@ -78,7 +83,27 @@ int main(int argc, char** argv) {
     ovvsResourcesSetPolicy(res, policies[p]);
     std::vector<float> A, B, C;
     std::vector<uint8_t> pq_codes;
-    if (op == "pq-adc-scale") {
+    std::vector<int64_t> topk_indices;
+    std::vector<float> topk_values;
+    int64_t topk_k = 0;
+    if (op == "topk-small") {
+      if (M <= 0 || N <= 0 || K <= 0 || K > N || M > std::numeric_limits<int64_t>::max() / N ||
+          static_cast<uint64_t>(M) >
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+                  static_cast<uint64_t>(N)) {
+        ovvsResourcesDestroy(res);
+        return 2;
+      }
+      C.resize(static_cast<size_t>(M * N));
+      uint32_t state = 0x8f3a2c19u;
+      for (float& score : C) {
+        state = state * 1664525u + 1013904223u;
+        score = static_cast<float>(state >> 8) * (1.0f / 16777216.0f);
+      }
+      topk_k = K;
+      topk_indices.resize(static_cast<size_t>(M * K));
+      topk_values.resize(static_cast<size_t>(M * K));
+    } else if (op == "pq-adc-scale") {
       if (M <= 0 || N <= 0 || N > INT32_MAX || K <= 0 || K > 256 ||
           M > std::numeric_limits<int64_t>::max() / N ||
           N > std::numeric_limits<int64_t>::max() / K ||
@@ -115,6 +140,11 @@ int main(int argc, char** argv) {
         A[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i % 17);
       for (int64_t i = 0; i < N * K; ++i)
         B[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i % 13);
+      if (op == "topk") {
+        topk_k = 10;
+        topk_indices.resize(static_cast<size_t>(M * topk_k));
+        topk_values.resize(static_cast<size_t>(M * topk_k));
+      }
     }
 
     auto run_op = [&]() {
@@ -125,10 +155,8 @@ int main(int argc, char** argv) {
         st = ovvsGemmEx(res, A.data(), B.data(), C.data(), M, N, K, 1, OVVS_DTYPE_F16);
       } else if (op == "gemm-i8") {
         st = ovvsGemmEx(res, A.data(), B.data(), C.data(), M, N, K, 1, OVVS_DTYPE_I8);
-      } else if (op == "topk") {
-        std::vector<int64_t> idx(static_cast<size_t>(M * 10));
-        std::vector<float> val(static_cast<size_t>(M * 10));
-        st = ovvsTopk(res, C.data(), M, N, 10, idx.data(), val.data(), 0);
+      } else if (op == "topk" || op == "topk-small") {
+        st = ovvsTopk(res, C.data(), M, N, topk_k, topk_indices.data(), topk_values.data(), 0);
       } else if (op == "gather") {
         const int64_t nidx = std::min<int64_t>(4096, M);
         std::vector<int64_t> idx(static_cast<size_t>(nidx));

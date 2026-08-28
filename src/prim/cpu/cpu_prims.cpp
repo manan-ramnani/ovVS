@@ -1,5 +1,6 @@
 #include "internal.hpp"
 
+#include <array>
 #include <cstdint>
 
 #if defined(OVVS_WITH_MKL)
@@ -8,6 +9,29 @@
 
 namespace ovvs {
 namespace impl {
+
+namespace {
+
+constexpr int64_t kStackTopkCapacity = 64;
+
+struct TopkEntry {
+  float score;
+  int64_t ordinal;
+};
+
+/* Numeric scores always precede NaNs. Within numeric scores, the requested score
+   direction wins; exact ties (including signed zero) use the original ordinal. */
+inline bool topk_before(float lhs, int64_t lhs_ordinal, float rhs, int64_t rhs_ordinal,
+                        bool largest) noexcept {
+  if (lhs < rhs) return !largest;
+  if (lhs > rhs) return largest;
+  const bool lhs_nan = std::isnan(lhs);
+  const bool rhs_nan = std::isnan(rhs);
+  if (lhs_nan != rhs_nan) return !lhs_nan;
+  return lhs_ordinal < rhs_ordinal;
+}
+
+}  // namespace
 
 void cpu_gemm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
               bool trans_b) {
@@ -36,18 +60,44 @@ void cpu_gemm(const float* a, const float* b, float* c, int64_t m, int64_t n, in
 
 void cpu_topk(const float* scores, int64_t rows, int64_t cols, int64_t k, int64_t* indices,
               float* values, bool largest) {
+  if (rows <= 0 || cols <= 0 || k <= 0) return;
   k = std::min(k, cols);
+  if (k <= kStackTopkCapacity) {
+    std::array<TopkEntry, static_cast<size_t>(kStackTopkCapacity)> heap{};
+    const auto better = [largest](const TopkEntry& lhs, const TopkEntry& rhs) {
+      return topk_before(lhs.score, lhs.ordinal, rhs.score, rhs.ordinal, largest);
+    };
+    for (int64_t r = 0; r < rows; ++r) {
+      const float* row = scores + r * cols;
+      for (int64_t i = 0; i < k; ++i) {
+        heap[static_cast<size_t>(i)] = TopkEntry{row[i], i};
+      }
+      auto heap_end = heap.begin() + k;
+      std::make_heap(heap.begin(), heap_end, better);
+      for (int64_t i = k; i < cols; ++i) {
+        const TopkEntry candidate{row[i], i};
+        if (!better(candidate, heap.front())) continue;
+        std::pop_heap(heap.begin(), heap_end, better);
+        heap[static_cast<size_t>(k - 1)] = candidate;
+        std::push_heap(heap.begin(), heap_end, better);
+      }
+      std::sort_heap(heap.begin(), heap_end, better);
+      for (int64_t t = 0; t < k; ++t) {
+        const TopkEntry entry = heap[static_cast<size_t>(t)];
+        indices[r * k + t] = entry.ordinal;
+        values[r * k + t] = entry.score;
+      }
+    }
+    return;
+  }
+
   std::vector<int64_t> idx(static_cast<size_t>(cols));
   for (int64_t r = 0; r < rows; ++r) {
     const float* row = scores + r * cols;
     std::iota(idx.begin(), idx.end(), 0);
-    if (largest) {
-      std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                        [&](int64_t i, int64_t j) { return row[i] > row[j]; });
-    } else {
-      std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                        [&](int64_t i, int64_t j) { return row[i] < row[j]; });
-    }
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int64_t i, int64_t j) {
+      return topk_before(row[i], i, row[j], j, largest);
+    });
     for (int64_t t = 0; t < k; ++t) {
       indices[r * k + t] = idx[static_cast<size_t>(t)];
       values[r * k + t] = row[idx[static_cast<size_t>(t)]];
