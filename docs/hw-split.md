@@ -99,7 +99,7 @@ AUTO:
 
 Not a third GEMM backend. It is **stage overlap**:
 
-- Independent queries in a batch: NPU can score query *i+1* while iGPU walks query *i* (CAGRA). Not wired yet; `OVVS_POLICY_HETERO` currently equals AUTO.
+- Independent queries in a batch: NPU can score query *i+1* while iGPU walks query *i* (CAGRA). Not wired yet; `OVVS_POLICY_HETERO` currently equals AUTO (backlog B6, `.claude/backlog.md`).
 - Do not ping-pong the same buffer NPU↔iGPU inside one stage. Scores stay host-visible USM; TopK is CPU.
 
 ## What not to do

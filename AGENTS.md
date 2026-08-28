@@ -6,7 +6,9 @@ Canonical plan (read before coding):
 
 `.claude/plans/2026-08-20-ovvs-intel-cuvs-equivalent.md`
 
-That document is the spec: architecture, device policy, feature matrix, and sequenced tasks T0.x–T23.x. If this file and the plan disagree, **the plan wins** until someone updates both.
+That document is the spec: architecture, device policy, feature matrix, and sequenced tasks T0.x–T23.x. If this file and the plan disagree on design, **the plan wins** until someone updates both.
+
+Remaining work (what is still open vs v1.0 “Accelerated”): `.claude/backlog.md`. If this file or the plan disagrees with the backlog on *status*, the backlog wins until both are updated. Do not add more C ABI algorithm names — v0.2 already has them.
 
 ---
 
@@ -58,18 +60,18 @@ If a change “uses the NPU” but creates a request per call, `set_tensor`s hos
 
 ## Task order
 
-Work the plan’s phases in sequence. Critical path:
+Work the plan’s phases in sequence. **v0.2.0 already has C ABI symbols through the plan’s algorithm list** (brute, IVF family, CAGRA, NN-Descent, Vamana, ScaNN, HNSW export, cluster, quantizers, pairwise). Do not scaffold more names.
 
-1. Phase 0–1: repo, probe, Resources, NPU MatMul, SYCL USM
-2. Phase 2–5: bakeoff + primitives (gemm, topk, gather, …)
-3. Phase 6: brute-force + Python (first user-visible)
-4. Phase 7–11: quantizers, k-means, IVF family
-5. Phase 12–14: NN-Descent, CAGRA, HNSW export
-6. Rest as specified
+`prim::gemm`, `prim::topk`, and `prim::gather` exist. Remaining work is **accelerated quality and scale**, not first implementations. Current critical path (2026-08-28, `.claude/backlog.md`):
 
-Do not start CAGRA before `prim::gemm`, `prim::topk`, and `prim::gather` exist.
+1. SIFT1M / 1e5×768 recall–QPS vs FAISS-CPU and hnswlib (B1)
+2. CAGRA search kernel T13.4: work-group per query, SLM itopk, bounded hashmap (B2). Gate: SIFT1M recall within 2% of hnswlib at similar M/ef before chasing QPS
+3. NN-Descent iGPU for n≫4096 (B5) so CAGRA init scales
+4. IVF-PQ search rewrite around batched ADC, then RaBitQ packed binary GEMM (B3, B4)
+5. HETERO stage overlap (B6); NPU L0 dataset-home experiment (B7); Lunar Lake bakeoff when hardware exists (B8)
+6. Then plan v1.0 polish (B9–B20). Vamana/ScaNN/SLINK/bindings are v1.1 (B21+) — do not start them ahead of B2
 
-Phase 23 (npu_compiler / SHAVE) is a **parallel** track from Phase 4 onward, not a reason to stall iGPU kernels.
+Phase 23 (npu_compiler / SHAVE) is a **parallel** track, not a reason to stall iGPU kernels. Unsigned SHAVE inject is parked after a real attempt; ActShave already runs inside compiler graphs.
 
 ---
 

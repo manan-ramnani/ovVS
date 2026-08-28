@@ -27,7 +27,7 @@ Tiny and large GEMM on this SKU both win on **CPU oneMKL** (`cblas_sgemm`): 64×
 
 ## CAGRA walk
 
-Search is `prim_graph_walk`: fused SYCL iGPU kernel when `OVVS_WITH_SYCL=ON` (SLM itopk, 256-slot hashmap, `search_width` seeds). Build that path with intel/llvm nightly `clang++ -fsycl` if oneAPI `icpx` is not installed. Otherwise a host walk whose gather/pairwise go through OpenVINO GPU (or NPU) under FORCE_*. `ovvsSyclEnabled()` reports the compile-time path.
+Search is `prim_graph_walk`. With `OVVS_WITH_SYCL=ON` that is a fused iGPU kernel: **one work-item per query**, USM itopk heap, per-vertex `Seen[nq×n]`, hash seeds, in-kernel L2. It is **not** cuVS-style work-group CAGRA (SLM itopk, bloom hashmap, subgroup teams) — that is plan T13.4 / backlog B2. Build the SYCL path with oneAPI `icx` or intel/llvm nightly `clang++ -fsycl`. Without SYCL, a host walk whose gather/pairwise go through OpenVINO GPU (or NPU) under FORCE_*. `ovvsSyclEnabled()` reports the compile-time path. Refuse the SYCL kernel if `itopk>4096` or seen bytes would exceed 64 MiB, then host prim walk.
 
 ## FP16 / INT8 / FP8 / FP4
 

@@ -1,7 +1,7 @@
 # ovVS: Complete cuVS Equivalent on Intel NPU + iGPU
 
-**Status:** implementing (v0.1 library in-tree; Arrow Lake bakeoff tables checked in)  
-**Date:** 2026-08-20  
+**Status:** implementing — **v0.2.0** C ABI and Arrow Lake bakeoff tables in-tree. Algorithm *names* exist; plan §5 “Accelerated” and §16 v1.0 are **not** met. Remaining work is kernel quality + scale (not more symbols): `.claude/backlog.md`.
+**Date:** 2026-08-20 (snapshot 2026-08-28)
 **Non-negotiable:** feature-complete vs NVIDIA cuVS. Hard problems are sequenced, not dropped. NPU is used wherever it lifts; otherwise iGPU; CPU only as control plane or when it actually wins latency. Custom kernels, compiler patches, and SHAVE/DPU work are in-scope.
 
 This document is the implementation spec for agents and humans. Read it before writing code.
@@ -817,7 +817,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | First measured SKU | Arrow Lake 265K | lab machine; Lunar Lake tables still TBD |
 | FORCE_* honesty | DEVICE_UNAVAILABLE if the requested device did not run | bakeoff last_device must match requested device on success |
 | iGPU topk/gather without DPC++ | OpenVINO TopK/Gather on GPU plugin | SYCL kernels remain for icpx |
-| CAGRA walk | `prim_graph_walk`: fused SYCL if `OVVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | Heaps/seen sized to real `itopk`/`n` (not SLM-64 / expd-4096). Refuse SYCL only if itopk>4096 or seen bytes>64MiB, then host prim walk. `cagra_sycl_walk_n_over_4096` FORCE_GPU n=4200 vs independent L2. |
+| CAGRA walk | `prim_graph_walk`: fused SYCL if `OVVS_WITH_SYCL`, else host walk + OpenVINO GPU gather/pairwise | **v0 kernel (shipped):** one work-item per query, USM heaps, `Seen[nq×n]`, hash seeds. Refuse SYCL if itopk>4096 or seen bytes>64MiB. `cagra_sycl_walk_n_over_4096` FORCE_GPU n=4200. **T13.4 still open** (work-group/query, SLM itopk, bloom hashmap) — backlog B2. Do not describe v0 as SLM/hashmap CAGRA. |
 | HostCompile | NPU GEMM tiles of M=256, TopK rows of 32, Gather nidx of 128 when full-shape compile fails | in `npu_gemm` / `npu_topk` / `npu_gather_rows`; SHAVE ADC/TopK C still host-linked until unsigned ELF is loadable |
 | HNSW serialize | hnswlib `saveIndex` layout | documented in `docs/devices.md` |
 | Mixer v2 | `ovvsResourcesSetNpuBusy` skips NPU on AUTO | competing occupancy APIs are not exposed; busy flag + compile-fail fallback |
@@ -831,6 +831,9 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | TopK/Gather AUTO | CPU | `topk_large.json` CPU 3.4 ms vs NPU 99 vs GPU 758. |
 | CPU GEMM | oneMKL `cblas_sgemm` | Naive triple loop was 192 ms; MKL is 18 ms. That flip made CPU the dense GEMM device on this SKU. |
 | NPU programming model | Inference engine, not BLAS | DPU MatMul is µs; wall was SHAVE copies from `set_tensor(host*)` plus new InferRequest. Feed `get_input_tensor` L0 buffers; reuse InferRequest; always memcpy (k-means mutates in place — no pointer-sticky skip). INT8 = NNCF FQ+Constant weights. Scratchpad 4 MB. Compile: TURBO + `optimization-level=2`. Canonical: `AGENTS.md` “NPU contract” + `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`. |
+| Remaining work after v0.2 ABI | Kernel quality + scale, not more C ABI names | 2026-08-28 assessment: symbols cover the plan’s algorithm list; AUTO search on Arrow Lake is CPU oneMKL; CAGRA/IVF do not beat hnswlib/FAISS; competitor bench is SIFT n=2000; Lunar Lake unmeasured. Critical path: SIFT1M harness (B1) → CAGRA T13.4 (B2) → NN-Descent iGPU (B5) → IVF-PQ/RaBitQ search rewrite (B3–B4). Journal: `.claude/backlog.md`. |
+| HETERO policy | equals AUTO until stage overlap lands | Not a third GEMM backend. Product is NPU ADC ∥ iGPU walk. Documented in `docs/hw-split.md`. Backlog B6. |
+| v0.2 vs v1.0 | 0.2.0 is not §16 equivalent | v1.0 still requires Lunar Lake accelerated paths, published FAISS/hnswlib benches, mixer tables for that SKU. Toy-test recall floors (CAGRA-Q 0.35 on n=32, IVF-PQ 0.5 on n=64) are not those gates. |
 
 ---
 
@@ -839,12 +842,16 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 Filled in as installs finish. Placeholder until toolchain logs land:
 
 - **SYCL/oneAPI toolkit:** elevated offline installer `intel-oneapi-base-toolkit-2025.1.3.8_offline.exe` exit 0. `icpx`/`icx` 2025.1.1 at `C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin\`. On Windows Ninja, **`icx` for both C and CXX** (`icpx` is GNU-like; CMake then passes `/nologo /EHsc` and the compiler test fails). `build-icpx` with `-DOVVS_WITH_SYCL=ON -DOVVS_WITH_OPENVINO=ON` links `sycl8.dll` and passes 45/45 plus C++/C consumers, including `cagra_sycl_walk_n_over_4096`. `intel/llvm` nightly `clang++ -fsycl` remains a fallback (`build-sycl`).
-- **SYCL fused CAGRA walk (enabled):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ovVS with `-DOVVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (fused iGPU walk). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed).
+- **SYCL fused CAGRA walk (enabled, v0 quality):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ovVS with `-DOVVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (`last_device=GPU`). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed). Kernel quality is the following bullet / backlog B2 — not T13.4.
 - **SHAVE on NPU silicon:** ActShave **does** run. OpenVINO NPU ADC (Gather+ReduceSum) profiling on this 265K: `lut`/`Gather`/`Result` exec_type `Shave`, `ReduceSum` exec_type `DPU`. Compiler-in-driver embeds Intel prebuilt ELF32 `.text` (`gather.3720xx.elf`, …) into a graph ELF64 (`.text.KernelText`, `.text.ActKernelInvocations`). Level Zero `ZE_GRAPH_FORMAT_NATIVE` is that graph blob; a raw SHAVE ELF32 is `invalid_native_binary`. VCL still rejects ELF-as-IR (`invalid_ir`). `ze_activation_kernel_desc_t` is compile-time extra kernel data, not an unsigned loader. MoviTools is artifactory-only (`ENABLE_SHAVE_BINARIES_BUILD`). Probe: `shave_silicon_load: compiler_actshave`, `shave_unsigned_inject: unsupported_no_inject_api`. Park only “custom unsigned SHAVE C compiled with moviCompile and registered as VPU.SW.Kernel”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.
 - **Energy/RAPL:** Windows package joules come from **intelppm EMI**, not Power Gadget. `GUID_DEVICE_ENERGY_METER` `{45BD8344-7ED6-49CF-A440-C276C933B053}` is registered on ACPI processor instance 0 (`cpu.inf` / `intelppm.sys`, Microsoft PPM v2). Channels: `RAPL_Package0_PKG`, `_PP0`, `_PP1`, `_DRAM` (DRAM is 0 on this desktop SKU). `ovvsResourcesEnergyUj` reads `IOCTL_EMI_GET_MEASUREMENT` (pWh × 0.0036 = µJ), then PDH Energy Meter, then Power Gadget, then Linux sysfs. Arrow Lake 265K: SUCCESS, increasing µJ. IPF/PMT are not this counter. Bakeoff `energy_probe` is `success` when EMI/PDH is present.
 - **git push:** Repo renamed to [`manan-ramnani/ovVS`](https://github.com/manan-ramnani/ovVS). `origin` is `https://github.com/manan-ramnani/ovVS.git`. Full local `main` (including `.github/workflows/ci.yml`) replaced the old workflow-free snapshot `769ff5d` at `950c625`. C ABI remains `ovvs`.
-- **FAISS/hnswlib pip:** `faiss-cpu` 1.15.0 and `hnswlib` 0.8.0 import. SIFT slice benches in `tables/arrow-lake/bench-recall-qps.md`.
+- **FAISS/hnswlib pip:** `faiss-cpu` 1.15.0 and `hnswlib` 0.8.0 import. SIFT **n=2000** slice benches in `tables/arrow-lake/bench-recall-qps.md` (not SIFT1M). On that slice AUTO/CPU brute beats FAISS brute; NPU/GPU brute lose; IVF-Flat/PQ and CAGRA lose QPS to FAISS/hnswlib. Full-corpus harness is backlog B1.
+- **CAGRA SYCL v0 (attempted, not T13.4):** `gpu_cagra_walk` is `parallel_for(nq)` (one WI/query), USM `Seen[nq×n]`, hash seeds, scalar L2. FORCE_GPU `last_device` is honest. It is not work-group CAGRA, not SLM itopk, not a 256-slot hashmap. T13.4 remains open (backlog B2).
+- **IVF-PQ NPU ADC (attempted, control plane still host):** `prim_pq_adc` Gather+ReduceSum tiles run ActShave+DPU. `ovvsIvfPqSearch` still rebuilds tables and packs list codes on the host per query per list (backlog B3).
+- **HETERO:** `OVVS_POLICY_HETERO` currently equals AUTO. Not parked — unwired (backlog B6).
+- **Lunar Lake tables:** still TBD. Do not copy Arrow Lake. v1.0 SKU (backlog B8).
 
 ---
 
