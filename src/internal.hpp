@@ -3,6 +3,7 @@
 #include "ovvs/ovvs.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -278,6 +279,19 @@ inline int64_t cagra_seed_count(int64_t n, int32_t itopk, int32_t search_width) 
   if (n > 0 && seeds > n) seeds = n;
   if (seeds < 1) seeds = n > 0 ? 1 : 0;
   return seeds;
+}
+
+inline uint32_t cagra_query_hash(const float* query, int64_t dim) {
+  uint32_t hash = 2166136261u;
+  for (int64_t i = 0; i < dim; ++i) {
+    hash ^= std::bit_cast<uint32_t>(query[i]);
+    hash *= 16777619u;
+  }
+  hash ^= hash >> 16;
+  hash *= 0x7feb352du;
+  hash ^= hash >> 15;
+  hash *= 0x846ca68bu;
+  return hash ^ (hash >> 16);
 }
 
 inline float f16_to_f32(uint16_t h) {

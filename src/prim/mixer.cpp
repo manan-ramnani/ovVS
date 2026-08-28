@@ -321,8 +321,10 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     std::vector<Node> cand;
     std::vector<int64_t> seed_ids;
     const int64_t nseeds = cagra_seed_count(n, itopk, search_width);
+    const uint32_t query_hash = cagra_query_hash(query, dim);
     for (int64_t s = 0; s < nseeds; ++s) {
-      int64_t id = (s * 9973 + q * 13) % n;
+      const uint64_t mixed = static_cast<uint64_t>(s) * 9973u + static_cast<uint64_t>(query_hash) * 13u;
+      const int64_t id = static_cast<int64_t>(mixed % static_cast<uint64_t>(n));
       if (!allowed(bitset, id) || seen[static_cast<size_t>(id)]) continue;
       seen[static_cast<size_t>(id)] = 1;
       seed_ids.push_back(id);

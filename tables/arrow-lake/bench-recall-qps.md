@@ -17,6 +17,8 @@ The quality gate **failed**: `0.8903 - 0.4057 = 0.4846`, versus a maximum allowe
 
 The timing columns are diagnostic only. Preflight sampled about 62.7% unrelated iGPU 3D load (WUDFHost, ChatGPT, and DWM), so neither QPS nor build wall is a publishable isolated-performance baseline. The recall gap is far from the threshold; the near-boundary hnswlib rerun rule did not apply. The artifact remains intentionally partial because this single pair omits the full curves and package energy.
 
+A bounded post-gate audit found no CPU/SYCL walk divergence on the same graph. Before the seed fix, batching was not invariant because both paths mixed the query ordinal within the native call: at n=4,200, 30/32 queries changed between tested partitions (mean top-10 overlap 0.675); at n=16,384, batch 32 versus batch 1 changed 1.77% of IDs. The same 16,384-row graph improved from 0.90625 recall at `32/1` to 0.953125 at `64/2`, supporting traversal effort as a secondary limiter. Query-content hashing now removes the batching/order defect and passes exact CPU/GPU ID regressions; these bounded diagnostics do not apportion the SIFT1M gap or claim improved full-corpus recall.
+
 ## B2 work-group checkpoint
 
 Final bounded rerun after the B2 regression fixes: `bench.py --profile smoke --algorithms cagra --policies gpu --no-energy --repeats 3`. Energy was intentionally disabled, so this is a correctness and relative-throughput smoke, not B1 full-profile evidence.

@@ -1224,6 +1224,112 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   ovvsCagraDestroy(ix);
 }
 
+OVVS_TEST(cagra_query_seed_is_batch_invariant) {
+  Res res;
+  const int64_t n = 640, dim = 8, nq = 6, k = 8;
+  constexpr int32_t itopk = 8;
+  constexpr int32_t search_width = 1;
+  /* Keep the walk non-exhaustive: 512 seeds + at most 48 degree-one expansions
+     cover fewer than 640 rows. The legacy call-ordinal seeds changed 4/6 rows. */
+  auto data = make_data(n, dim, 446);
+  auto queries = make_data(nq, dim, 447);
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  ovvsCagraIndex_t ix = nullptr;
+  expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 1, 1, &ix),
+                "batch-invariant build");
+
+  const auto close_distance = [](float a, float b) {
+    const float scale = std::max(1.f, std::max(std::fabs(a), std::fabs(b)));
+    return std::fabs(a - b) <= 2e-5f * scale;
+  };
+  const auto run_batch = [&](ovvsPolicy policy, const float* query_data, int64_t query_count,
+                             std::vector<int64_t>& ids, std::vector<float>& distances,
+                             const char* label) {
+    expect_status(ovvsResourcesSetPolicy(res.r, policy), label);
+    ids.resize(static_cast<size_t>(query_count * k));
+    distances.resize(static_cast<size_t>(query_count * k));
+    expect_status(ovvsCagraSearch(res.r, ix, query_data, query_count, k, itopk, search_width,
+                                  nullptr, ids.data(), distances.data()),
+                  label);
+  };
+  const auto expect_single_partition = [&](ovvsPolicy policy, const std::vector<int64_t>& batch_ids,
+                                           const std::vector<float>& batch_distances,
+                                           const char* label) {
+    std::vector<int64_t> single_ids(static_cast<size_t>(k));
+    std::vector<float> single_distances(static_cast<size_t>(k));
+    expect_status(ovvsResourcesSetPolicy(res.r, policy), label);
+    for (int64_t qi = 0; qi < nq; ++qi) {
+      expect_status(ovvsCagraSearch(res.r, ix, queries.data() + qi * dim, 1, k, itopk,
+                                    search_width, nullptr, single_ids.data(),
+                                    single_distances.data()),
+                    label);
+      for (int64_t t = 0; t < k; ++t) {
+        const size_t offset = static_cast<size_t>(qi * k + t);
+        expect(single_ids[static_cast<size_t>(t)] == batch_ids[offset],
+               std::string(label) + " exact ID partition invariance");
+        expect(close_distance(single_distances[static_cast<size_t>(t)], batch_distances[offset]),
+               std::string(label) + " distance partition invariance");
+      }
+    }
+  };
+
+  std::vector<int64_t> cpu_ids;
+  std::vector<float> cpu_distances;
+  run_batch(OVVS_POLICY_FORCE_CPU, queries.data(), nq, cpu_ids, cpu_distances, "CPU batch search");
+  expect_single_partition(OVVS_POLICY_FORCE_CPU, cpu_ids, cpu_distances, "CPU single search");
+
+  std::vector<float> reversed_queries(static_cast<size_t>(nq * dim));
+  for (int64_t qi = 0; qi < nq; ++qi) {
+    std::copy_n(queries.data() + (nq - 1 - qi) * dim, dim, reversed_queries.data() + qi * dim);
+  }
+  std::vector<int64_t> reversed_ids;
+  std::vector<float> reversed_distances;
+  run_batch(OVVS_POLICY_FORCE_CPU, reversed_queries.data(), nq, reversed_ids, reversed_distances,
+            "CPU reordered search");
+  for (int64_t qi = 0; qi < nq; ++qi) {
+    const int64_t original_qi = nq - 1 - qi;
+    for (int64_t t = 0; t < k; ++t) {
+      const size_t reordered_offset = static_cast<size_t>(qi * k + t);
+      const size_t original_offset = static_cast<size_t>(original_qi * k + t);
+      expect(reversed_ids[reordered_offset] == cpu_ids[original_offset],
+             "CPU exact ID reorder invariance");
+      expect(close_distance(reversed_distances[reordered_offset], cpu_distances[original_offset]),
+             "CPU distance reorder invariance");
+    }
+  }
+
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "GPU availability");
+  if (gpu && ovvsSyclEnabled()) {
+    std::vector<int64_t> gpu_ids;
+    std::vector<float> gpu_distances;
+    run_batch(OVVS_POLICY_FORCE_GPU, queries.data(), nq, gpu_ids, gpu_distances, "GPU batch search");
+    expect_single_partition(OVVS_POLICY_FORCE_GPU, gpu_ids, gpu_distances, "GPU single search");
+    for (size_t i = 0; i < cpu_ids.size(); ++i) {
+      expect(gpu_ids[i] == cpu_ids[i], "CPU/GPU exact ID parity for deterministic seeds");
+      expect(close_distance(gpu_distances[i], cpu_distances[i]),
+             "CPU/GPU distance parity for deterministic seeds");
+    }
+
+    run_batch(OVVS_POLICY_FORCE_GPU, reversed_queries.data(), nq, reversed_ids, reversed_distances,
+              "GPU reordered search");
+    for (int64_t qi = 0; qi < nq; ++qi) {
+      const int64_t original_qi = nq - 1 - qi;
+      for (int64_t t = 0; t < k; ++t) {
+        const size_t reordered_offset = static_cast<size_t>(qi * k + t);
+        const size_t original_offset = static_cast<size_t>(original_qi * k + t);
+        expect(reversed_ids[reordered_offset] == gpu_ids[original_offset],
+               "GPU exact ID reorder invariance");
+        expect(close_distance(reversed_distances[reordered_offset], gpu_distances[original_offset]),
+               "GPU distance reorder invariance");
+      }
+    }
+  }
+
+  ovvsCagraDestroy(ix);
+}
+
 OVVS_TEST(ivf_flat_serialize_extend) {
   Res res;
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);

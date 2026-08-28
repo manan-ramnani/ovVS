@@ -1068,6 +1068,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
          sycl::local_accessor<uint8_t, 1> candidate_expanded(sycl::range<1>(BEAM), h);
          sycl::local_accessor<int32_t, 1> picks(sycl::range<1>(SW), h);
          sycl::local_accessor<int32_t, 1> state(sycl::range<1>(4), h);
+         sycl::local_accessor<uint32_t, 1> query_hash_state(sycl::range<1>(1), h);
          h.parallel_for(sycl::nd_range<1>(sycl::range<1>(launch_queries * work_group_size),
                                          sycl::range<1>(work_group_size)),
                         [=](sycl::nd_item<1> item) {
@@ -1079,7 +1080,10 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
            for (size_t i = lid; i < visited_capacity; i += work_group_size) {
              VISITED[visited_base + i] = -1;
            }
-           if (lid == 0) state[0] = 0;
+           if (lid == 0) {
+             state[0] = 0;
+             query_hash_state[0] = cagra_query_hash(Q + qi * D, static_cast<int64_t>(D));
+           }
            item.barrier(sycl::access::fence_space::global_and_local);
 
            auto allowed_id = [&](int32_t id) {
@@ -1155,7 +1159,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 
            for (size_t seed = 0; seed < nseeds; ++seed) {
              if (lid == 0) {
-               const uint64_t mixed = static_cast<uint64_t>(seed) * 9973u + static_cast<uint64_t>(qi) * 13u;
+               const uint64_t mixed =
+                   static_cast<uint64_t>(seed) * 9973u + static_cast<uint64_t>(query_hash_state[0]) * 13u;
                const int32_t id = static_cast<int32_t>(mixed % N);
                state[1] = allowed_id(id) && visit_once(id) ? id : -1;
              }

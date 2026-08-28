@@ -12,4 +12,4 @@ Source: `build-icpx` with `OVVS_WITH_SYCL=ON` on 2026-08-28. Counters are cumula
 
 This proves that all listed runs bound GPU-accessible shared-USM dataset and graph pointers directly and performed no explicit index `memcpy`. It does not prove physical residency or zero driver-managed page migration. At SIFT1M degree 16, a heap-fallback walk would explicitly upload 512,000,000 dataset bytes plus 64,000,000 graph bytes; across the 192-call gate that would have been 110.592 GB. The zero-upload result isolates the failed SIFT1M recall gate from explicit index-transfer overhead.
 
-Verification: focused GPU regression 1/1; full native suite 63/63; Python benchmark suite 45/45. Benchmark tests cover rejection logic using synthetic upload deltas; the native forced-fallback/upload counter path is not yet exercised.
+Verification: focused transfer regression 1/1; full native suite 64/64 including CPU/GPU batch-invariant seed parity; Python benchmark suite 45/45. Benchmark tests cover rejection logic using synthetic upload deltas; the native forced-fallback/upload counter path is not yet exercised.
