@@ -219,41 +219,6 @@ ovvsStatus nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t 
   return OVVS_STATUS_SUCCESS;
 }
 
-void prune_graph(const float* x, int64_t n, int64_t dim, ovvsMetric metric, const int32_t* in,
-                 int32_t in_deg, int32_t out_deg, std::vector<int32_t>& out) {
-  /* Symmetrized kNN truncated to out_deg. RNG occlusion at graph_degree=16 drops reverse
-     edges that greedy routing needs in high-d; keep the nearest knn∪reverse instead. */
-  out.assign(static_cast<size_t>(n) * static_cast<size_t>(out_deg), -1);
-  std::vector<std::vector<int32_t>> rev(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) {
-    for (int32_t t = 0; t < in_deg; ++t) {
-      const int32_t nb = in[i * in_deg + t];
-      if (nb >= 0 && nb != static_cast<int32_t>(i) && static_cast<int64_t>(nb) < n) {
-        rev[static_cast<size_t>(nb)].push_back(static_cast<int32_t>(i));
-      }
-    }
-  }
-  std::vector<int32_t> cand;
-  for (int64_t i = 0; i < n; ++i) {
-    cand.clear();
-    for (int32_t t = 0; t < in_deg; ++t) {
-      const int32_t nb = in[i * in_deg + t];
-      if (nb >= 0 && nb != static_cast<int32_t>(i)) cand.push_back(nb);
-    }
-    cand.insert(cand.end(), rev[static_cast<size_t>(i)].begin(), rev[static_cast<size_t>(i)].end());
-    std::sort(cand.begin(), cand.end());
-    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
-    std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) {
-      return distance_one(metric, x + i * dim, x + static_cast<int64_t>(a) * dim, dim, 2.f) <
-             distance_one(metric, x + i * dim, x + static_cast<int64_t>(b) * dim, dim, 2.f);
-    });
-    const int32_t keep = std::min(out_deg, static_cast<int32_t>(cand.size()));
-    for (int32_t t = 0; t < keep; ++t) {
-      out[static_cast<size_t>(i * out_deg + t)] = cand[static_cast<size_t>(t)];
-    }
-  }
-}
-
 ovvsStatus graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                         ovvsMetric metric, const int32_t* graph, int32_t degree,
                         const float* queries, int64_t nq, int64_t k, int32_t itopk,
@@ -422,16 +387,16 @@ ovvsStatus cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int
   const ovvsStatus init_status = nndescent_build(r, x, n, dim, metric, degree, 4, graph);
   if (init_status != OVVS_STATUS_SUCCESS) return init_status;
   std::vector<int32_t> next = graph;
-  std::vector<int64_t> nb(static_cast<size_t>(degree));
-  std::vector<float> ds(static_cast<size_t>(degree));
+  std::vector<int64_t> nb(static_cast<size_t>(degree) + 1);
+  std::vector<float> ds(static_cast<size_t>(degree) + 1);
   for (int it = 0; it < 2; ++it) {
     for (int64_t i = 0; i < n; ++i) {
       const ovvsStatus search_status =
-          graph_search(r, x, n, dim, metric, graph.data(), degree, x + i * dim, 1, degree,
+          graph_search(r, x, n, dim, metric, graph.data(), degree, x + i * dim, 1, degree + 1,
                        degree * 2, 2, nullptr, nb.data(), ds.data());
       if (search_status != OVVS_STATUS_SUCCESS) return search_status;
       int filled = 0;
-      for (int32_t t = 0; t < degree && filled < degree; ++t) {
+      for (int32_t t = 0; t < degree + 1 && filled < degree; ++t) {
         if (nb[static_cast<size_t>(t)] == i || nb[static_cast<size_t>(t)] < 0) continue;
         next[static_cast<size_t>(i * degree + filled)] = static_cast<int32_t>(nb[static_cast<size_t>(t)]);
         ++filled;
@@ -510,6 +475,171 @@ void robust_prune(const float* x, int64_t dim, ovvsMetric metric, int64_t p, std
 }
 
 }  // namespace
+
+ovvsStatus ovvs::impl::cagra_optimize_ranked(const int32_t* initial, int64_t n,
+                                              int32_t initial_degree, int32_t final_degree,
+                                              std::vector<int32_t>& output) {
+  output.clear();
+  if (!initial || n <= 1 || initial_degree <= 0 || final_degree <= 0 ||
+      final_degree > initial_degree || initial_degree >= n || final_degree >= n) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (n > std::numeric_limits<int32_t>::max()) return OVVS_STATUS_SHAPE_MISMATCH;
+
+  const size_t node_count = static_cast<size_t>(n);
+  const size_t initial_width = static_cast<size_t>(initial_degree);
+  const size_t final_width = static_cast<size_t>(final_degree);
+  if (node_count > std::numeric_limits<size_t>::max() / initial_width ||
+      node_count > std::numeric_limits<size_t>::max() / final_width) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  const size_t initial_count = node_count * initial_width;
+  const size_t final_count = node_count * final_width;
+
+  try {
+    /* Sorted packed (neighbor ID, original rank) rows provide bounded rank lookup without
+       allocating a dense N-by-N table. */
+    std::vector<uint64_t> rank_lookup(initial_count);
+    for (size_t row = 0; row < node_count; ++row) {
+      const size_t row_base = row * initial_width;
+      for (size_t rank = 0; rank < initial_width; ++rank) {
+        const int32_t id = initial[row_base + rank];
+        if (id < 0 || static_cast<int64_t>(id) >= n || static_cast<size_t>(id) == row) {
+          return OVVS_STATUS_ERROR;
+        }
+        rank_lookup[row_base + rank] =
+            (static_cast<uint64_t>(static_cast<uint32_t>(id)) << 32) |
+            static_cast<uint32_t>(rank);
+      }
+      auto begin = rank_lookup.begin() + static_cast<std::ptrdiff_t>(row_base);
+      auto end = begin + initial_degree;
+      std::sort(begin, end);
+      for (auto it = begin + 1; it != end; ++it) {
+        if ((*it >> 32) == (*(it - 1) >> 32)) return OVVS_STATUS_ERROR;
+      }
+    }
+
+    const auto rank_of = [&](size_t row, int32_t id) {
+      const size_t row_base = row * initial_width;
+      const auto begin = rank_lookup.begin() + static_cast<std::ptrdiff_t>(row_base);
+      const auto end = begin + initial_degree;
+      const uint64_t needle = static_cast<uint64_t>(static_cast<uint32_t>(id)) << 32;
+      const auto it = std::lower_bound(begin, end, needle);
+      if (it == end || (*it >> 32) != (needle >> 32)) {
+        return static_cast<uint32_t>(initial_degree);
+      }
+      return static_cast<uint32_t>(*it);
+    };
+
+    struct RankedCandidate {
+      uint32_t detours;
+      uint32_t initial_rank;
+      int32_t id;
+    };
+    const auto candidate_less = [](const RankedCandidate& a, const RankedCandidate& b) {
+      if (a.detours != b.detours) return a.detours < b.detours;
+      if (a.initial_rank != b.initial_rank) return a.initial_rank < b.initial_rank;
+      return a.id < b.id;
+    };
+
+    std::vector<int32_t> forward(final_count);
+    std::vector<RankedCandidate> candidates(initial_width);
+    for (size_t row = 0; row < node_count; ++row) {
+      const size_t initial_base = row * initial_width;
+      for (uint32_t y_rank = 0; y_rank < static_cast<uint32_t>(initial_degree); ++y_rank) {
+        const int32_t y = initial[initial_base + y_rank];
+        uint32_t detours = 0;
+        for (uint32_t z_rank = 0; z_rank < y_rank; ++z_rank) {
+          const int32_t z = initial[initial_base + z_rank];
+          /* z_rank < y_rank is already strict, so the paper's
+             max(rank_X(z), rank_z(y)) < rank_X(y) reduces to this check. */
+          if (rank_of(static_cast<size_t>(z), y) < y_rank) ++detours;
+        }
+        candidates[y_rank] = {detours, y_rank, y};
+      }
+      std::partial_sort(candidates.begin(), candidates.begin() + final_degree, candidates.end(),
+                        candidate_less);
+      const size_t forward_base = row * final_width;
+      for (size_t rank = 0; rank < final_width; ++rank) {
+        forward[forward_base + rank] = candidates[rank].id;
+      }
+    }
+
+    /* Store reverse candidates as a flat CSR graph. Keys sort by the source edge's
+       post-prune forward rank and then source ID, giving a total deterministic order. */
+    std::vector<size_t> reverse_counts(node_count, 0);
+    for (size_t source = 0; source < node_count; ++source) {
+      const size_t row_base = source * final_width;
+      for (size_t rank = 0; rank < final_width; ++rank) {
+        ++reverse_counts[static_cast<size_t>(forward[row_base + rank])];
+      }
+    }
+    std::vector<size_t> reverse_offsets(node_count + 1, 0);
+    for (size_t row = 0; row < node_count; ++row) {
+      reverse_offsets[row + 1] = reverse_offsets[row] + reverse_counts[row];
+    }
+    if (reverse_offsets.back() != final_count) return OVVS_STATUS_ERROR;
+
+    std::vector<uint64_t> reverse_keys(final_count);
+    std::fill(reverse_counts.begin(), reverse_counts.end(), 0);
+    for (size_t source = 0; source < node_count; ++source) {
+      const size_t row_base = source * final_width;
+      for (uint32_t rank = 0; rank < static_cast<uint32_t>(final_degree); ++rank) {
+        const size_t destination = static_cast<size_t>(forward[row_base + rank]);
+        const size_t slot = reverse_offsets[destination] + reverse_counts[destination]++;
+        reverse_keys[slot] = (static_cast<uint64_t>(rank) << 32) |
+                             static_cast<uint32_t>(source);
+      }
+    }
+
+    for (size_t row = 0; row < node_count; ++row) {
+      const size_t begin_offset = reverse_offsets[row];
+      const size_t end_offset = reverse_offsets[row + 1];
+      auto begin = reverse_keys.begin() + static_cast<std::ptrdiff_t>(begin_offset);
+      auto end = reverse_keys.begin() + static_cast<std::ptrdiff_t>(end_offset);
+      std::sort(begin, end);
+      size_t accepted = 0;
+      const auto forward_begin = forward.begin() + static_cast<std::ptrdiff_t>(row * final_width);
+      const auto forward_end = forward_begin + final_degree;
+      for (auto it = begin; it != end && accepted < final_width; ++it) {
+        const int32_t source = static_cast<int32_t>(static_cast<uint32_t>(*it));
+        if (std::find(forward_begin, forward_end, source) != forward_end) continue;
+        reverse_keys[begin_offset + accepted++] = *it;
+      }
+      reverse_counts[row] = accepted;
+    }
+
+    std::vector<int32_t> forward_row(final_width);
+    for (size_t row = 0; row < node_count; ++row) {
+      const size_t row_base = row * final_width;
+      std::copy_n(forward.begin() + static_cast<std::ptrdiff_t>(row_base), final_degree,
+                  forward_row.begin());
+      const size_t reverse_take = std::min(final_width / 2, reverse_counts[row]);
+      const size_t forward_take = final_width - reverse_take;
+      size_t forward_pos = 0;
+      size_t reverse_pos = 0;
+      size_t output_pos = 0;
+      while (forward_pos < forward_take || reverse_pos < reverse_take) {
+        if (forward_pos < forward_take) {
+          forward[row_base + output_pos++] = forward_row[forward_pos++];
+        }
+        if (reverse_pos < reverse_take) {
+          const uint64_t key = reverse_keys[reverse_offsets[row] + reverse_pos++];
+          forward[row_base + output_pos++] =
+              static_cast<int32_t>(static_cast<uint32_t>(key));
+        }
+      }
+      if (output_pos != final_width) return OVVS_STATUS_ERROR;
+    }
+
+    output.swap(forward);
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+}
 
 ovvsStatus ovvsIvfRabitqBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
                               ovvsMetric metric, int32_t nlist, ovvsIvfRabitqIndex_t* index) {
@@ -829,8 +959,8 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
     }
     if (status != OVVS_STATUS_SUCCESS) return status;
     std::vector<int32_t> pruned;
-    prune_graph(ix->ds.x.data(), n, dim, metric, init.data(), intermediate_degree,
-                graph_degree, pruned);
+    status = cagra_optimize_ranked(init.data(), n, intermediate_degree, graph_degree, pruned);
+    if (status != OVVS_STATUS_SUCCESS) return status;
     ix->graph.assign(pruned.begin(), pruned.end());
     resources->last_device = OVVS_DEVICE_CPU;
     *index = reinterpret_cast<ovvsCagraIndex_t>(ix.release());

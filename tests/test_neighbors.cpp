@@ -1,4 +1,5 @@
 #include "test_harness.hpp"
+#include "internal.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -508,6 +509,110 @@ OVVS_TEST(nndescent_graph_overlap) {
                                                   static_cast<int32_t>(n));
   expect(overlap == 1.f, "small exact NN-Descent overlap " + std::to_string(overlap));
   ovvsNnDescentDestroy(g);
+}
+
+OVVS_TEST(cagra_rank_optimizer_known_detours) {
+  constexpr int64_t n = 6;
+  constexpr int32_t initial_degree = 4;
+  constexpr int32_t final_degree = 2;
+  const std::vector<int32_t> initial = {
+      1, 2, 3, 4,
+      2, 3, 5, 4,
+      3, 5, 1, 4,
+      5, 1, 2, 4,
+      5, 1, 2, 3,
+      1, 2, 3, 4,
+  };
+  std::vector<int32_t> optimized;
+  expect_status(ovvs::impl::cagra_optimize_ranked(initial.data(), n, initial_degree,
+                                                   final_degree, optimized),
+                "known detour-rank optimization");
+  expect(optimized.size() == static_cast<size_t>(n * final_degree),
+         "known rank optimizer shape");
+  /* Row 0 has detour counts [0, 1, 2, 0] and no reverse incoming edges. */
+  expect(optimized[0] == 1 && optimized[1] == 4,
+         "detour rank must retain the two least-redundant row-0 edges");
+  for (int64_t row = 0; row < n; ++row) {
+    std::set<int32_t> unique;
+    for (int32_t edge = 0; edge < final_degree; ++edge) {
+      const int32_t id = optimized[static_cast<size_t>(row * final_degree + edge)];
+      expect(id >= 0 && static_cast<int64_t>(id) < n, "rank optimizer ID range");
+      expect(id != row, "rank optimizer self edge");
+      unique.insert(id);
+    }
+    expect(static_cast<int32_t>(unique.size()) == final_degree,
+           "rank optimizer fixed unique degree");
+  }
+}
+
+OVVS_TEST(cagra_rank_optimizer_reverse_interleave) {
+  constexpr int64_t n = 6;
+  constexpr int32_t degree = 2;
+  const std::vector<int32_t> initial = {
+      1, 2,
+      0, 3,
+      1, 3,
+      0, 4,
+      0, 5,
+      0, 1,
+  };
+  std::vector<int32_t> optimized;
+  expect_status(ovvs::impl::cagra_optimize_ranked(initial.data(), n, degree, degree, optimized),
+                "reverse interleave optimization");
+  /* Incoming row-0 sources are 1,3,4,5 at forward rank 0. Source 1 is already forward,
+     then source-ID tie breaking makes 3 the first novel reverse edge. */
+  expect(optimized[0] == 1 && optimized[1] == 3,
+         "rank optimizer must interleave one capped reverse edge");
+}
+
+OVVS_TEST(cagra_rank_optimizer_invalid_and_deterministic) {
+  constexpr int64_t n = 6;
+  constexpr int32_t initial_degree = 2;
+  constexpr int32_t final_degree = 2;
+  const std::vector<int32_t> initial = {
+      1, 2,
+      0, 3,
+      1, 3,
+      0, 4,
+      0, 5,
+      0, 1,
+  };
+  std::vector<int32_t> first;
+  std::vector<int32_t> second;
+  expect_status(ovvs::impl::cagra_optimize_ranked(initial.data(), n, initial_degree,
+                                                   final_degree, first),
+                "first deterministic rank optimization");
+  expect_status(ovvs::impl::cagra_optimize_ranked(initial.data(), n, initial_degree,
+                                                   final_degree, second),
+                "second deterministic rank optimization");
+  expect(first == second, "rank optimizer deterministic output");
+
+  std::vector<int32_t> malformed = initial;
+  malformed[1] = malformed[0];
+  second = {99};
+  expect(ovvs::impl::cagra_optimize_ranked(malformed.data(), n, initial_degree,
+                                           final_degree, second) == OVVS_STATUS_ERROR,
+         "rank optimizer duplicate row rejection");
+  expect(second.empty(), "failed rank optimization clears output");
+
+  malformed = initial;
+  malformed[0] = 0;
+  expect(ovvs::impl::cagra_optimize_ranked(malformed.data(), n, initial_degree,
+                                           final_degree, second) == OVVS_STATUS_ERROR,
+         "rank optimizer self-edge rejection");
+  malformed = initial;
+  malformed[0] = static_cast<int32_t>(n);
+  expect(ovvs::impl::cagra_optimize_ranked(malformed.data(), n, initial_degree,
+                                           final_degree, second) == OVVS_STATUS_ERROR,
+         "rank optimizer out-of-range rejection");
+  expect(ovvs::impl::cagra_optimize_ranked(initial.data(), n, initial_degree,
+                                           initial_degree + 1, second) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "rank optimizer invalid degree rejection");
+  expect(ovvs::impl::cagra_optimize_ranked(nullptr, n, initial_degree,
+                                           final_degree, second) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "rank optimizer null graph rejection");
 }
 
 OVVS_TEST(nndescent_gpu_n_over_4096) {

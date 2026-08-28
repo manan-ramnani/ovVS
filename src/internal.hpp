@@ -264,6 +264,10 @@ ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int3
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph);
+/* Private C++ test seam; not part of the installed C ABI. */
+OVVS_API ovvsStatus cagra_optimize_ranked(const int32_t* initial, int64_t n,
+                                          int32_t initial_degree, int32_t final_degree,
+                                          std::vector<int32_t>& output);
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
