@@ -544,7 +544,7 @@ def _hdf5(path: Path, profile_name: str, profile: dict[str, Any]) -> dict[str, A
         "dim": int(train[1]),
         "nq": nq,
         "source_nq": int(test[0]),
-        "dtype": "float32_normalized_on_load",
+        "dtype": "float32_cast_on_load",
         "metric": "squared_l2",
         "selection": {"base": f"first {n}", "queries": f"first {nq}"},
         "source": {
@@ -597,7 +597,7 @@ def _custom(base_path: Path, query_path: Path, profile: dict[str, Any]) -> dict[
         "dim": dim,
         "nq": nq,
         "source_nq": int(queries.shape[0]),
-        "dtype": "float32_normalized_on_load",
+        "dtype": "float32_cast_on_load",
         "metric": "squared_l2",
         "selection": {"base": f"first {n}", "queries": f"first {nq}"},
         "source": {

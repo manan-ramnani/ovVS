@@ -27,7 +27,7 @@ Sources: `tables/arrow-lake/gemm.json`, `gemm_large.json`, `gemm_f16.json`, `gem
 | TopK | tiny and 32×1e5 k=10 | **1.9 ms** | 114 ms | 750 ms | CPU |
 | Gather | 4096 rows from 1e5×768 | **4 ms** | 213 ms | 24 ms | CPU |
 | Graph walk | CAGRA | host fallback | no | **SYCL fused** | GPU |
-| PQ ADC | tiles of 128 | SHAVE C | **Gather+ReduceSum** | — | NPU |
+| PQ ADC | tiles of 128 | SHAVE C | **Gather+ReduceSum when range-safe** | — | NPU only for safe bounds; CPU fallback otherwise |
 | Hamming / Lp | pairwise graph | AVX | GreaterEqual/Xor or Abs/Power | SYCL | FORCE_* honest; AUTO follows size |
 
 Search-shaped GEMM is `nq × n × dim` with **B = dataset** (large, immutable after build) and **A = queries** (small, changes). That is the NPU sticky-B win. The bakeoff `large` shape (`1e5 × 32 × 768`) is the inverse (huge A); `ovvs_bakeoff search` is `32 × 1e5 × 768`.
@@ -48,7 +48,7 @@ IVF-Flat
 
 IVF-PQ / RaBitQ
   coarse assign       → CPU GEMM
-  ADC                 → NPU Gather+ReduceSum tiles (this is the NPU search win)
+  ADC                 → NPU Gather+ReduceSum only when the LUT accumulation bound is safe; CPU fallback otherwise
   refine              → CPU
 
 CAGRA search
@@ -81,7 +81,7 @@ Arrow Lake dense GEMM is an AVX-512 / AMX problem that oneMKL already owns. Ship
 4. Do not bake B as an IR Constant. DPU got faster; wall got slower.
 5. INT8 on NPU is NNCF FakeQuantize+Constant weights, not raw `si8`. Until that IR exists for a given op, AUTO I8 is iGPU XMX.
 6. Compile: `NPU_TURBO`, `PERFORMANCE_HINT=LATENCY`, `optimization-level=2 performance-hint-override=latency`.
-7. Fail closed when conservative GEMM/TopK bounds or outputs reach FP16 range (65,504); scaled execution is not implemented yet.
+7. Fail closed when conservative GEMM/TopK/PQ-ADC bounds or outputs reach FP16 range (65,504); scaled execution is not implemented yet. PQ ADC uses `sum_m max_code(abs(lut[m, code]))` and validates request-owned output before copying it to caller memory.
 
 Remaining NPU gap: after fingerprint-sticky inputs skip the hot host memcpy, wall still remains about `45–54 ms` versus `5.3 ms` of profiled DPU work on 1e5×32×768. The remaining cost is principally device DMA/tile movement into a 4 MB scratchpad; a roughly 150 MB f16 operand cannot remain resident there. A canonical remote L0 tensor may reduce application copies, duplicate request buffers, or cold-path ownership cost, but it does not by itself prove lower steady-state DMA or wall time. Unsigned SHAVE ELF inject is still unsupported; ActShave already runs inside compiler graphs.
 
@@ -100,6 +100,8 @@ The archived Intel NPU Acceleration Library is reference material only; Intel di
 
 The current B3/B6/B7 experiments are software-only and require no BIOS or firmware change. Resizable BAR and firmware power tuning have no measured ovVS benefit on this machine and are excluded unless future authoritative device evidence plus a controlled end-to-end benchmark justifies reopening them.
 
+Current B3 evidence is in `tables/arrow-lake/ivfpq-b3.md`. The fail-closed guard restored the bounded SIFT-prefix AUTO recall to exact FORCE_CPU parity, but AUTO remained 6.82× slower at `nprobe=8`. Infer-only request-pool and fixed-bucket probes justify implementation experiments; they are not end-to-end IVF-PQ wins.
+
 Primary references: [Intel NPU Acceleration Library EOL](https://github.com/intel/intel-npu-acceleration-library), [OpenVINO NPU device and model caching](https://docs.openvino.ai/2026/openvino-workflow/running-inference/inference-devices-and-modes/npu-device.html), [NPU Remote Tensor API](https://docs.openvino.ai/2026/openvino-workflow/running-inference/inference-devices-and-modes/npu-device/remote-tensor-api-npu-plugin.html), [custom OpenVINO operations](https://docs.openvino.ai/2026/documentation/openvino-extensibility/custom-openvino-operations.html), and [OpenVINO GenAI continuous batching](https://github.com/openvinotoolkit/openvino.genai/blob/master/src/README.md#continuous-batching-with-llmpipeline).
 
 ## Feed path (iGPU)
@@ -116,7 +118,7 @@ AUTO:
 - `topk` / `gather` → CPU
 - GEMM / pairwise → CPU unless `flops ≥ large_gemm_flops` and `gemm_large.json` names NPU or GPU (Arrow Lake: CPU)
 - CAGRA walk → GPU (`prim_graph_walk`)
-- PQ ADC → NPU
+- PQ ADC → NPU only for range-safe tables; CPU fallback otherwise
 - `FORCE_NPU` / `FORCE_GPU` still hit that device or return `DEVICE_UNAVAILABLE`
 
 `FORCE_NPU` / `FORCE_GPU` still hit that device or return `DEVICE_UNAVAILABLE`. CPU is never reported as an NPU/GPU win.

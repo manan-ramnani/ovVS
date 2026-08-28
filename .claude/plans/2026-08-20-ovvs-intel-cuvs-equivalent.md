@@ -324,15 +324,15 @@ Build: CMake, C++20, Intel DPC++ (icpx) for GPU code, MSVC/clang for host if nee
 
 ## 5. Feature matrix (definition of done)
 
-Every row must reach **Accelerated** on a Lunar Lake machine. **Accelerated** means the hot loop is NPU and/or iGPU, not “CPU works”.
+Every row must reach **Accelerated** on a Lunar Lake machine. **Accelerated** means the hot loop is NPU and/or iGPU, not “CPU works”. The device columns require those paths to exist; they do not override per-SKU AUTO bakeoffs. Arrow Lake AUTO uses CPU oneMKL for coarse/dense GEMM and NPU PQ ADC only when its numeric bound is safe.
 
 ### 5.1 Neighbors
 
 | Algorithm | cuVS role | ovVS NPU | ovVS iGPU | ovVS CPU | Done when |
 |---|---|---|---|---|---|
 | Brute-force | exact kNN | GEMM+topk graph | GEMM+topk kernel | AVX GEMM | recall=1, beats naive NumPy, NPU used for large NxD |
-| IVF-Flat | inverted lists, full vectors | coarse GEMM | list scan + dist | metadata | recall vs FAISS IVF-Flat within 1% at same nprobe |
-| IVF-PQ | IVF + PQ ADC | coarse + ADC if padded | ADC + refine | train | recall vs FAISS IVF-PQ within 1% at same params |
+| IVF-Flat | inverted lists, full vectors | coarse GEMM path | list scan + dist | metadata + SKU winner | recall vs FAISS IVF-Flat within 1% at same nprobe |
+| IVF-PQ | IVF + PQ ADC | coarse path + range-safe padded ADC | ADC + refine | train + unsafe-range fallback | recall vs FAISS IVF-PQ within 1% at same params |
 | IVF-RaBitQ | binary/quant IVF | native INT/binary GEMM | scan | train | recall-QPS curve vs paper/cuVS ballpark |
 | CAGRA | GPU graph ANN | optional dist tiles | walk + build | export | recall vs CAGRA/HNSW; iGPU walk fused |
 | CAGRA-Q | compressed attached dataset | ADC | walk on codes | — | same API as cuVS compression flag |
@@ -378,13 +378,13 @@ Porting CUDA CAGRA blindly will lose. Redesign for subgroup-16 and DRAM.
 ### 6.1 Build
 
 1. **Initial graph**
-   - IVF-PQ path: reuse ovVS IVF-PQ (NPU coarse + iGPU/NPU ADC), batched queries of the dataset against itself in chunks.
+   - IVF-PQ path: reuse ovVS IVF-PQ (SKU-selected coarse assignment + iGPU/NPU ADC), batched queries of the dataset against itself in chunks.
    - NN-Descent path: iGPU kernels (see §7 phase 12).
    - Iterative CAGRA-search path: after search kernel exists.
 2. **Optimize/prune** on iGPU: each vertex’s `I` neighbors → reverse edges → prune to degree `G`. Sort and unique in SLM if `I` fits, else global.
 3. Graph stored as `uint32[N, G]` in USM, optionally degree-padded.
 
-NPU during build: all large GEMMs (IVF-PQ train assignment, batched self-search scores).
+NPU during build: retain large-GEMM paths for SKUs whose bakeoff selects them. Arrow Lake AUTO uses CPU oneMKL for IVF-PQ assignment and batched dense scores.
 
 ### 6.2 Search kernel (iGPU)
 
@@ -532,7 +532,7 @@ Exit: IVF training can call this.
 ### Phase 9 — IVF-Flat
 
 - **T9.1** Train: k-means coarse, assign lists, prefix-sum offsets, pack lists (CSR-like).
-- **T9.2** Search: coarse GEMM **NPU**, top `nprobe` **CPU/iGPU**, scan lists **iGPU** fused dist.
+- **T9.2** Search: coarse GEMM through the SKU-selected primitive (**CPU oneMKL on Arrow Lake; NPU path retained**), top `nprobe` **CPU/iGPU**, scan lists **iGPU** fused dist.
 - **T9.3** `[H][N]` Padded-list NPU scan: pad each probed list to `max_list_size`, pack `[B*nprobe, max_list, D]`, NPU GEMM. Bakeoff vs fused iGPU. Keep winner per SKU.
 - **T9.4** Add/remove optional (lists rebuild or extra list). If cuVS IVF-Flat has extend, match it.
 - **T9.5** Serialize. Filtered search bitset while scanning.
@@ -833,6 +833,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 | TopK/Gather AUTO | CPU | `topk_large.json` CPU 3.4 ms vs NPU 99 vs GPU 758. |
 | CPU GEMM | oneMKL `cblas_sgemm` | Naive triple loop was 192 ms; MKL is 18 ms. That flip made CPU the dense GEMM device on this SKU. |
 | NPU programming model | Inference engine, not BLAS | DPU MatMul is µs; wall was SHAVE copies from `set_tensor(host*)` plus new InferRequest. Feed `get_input_tensor` L0 buffers and reuse InferRequest. Copy inputs unless a payload is at least 64 KiB and the 32-sample content fingerprint still matches; pointer identity alone is unsafe because k-means mutates in place. INT8 = NNCF FQ+Constant weights. Scratchpad 4 MB. Compile: TURBO + `optimization-level=2`. Canonical: `AGENTS.md` “NPU contract” + `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`. |
+| NPU PQ ADC numeric contract | Run Gather+ReduceSum only when `sum_m max_code(abs(lut[m, code])) < 65,504`; validate the request-owned result before copying | Real SIFT residual LUT sums reached roughly 85k–100k and full 128-row tiles saturated at 65,504, collapsing bounded AUTO recall to 0.3781 versus CPU 0.9469. The fail-closed guard restored exact recall parity; unsafe AUTO uses CPU and FORCE_NPU returns unavailable. Per-table scaling is measured but unimplemented. Evidence: `tables/arrow-lake/ivfpq-b3.md`. |
 | Remaining work after v0.2 ABI | Kernel quality + scale, not more C ABI names | 2026-08-28 status: symbols cover the plan’s algorithm list; AUTO dense search on Arrow Lake is CPU oneMKL; CAGRA/IVF do not beat hnswlib/FAISS; Lunar Lake is unmeasured. The current-code SIFT1M CAGRA point passes recall closeness at 0.9036 versus 0.8915, but hnswlib was 6.02× faster in the load-contaminated diagnostic run and the ≥0.95 target is open. The next implementation path is persistent/batched IVF-PQ ADC then RaBitQ (B3–B4), while B2 throughput and full B1 curves/energy remain open. Journal: `.claude/backlog.md`. |
 | HETERO policy | equals AUTO until an explicit stage DAG lands | Not a third GEMM backend. `prim_pq_adc` and `prim_graph_walk` are currently different algorithms, so they cannot be called a pipeline. Define buffer ownership and dependencies first; candidate DAGs are IVF-PQ ADC tile i+1 on NPU while iGPU scans/selects tile i after B3, or CAGRA candidate-slab scoring after B9. Only end-to-end wall/energy wins count. Documented in `docs/hw-split.md`; backlog B6. |
 | v0.2 vs v1.0 | 0.2.0 is not §16 equivalent | v1.0 still requires Lunar Lake accelerated paths, published FAISS/hnswlib benches, mixer tables for that SKU. Toy-test recall floors (CAGRA-Q 0.35 on n=32, IVF-PQ 0.5 on n=64) are not those gates. |
@@ -852,7 +853,7 @@ Filled in as installs finish. Placeholder until toolchain logs land:
 - **FAISS/hnswlib pip:** `faiss-cpu` 1.15.0 and `hnswlib` 0.8.0 import. SIFT **n=2000** artifacts remain smoke only. The current strict SIFT1M pair passes recall closeness: CAGRA 0.9036 versus hnswlib 0.8915. It remains below the ≥0.95 target; hnswlib was 6.02× faster in the load-contaminated diagnostic run, and the artifact is not the full B1 curve/energy report. AUTO/CPU brute beats FAISS only on the bounded slice; the legacy NPU brute result is invalid due FP16-range saturation and now fails closed; IVF paths remain behind FAISS.
 - **CAGRA SYCL B2 checkpoint:** work-group/query, SLM candidates, bounded hash, cooperative distance, and forced-policy honesty are implemented. The current full SIFT1M gate passes recall closeness at 0.9036 versus hnswlib 0.8915. Resource-local counters prove direct GPU-accessible index pointers, all 192 device attributions, and zero explicit dataset/graph uploads; they do not measure driver-managed page migration. Query-content hashing fixes batch/order dependence with exact CPU/GPU parity regressions. The ≥0.95 target, graph-aware entry points, effort scaling, and leader-serial selection/sort remain; hnswlib was 6.02× faster in the load-contaminated diagnostic run. Evidence: `tables/arrow-lake/bench-recall-qps.md`, `tables/arrow-lake/cagra-transfer-b2.md`.
 - **NN-Descent SYCL B5 checkpoint:** n>4096 L2-family/IP/cosine construction uses cached-distance NEW/OLD tags, bounded sampled forward/reverse lists, NEW–NEW and NEW–OLD reciprocal proposals, deterministic target-owned merges, and exact changed/pending-NEW accounting. The current SIFT1M AUTO build completed in 185.3 s within 2,342.5 MiB isolated peak process RSS and supported 0.9036 downstream CAGRA recall, passing the matched hnswlib-closeness gate. This does not close T12.5: standalone convergence, the IVF-PQ-init comparison, K64 scale, and the T13.3 GPU prune remain open. Evidence: `tables/arrow-lake/nndescent-b5.md`.
-- **IVF-PQ NPU ADC (attempted, control plane still host):** `prim_pq_adc` Gather+ReduceSum tiles run ActShave+DPU. `ovvsIvfPqSearch` still rebuilds tables and packs list codes on the host per query per list (backlog B3).
+- **IVF-PQ NPU ADC (correctness guarded, control plane still host):** `prim_pq_adc` Gather+ReduceSum tiles run ActShave+DPU only when the conservative LUT accumulation bound is below 65,504 and every output tile validates; caller output is published atomically after the full request batch. Unsafe AUTO falls back to CPU; FORCE_NPU fails unavailable. `ovvsIvfPqSearch` still rebuilds tables and packs list codes on the host per query per list (backlog B3). The current bounded AUTO result is correct but 6.82× slower than FORCE_CPU at `nprobe=8`; request-pool/bucket measurements are infer-only, not end-to-end proof.
 - **HETERO:** `OVVS_POLICY_HETERO` currently equals AUTO. Not parked — unwired (backlog B6).
 - **Lunar Lake tables:** still TBD. Do not copy Arrow Lake. v1.0 SKU (backlog B8).
 

@@ -33,9 +33,9 @@ bindings → C ABI (libovvs) → C++ algorithms → mixer/planner
 - Algorithms call `ovvs::prim`, never OpenVINO or SYCL directly.
 - Default tensor home: USM shared (CPU + iGPU). NPU sees tiles/bound host buffers, not a second index copy as source of truth.
 - Graph ANN (CAGRA/Vamana/NN-Descent walk) lives on **iGPU**. NPU may score a padded candidate slab if bakeoff says so.
-- Dense GEMM / coarse IVF assign / k-means assign: **CPU oneMKL** on Arrow Lake (bakeoff). PQ ADC: **NPU**. Graph walk: **iGPU**. NPU Parameter MatMul is kept for FORCE_NPU and for SKUs whose `gemm_large.json` names NPU.
+- Dense GEMM / coarse IVF assign / k-means assign: **CPU oneMKL** on Arrow Lake (bakeoff). PQ ADC: **NPU only when its conservative accumulation bound is range-safe; otherwise AUTO falls back to CPU until scaled execution lands**. Graph walk: **iGPU**. NPU Parameter MatMul is kept for FORCE_NPU and for SKUs whose `gemm_large.json` names NPU.
 
-**Device split (canonical):** `docs/hw-split.md`. AUTO GEMM / TopK / Gather → CPU (oneMKL `cblas_sgemm` beats NPU wall and iGPU XMX on Arrow Lake). CAGRA walk → iGPU. PQ ADC → NPU. `FORCE_*` still hits NPU/GPU.
+**Device split (canonical):** `docs/hw-split.md`. AUTO GEMM / TopK / Gather → CPU (oneMKL `cblas_sgemm` beats NPU wall and iGPU XMX on Arrow Lake). CAGRA walk → iGPU. Range-safe PQ ADC may use NPU; unsafe tables use CPU. `FORCE_*` still hits NPU/GPU or fails unavailable.
 
 Details, knobs, and CAGRA mapping: the plan §4–§6.
 
@@ -51,9 +51,9 @@ Intel added an **inference engine** (compiled graph, weight-stationary, ~4 MB sc
 2. **Feed L0 tensors via `get_input_tensor` / `get_output_tensor`.** The plugin allocates Level Zero buffers at request creation. `memcpy` into those. `set_tensor` on a malloc/USM host pointer **forces a SHAVE copy** (intel_npu README). That copy is the 35 ms “SHAVE A” in `PERF_COUNT`, not a broken DPU.
 3. **Reuse the request’s L0 buffers.** `memcpy` unless `nbytes ≥ 64 KiB` and a 32-sample fingerprint matches (search dataset). Pointer-identity alone is unsafe: k-means/ScaNN mutate centroids. Scratchpad is **4 MB** (`1e5×768` f16 ≈ 150 MB does not fit).
 4. **INT8 is NNCF Low Precision IR** (FakeQuantize on activations **and Constant weights**). Raw `si8` MatMul is illegal. Two live fp32 Parameters will not light INT8 MACs. TOPS on this SKU are INT8; FP16 is half-rate. Compile with `NPU_TURBO` + `optimization-level=2 performance-hint-override=latency`.
-5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (18 ms vs NPU 45 ms vs GPU 221 ms at 1e5×32×768). Graph walk → iGPU. ADC → NPU. NPU DPU is still 5.3 ms; Parameter DMA is why wall loses to MKL.
+5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (18 ms vs NPU 45 ms vs GPU 221 ms at 1e5×32×768). Graph walk → iGPU. Range-safe ADC may use NPU; unsafe ADC falls back to CPU. NPU DPU is still 5.3 ms; Parameter DMA is why wall loses to MKL.
 6. **Do not bake B as an IR Constant just to be clever.** That made DPU 10× faster and wall 10× *slower* (UMD/constant reload). Sticky Parameter + reused request + L0 `get_tensor` is the path.
-7. **Fail closed on numeric range.** Arrow Lake f32 graph IO can exhibit FP16-range saturation. GEMM/TopK must reject non-finite inputs, unsafe conservative bounds, or invalid outputs; FORCE_NPU returns `DEVICE_UNAVAILABLE` until a measured scaling path exists.
+7. **Fail closed on numeric range.** Arrow Lake f32 graph IO can exhibit FP16-range saturation. GEMM, TopK, and PQ ADC reject non-finite inputs, unsafe conservative bounds, or invalid outputs; FORCE_NPU returns `DEVICE_UNAVAILABLE` until a measured scaling path exists. For ADC the bound is `sum_m max_code(abs(lut[m, code])) < 65,504`, and the request-owned output is validated before publication.
 
 If a change “uses the NPU” but creates a request per call, `set_tensor`s host pointers, or DMA’s the dataset every query, it is a defect.
 

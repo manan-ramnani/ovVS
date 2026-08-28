@@ -271,6 +271,187 @@ OVVS_TEST(npu_pq_adc_matches_shave_when_present) {
   }
 }
 
+OVVS_TEST(npu_pq_adc_tile_boundaries_match_reference_when_present) {
+  Res res;
+  int32_t npu = 0;
+  ovvsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) skip_test("NPU not available");
+
+  constexpr int32_t pq_m = 8;
+  constexpr int32_t ks = 256;
+  std::vector<float> tables(static_cast<size_t>(pq_m * ks));
+  for (int32_t m = 0; m < pq_m; ++m) {
+    for (int32_t code = 0; code < ks; ++code) {
+      tables[static_cast<size_t>(m * ks + code)] =
+          0.03125f * static_cast<float>(m + 1) + 0.001f * static_cast<float>(code);
+    }
+  }
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  const std::vector<int64_t> counts{127, 128, 129, 255, 256, 257};
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      for (size_t i = 0; i < tables.size(); ++i) {
+        tables[i] += 0.00025f * static_cast<float>((i % 11) + 1);
+      }
+    }
+    for (int64_t ncodes : counts) {
+      std::vector<uint8_t> codes(static_cast<size_t>(ncodes * pq_m));
+      for (int64_t i = 0; i < ncodes; ++i) {
+        for (int32_t m = 0; m < pq_m; ++m) {
+          codes[static_cast<size_t>(i * pq_m + m)] =
+              static_cast<uint8_t>((i * 37 + m * 53 + pass * 97) % ks);
+        }
+      }
+      const uint8_t special_codes[] = {0, 127, 128, 255};
+      for (size_t row = 0; row < 4 && row < static_cast<size_t>(ncodes); ++row) {
+        for (int32_t m = 0; m < pq_m; ++m) {
+          codes[row * static_cast<size_t>(pq_m) + static_cast<size_t>(m)] = special_codes[row];
+        }
+      }
+      for (int32_t m = 0; m < pq_m; ++m) {
+        codes[static_cast<size_t>((ncodes - 1) * pq_m + m)] = 255;
+      }
+
+      std::vector<float> host(static_cast<size_t>(ncodes));
+      std::vector<float> npuo(static_cast<size_t>(ncodes + 2), -12345.0f);
+      for (int64_t i = 0; i < ncodes; ++i) {
+        float sum = 0.0f;
+        for (int32_t m = 0; m < pq_m; ++m) {
+          sum += tables[static_cast<size_t>(m * ks + codes[static_cast<size_t>(i * pq_m + m)])];
+        }
+        host[static_cast<size_t>(i)] = sum;
+      }
+
+      const ovvsStatus st =
+          ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes, npuo.data() + 1);
+      expect(st != OVVS_STATUS_DEVICE_UNAVAILABLE,
+             "NPU tile-boundary PQ ADC DEVICE_UNAVAILABLE at n=" + std::to_string(ncodes));
+      const std::string what = "NPU tile-boundary PQ ADC at n=" + std::to_string(ncodes);
+      expect_status(st, what.c_str());
+      ovvsDevice last = OVVS_DEVICE_CPU;
+      expect_status(ovvsResourcesLastDevice(res.r, &last), "tile-boundary ADC last device");
+      expect(last == OVVS_DEVICE_NPU, "tile-boundary FORCE_NPU ADC last_device");
+      expect(npuo.front() == -12345.0f && npuo.back() == -12345.0f,
+             "tile-boundary ADC output canaries");
+
+      float max_abs_error = 0.0f;
+      for (int64_t i = 0; i < ncodes; ++i) {
+        max_abs_error = std::max(
+            max_abs_error,
+            std::fabs(host[static_cast<size_t>(i)] - npuo[static_cast<size_t>(i + 1)]));
+      }
+      expect(max_abs_error < 2e-2f,
+             "tile-boundary ADC max error " + std::to_string(max_abs_error) +
+                 " at n=" + std::to_string(ncodes) + " pass=" + std::to_string(pass));
+    }
+  }
+}
+
+OVVS_TEST(npu_pq_adc_rejects_unsafe_accumulation_when_present) {
+  Res res;
+  int32_t npu = 0;
+  ovvsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) skip_test("NPU not available");
+
+  constexpr int32_t pq_m = 8;
+  constexpr int32_t ks = 256;
+  constexpr int64_t ncodes = 129;
+  std::vector<float> tables(static_cast<size_t>(pq_m * ks), 8192.0f);
+  std::vector<uint8_t> codes(static_cast<size_t>(ncodes * pq_m));
+  for (size_t i = 0; i < codes.size(); ++i) codes[i] = static_cast<uint8_t>(i % ks);
+  std::vector<float> expected(static_cast<size_t>(ncodes));
+  std::vector<float> actual(static_cast<size_t>(ncodes), -1.0f);
+  std::fill(expected.begin(), expected.end(), 65536.0f);
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes,
+                               actual.data()),
+                "unsafe CPU ADC reference");
+  for (int64_t i = 0; i < ncodes; ++i) {
+    expect(actual[static_cast<size_t>(i)] == expected[static_cast<size_t>(i)],
+           "unsafe CPU ADC reference result");
+  }
+  std::fill(actual.begin(), actual.end(), -1.0f);
+  int32_t fallbacks_before = 0;
+  int32_t compile_fails_before = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_before),
+                "unsafe NPU ADC fallback count before");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_before),
+                "unsafe NPU ADC compile-fail count before");
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  const ovvsStatus forced =
+      ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes, actual.data());
+  expect(forced == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "unsafe NPU ADC accumulation must fail closed");
+  for (float value : actual) expect(value == -1.0f, "failed NPU ADC must not write output");
+  ovvsDevice last = OVVS_DEVICE_NPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "unsafe rejected ADC last device");
+  expect(last == OVVS_DEVICE_CPU, "rejected NPU ADC must preserve prior device attribution");
+  int32_t fallbacks_after = 0;
+  int32_t compile_fails_after = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after),
+                "unsafe NPU ADC fallback count after");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_after),
+                "unsafe NPU ADC compile-fail count after");
+  expect(fallbacks_after == fallbacks_before + 1, "unsafe forced ADC fallback count");
+  expect(compile_fails_after == compile_fails_before,
+         "unsafe forced ADC must not count as a compile failure");
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO);
+  expect_status(ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes,
+                               actual.data()),
+                "unsafe AUTO ADC CPU fallback");
+  last = OVVS_DEVICE_NPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "unsafe AUTO ADC last device");
+  expect(last == OVVS_DEVICE_CPU, "unsafe AUTO ADC must attribute CPU fallback");
+  for (int64_t i = 0; i < ncodes; ++i) {
+    expect(actual[static_cast<size_t>(i)] == expected[static_cast<size_t>(i)],
+           "unsafe AUTO ADC CPU result");
+  }
+}
+
+OVVS_TEST(npu_pq_adc_multitile_output_is_atomic_when_present) {
+  Res res;
+  int32_t npu = 0;
+  ovvsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) skip_test("NPU not available");
+
+  constexpr int32_t pq_m = 8;
+  constexpr int32_t ks = 256;
+  constexpr int64_t ncodes = 256;
+  std::vector<float> tables(static_cast<size_t>(pq_m * ks), 1.0f);
+  for (int32_t m = 0; m < pq_m; ++m) {
+    tables[static_cast<size_t>(m * ks + 255)] = 8187.999f;
+  }
+  std::vector<uint8_t> codes(static_cast<size_t>(ncodes * pq_m), 0);
+  for (int64_t i = 128; i < ncodes; ++i) {
+    for (int32_t m = 0; m < pq_m; ++m) {
+      codes[static_cast<size_t>(i * pq_m + m)] = 255;
+    }
+  }
+  std::vector<float> actual(static_cast<size_t>(ncodes + 2), -12345.0f);
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  const ovvsStatus status =
+      ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes, actual.data() + 1);
+  expect(actual.front() == -12345.0f && actual.back() == -12345.0f,
+         "multi-tile ADC output canaries");
+  if (status == OVVS_STATUS_DEVICE_UNAVAILABLE) {
+    for (int64_t i = 0; i < ncodes; ++i) {
+      expect(actual[static_cast<size_t>(i + 1)] == -12345.0f,
+             "failed multi-tile ADC must publish no partial output");
+    }
+    return;
+  }
+  expect_status(status, "multi-tile ADC atomic success");
+  for (int64_t i = 0; i < ncodes; ++i) {
+    expect(actual[static_cast<size_t>(i + 1)] != -12345.0f,
+           "successful multi-tile ADC must publish every output");
+  }
+}
+
 static const char* dev_name(ovvsDevice d) {
   switch (d) {
     case OVVS_DEVICE_NPU:

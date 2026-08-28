@@ -44,6 +44,25 @@ bool finite_below_npu_limit(const float* values, int64_t count) {
   return true;
 }
 
+bool npu_pq_adc_range_safe(const float* tables, int32_t pq_m, int32_t ks) {
+  double accumulation_bound = 0.0;
+  for (int32_t m = 0; m < pq_m; ++m) {
+    double subspace_bound = 0.0;
+    for (int32_t code = 0; code < ks; ++code) {
+      const float value = tables[static_cast<size_t>(m) * static_cast<size_t>(ks) +
+                                 static_cast<size_t>(code)];
+      if (!std::isfinite(value)) return false;
+      subspace_bound = std::max(subspace_bound, static_cast<double>(std::fabs(value)));
+    }
+    accumulation_bound += subspace_bound;
+    if (!std::isfinite(accumulation_bound) ||
+        accumulation_bound >= static_cast<double>(kNpuFp16FiniteMax)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool npu_gemm_range_safe(const float* a, int64_t na, const float* b, int64_t nb, int64_t k) {
   float amax = 0.0f;
   float bmax = 0.0f;
@@ -576,10 +595,12 @@ bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
                 int64_t ncodes, float* out) {
 #if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device("NPU")) return false;
+  if (!npu_pq_adc_range_safe(tables, pq_m, ks)) return false;
   constexpr int64_t kTile = 128;
   try {
     using namespace ov;
     const int64_t lut_n = static_cast<int64_t>(pq_m) * ks;
+    std::vector<float> staged(static_cast<size_t>(ncodes));
     std::filesystem::create_directories(r.cache_dir);
     for (int64_t off = 0; off < ncodes; off += kTile) {
       const int64_t nn = std::min(kTile, ncodes - off);
@@ -607,8 +628,14 @@ bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
         }
       }
       slot.req.infer();
-      read_out(slot, 0, out + off, static_cast<size_t>(nn) * sizeof(float));
+      Tensor result = slot.req.get_output_tensor(0);
+      const size_t result_bytes = static_cast<size_t>(nn) * sizeof(float);
+      if (result.get_byte_size() < result_bytes) return false;
+      const float* result_data = result.data<const float>();
+      if (!finite_below_npu_limit(result_data, nn)) return false;
+      std::memcpy(staged.data() + off, result_data, result_bytes);
     }
+    std::memcpy(out, staged.data(), staged.size() * sizeof(float));
     return true;
   } catch (...) {
     ++r.npu_compile_fails;

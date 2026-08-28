@@ -523,6 +523,45 @@ OVVS_TEST(ivf_pq_recall) {
   ovvsIvfPqDestroy(ix);
 }
 
+OVVS_TEST(ivf_pq_auto_matches_cpu_on_wide_range) {
+  Res res;
+  int32_t npu = 0;
+  ovvsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) skip_test("NPU not available");
+
+  const int64_t n = 512, dim = 16, nq = 16, k = 10;
+  auto data = make_data(n, dim, 214);
+  auto q = make_data(nq, dim, 215);
+  for (float& value : data) value *= 255.0f;
+  for (float& value : q) value *= 255.0f;
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  ovvsIvfPqIndex_t ix = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 32, 8, 8,
+                               &ix),
+                "wide-range ivfpq build");
+
+  std::vector<int64_t> cpu_ids(static_cast<size_t>(nq * k));
+  std::vector<int64_t> auto_ids(static_cast<size_t>(nq * k));
+  std::vector<float> cpu_distances(static_cast<size_t>(nq * k));
+  std::vector<float> auto_distances(static_cast<size_t>(nq * k));
+  expect_status(ovvsIvfPqSearch(res.r, ix, q.data(), nq, k, 8, 32, nullptr, cpu_ids.data(),
+                                cpu_distances.data()),
+                "wide-range ivfpq CPU search");
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO);
+  expect_status(ovvsIvfPqSearch(res.r, ix, q.data(), nq, k, 8, 32, nullptr, auto_ids.data(),
+                                auto_distances.data()),
+                "wide-range ivfpq AUTO search");
+  for (size_t i = 0; i < cpu_ids.size(); ++i) {
+    expect(auto_ids[i] == cpu_ids[i], "wide-range ivfpq AUTO/CPU neighbor parity");
+    const float tolerance = 1e-5f * std::max(1.0f, std::fabs(cpu_distances[i]));
+    expect(std::fabs(auto_distances[i] - cpu_distances[i]) <= tolerance,
+           "wide-range ivfpq AUTO/CPU distance parity");
+  }
+  ovvsIvfPqDestroy(ix);
+}
+
 OVVS_TEST(ivf_rabitq_recall) {
   Res res;
   const int64_t n = 64, dim = 8, nq = 5, k = 4;

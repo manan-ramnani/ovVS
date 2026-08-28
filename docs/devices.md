@@ -6,7 +6,7 @@ ovVS picks a device per primitive (`gemm`, `topk`, `gather`, pairwise). Algorith
 
 | Policy | Behavior |
 |---|---|
-| `OVVS_POLICY_AUTO` | Per `docs/hw-split.md`: GEMM/TopK/Gather → CPU oneMKL on this SKU; CAGRA walk → iGPU; ADC → NPU |
+| `OVVS_POLICY_AUTO` | Per `docs/hw-split.md`: GEMM/TopK/Gather → CPU oneMKL on this SKU; CAGRA walk → iGPU; range-safe PQ ADC → NPU, otherwise CPU |
 | `OVVS_POLICY_FORCE_CPU` | CPU only |
 | `OVVS_POLICY_FORCE_NPU` | NPU only. If the NPU does not run the op, the call returns `OVVS_STATUS_DEVICE_UNAVAILABLE`. CPU is **not** reported as an NPU win. |
 | `OVVS_POLICY_FORCE_GPU` | GPU only (OpenVINO GPU plugin, or SYCL if `OVVS_WITH_SYCL=ON`). Same unavailable rule. |
@@ -23,7 +23,7 @@ Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>
 
 Bakeoff JSON lives in `tables/<sku>/`. This lab machine writes `tables/arrow-lake/` (Core Ultra 7 265K). Lunar Lake files are only created if that CPU brand string is actually probed — do not copy Arrow Lake numbers.
 
-Tiny and large GEMM on this SKU both win on **CPU oneMKL** (`cblas_sgemm`): 64×128×32 is 0.006 ms; `1e5×32×768` is **18 ms** vs NPU 45 ms vs GPU 221 ms (`gemm_large.json`). Search-shaped 32×1e5×768 is the same story (CPU 18 vs NPU 36, `gemm_search.json`). NPU DPU is 5.3 ms; the 45 ms wall is Parameter DMA. AUTO GEMM is CPU. Large TopK/Gather stay CPU. CAGRA walk is iGPU. ADC is NPU. See `docs/hw-split.md`.
+Tiny and large GEMM on this SKU both win on **CPU oneMKL** (`cblas_sgemm`): 64×128×32 is 0.006 ms; `1e5×32×768` is **18 ms** vs NPU 45 ms vs GPU 221 ms (`gemm_large.json`). Search-shaped 32×1e5×768 is the same story (CPU 18 vs NPU 36, `gemm_search.json`). NPU DPU is 5.3 ms; the 45 ms wall is Parameter DMA. AUTO GEMM is CPU. Large TopK/Gather stay CPU. CAGRA walk is iGPU. PQ ADC uses NPU only for range-safe tables and otherwise falls back to CPU. See `docs/hw-split.md`.
 
 ## CAGRA walk
 
@@ -43,7 +43,7 @@ Bounded sampled exact overlap is 0.9727 at n=4,097/K=8 and 0.8750 at n=16,384/K=
 - **FP16 (iGPU):** Xe Matrix Extensions (XMX/DPAS) do FP16 and INT8. `ovvsGemmEx(..., F16)` AUTO/FORCE_GPU uses oneMKL `sycl::half` GEMM (XMX), then a SYCL-half loop, then OpenVINO GPU.
 - **INT8 (iGPU):** oneMKL `int8×int8→float` GEMM (XMX, 2× FP16 issue rate on Xe-core). AUTO I8 prefers this; FORCE_NPU still runs FakeQuantize.
 - **FP16 (NPU):** still available via `ovvsGemmEx(..., F16)` FORCE_NPU (`Convert→f16 MatMul`). Not the AUTO large-GEMM default.
-- **NPU range safety:** Arrow Lake NPU f32 graph IO can still exhibit FP16-range saturation. GEMM/TopK reject non-finite inputs, conservative bounds at or above 65,504, and invalid outputs. FORCE_NPU returns `DEVICE_UNAVAILABLE` for such shapes until range-scaled execution exists.
+- **NPU range safety:** Arrow Lake NPU f32 graph IO can still exhibit FP16-range saturation. GEMM, TopK, and PQ ADC reject non-finite inputs, conservative bounds at or above 65,504, and invalid outputs. FORCE_NPU returns `DEVICE_UNAVAILABLE` for such shapes until range-scaled execution exists.
 - **FP8 e4m3 / FP4 e2m1:** probed (`npu_matmul_f8e4m3`, `npu_matmul_f4e2m1`). Arrow Lake 3720 `compile_fail`.
 
 `ovvsResourcesLastComputeDtype` reports the type that actually ran. I8 search ids on `BuildTyped` still match an independent L2 oracle on integer-valued floats. F16 `BuildTyped` ids match an L2 oracle on IEEE-decoded binary16 (atol **2e-2**).
@@ -54,7 +54,7 @@ ScaNN-like indexes train IVF-PQ in anisotropic (per-dim std) space and **re-rank
 
 `ovvsBitsetFromAllowList(n, ids, nids, bitset)` fills a `(n+7)/8` bitset for filtered search. IVF-PQ and IVF-RaBitQ support serialize/deserialize/extend like IVF-Flat.
 
-When `OVVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Device-accessible inputs avoid an extra copy. CAGRA's index-owned vectors use shared USM when allocation succeeds; the host-heap fallback remains correct but copies those buffers for each GPU search. NPU binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest) and an OpenVINO NPU graph (FORCE_NPU is honest): Hamming is GreaterEqual→LogicalXor→ReduceSum; Lp is Subtract→Abs→Power→ReduceSum→Power. Those lower to Intel ActShave (`eltwise_logical_xor`, `activation_abs`, …) plus DPU ReduceSum. PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes; `PERF_COUNT` shows those tiles run as ActShave + DPU (`shave_silicon_load: compiler_actshave`). A raw SHAVE ELF32 is not a firmware load object (`invalid_native_binary`); the compiler embeds kernel `.text` in a graph ELF64. See `compiler/shave/README.md`.
+When `OVVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Device-accessible inputs avoid an extra copy. CAGRA's index-owned vectors use shared USM when allocation succeeds; the host-heap fallback remains correct but copies those buffers for each GPU search. NPU binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest) and an OpenVINO NPU graph (FORCE_NPU is honest): Hamming is GreaterEqual→LogicalXor→ReduceSum; Lp is Subtract→Abs→Power→ReduceSum→Power. Those lower to Intel ActShave (`eltwise_logical_xor`, `activation_abs`, …) plus DPU ReduceSum. PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes; `PERF_COUNT` shows those tiles run as ActShave + DPU (`shave_silicon_load: compiler_actshave`). Arrow Lake can saturate f32 graph IO at 65,504, so ADC now preflights `sum_m max_code(abs(lut))`, validates request-owned output before copying, falls back to CPU under AUTO when unsafe, and returns unavailable under FORCE_NPU. The bounded evidence and remaining B3 throughput deficit are recorded in `tables/arrow-lake/ivfpq-b3.md`. A raw SHAVE ELF32 is not a firmware load object (`invalid_native_binary`); the compiler embeds kernel `.text` in a graph ELF64. See `compiler/shave/README.md`.
 
 NPU Gather/TopK HostCompile tiles rows (32) and gather indices (128) when a full-shape compile fails.
 
