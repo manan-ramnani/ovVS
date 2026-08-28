@@ -10,7 +10,7 @@ Goal: **put each op on the device that is actually fastest for that op**, then o
 |---|---|---|
 | **NPU** | Compiled static MatMul / Conv on DPU. INT8 full-rate, FP16 half. Weight-stationary graphs. ~4 MB SRAM scratchpad. | Launch tax. No pointer-chasing. `set_tensor(host*)` SHAVE-copies. Two live fp32 Parameters do not light INT8 MACs. Dataset does not fit SRAM. |
 | **iGPU** | XMX/DPAS GEMM (FP16 and INT8 via oneMKL). SYCL graph walk (CAGRA). USM shared with CPU. Parallel convert/pack. | TopK/Gather launch tax vs CPU. Serial host fp32→half is a self-inflicted stall. Shared DRAM, not HBM. |
-| **CPU** | Tiny GEMM, TopK, Gather, control plane, heaps, HostCompile, k-means reduction, filters. AVX-512 / oneMKL `cblas_sgemm`. | Naive triple-loop GEMM is not a device (we do not ship that). Large dense GEMM loses to NPU once the feed path is L0 `get_tensor`. |
+| **CPU** | Tiny GEMM, TopK, Gather, control plane, heaps, HostCompile, k-means reduction, filters. AVX-512 / oneMKL `cblas_sgemm`. | Naive triple-loop GEMM is not a device (we do not ship that). Dense GEMM remains memory-bandwidth-bound and must be re-baked per SKU. |
 
 ## Primitive winners (Arrow Lake, icx + oneMKL + OpenVINO)
 
@@ -85,6 +85,20 @@ Arrow Lake dense GEMM is an AVX-512 / AMX problem that oneMKL already owns. Ship
 
 Remaining NPU gap: cold wall vs DPU (`54 ms` vs `5.3 ms` on 1e5×32×768) is the first memcpy of A into L0. Closing it means the **canonical dataset lives in an NPU L0 tensor** (remote `create_l0_host_tensor`), not a second copy. Unsigned SHAVE ELF inject is still unsupported; ActShave already runs inside compiler graphs.
 
+### OpenVINO 2026 opportunities (not measured in ovVS)
+
+The current measured Windows build links OpenVINO **2025.3.0**. OpenVINO 2026 documentation therefore defines upgrade experiments, not current capability or performance:
+
+- NPU `RemoteContext` / `RemoteTensor` can wrap or allocate Level Zero-accessible memory, including `create_l0_host_tensor`, native handles, mapped files, and CPU virtual addresses. B7 must first upgrade in an isolated build, query runtime/driver support, then compare bytes copied and end-to-end wall against the current request-owned `get_input_tensor` path.
+- Optional strided NPU IO can avoid repacking non-contiguous buffers, but only when `ov::supported_properties` advertises it. Test packed IVF list/code layouts; do not enable all ports by default because the device docs warn of a performance cost.
+- OpenVINO model caching is already enabled through `CACHE_DIR`. An explicit exported blob is useful only if measured startup/import improves and the cache key records OpenVINO, compiler, driver, device, shape, dtype, and compile properties. It does not improve steady-state inference by itself.
+- The NPU plugin exposes one optimal request in latency mode and four in throughput mode. A small reusable request pool plus `start_async` is a B6 experiment for independent ADC tiles; the current single cached request and mutex deliberately serialize a shape. Measure queueing, overlap, energy, and tail latency before retaining a pool.
+- An OpenVINO custom `ov::Op` supplies graph semantics, shape inference, serialization, and optional CPU evaluation. It does **not** provide a public NPU kernel implementation. GPU custom operations separately require OpenCL kernel code; ovVS keeps ANN hot loops in SYCL and the compiler/SHAVE track rather than treating `add_extension` as NPU support.
+
+The archived Intel NPU Acceleration Library is reference material only; Intel directs users to OpenVINO/OpenVINO GenAI. Its useful confirmation is architectural: static/tiled graphs, managed DMA/cache, and quantized/mixed-precision paths. ovVS will not add it as a dependency. From OpenVINO GenAI, only the bounded scheduler, persistent compiled state, and explicit performance telemetry generalize. Token/KV/prefix caches, paged attention, and speculative decoding are LLM-specific and are not ANN index techniques.
+
+Primary references: [Intel NPU Acceleration Library EOL](https://github.com/intel/intel-npu-acceleration-library), [OpenVINO NPU device and model caching](https://docs.openvino.ai/2026/openvino-workflow/running-inference/inference-devices-and-modes/npu-device.html), [NPU Remote Tensor API](https://docs.openvino.ai/2026/openvino-workflow/running-inference/inference-devices-and-modes/npu-device/remote-tensor-api-npu-plugin.html), [custom OpenVINO operations](https://docs.openvino.ai/2026/documentation/openvino-extensibility/custom-openvino-operations.html), and [OpenVINO GenAI continuous batching](https://github.com/openvinotoolkit/openvino.genai/blob/master/src/README.md#continuous-batching-with-llmpipeline).
+
 ## Feed path (iGPU)
 
 1. Dataset/graph in **USM shared**. Skip host→USM copies when the pointer is already shared.
@@ -109,6 +123,7 @@ AUTO:
 Not a third GEMM backend. It is **stage overlap**:
 
 - Independent queries in a batch: NPU can score query *i+1* while iGPU walks query *i* (CAGRA). Not wired yet; `OVVS_POLICY_HETERO` currently equals AUTO (backlog B6, `.claude/backlog.md`).
+- Use bounded queues and reusable device requests/events. Report per-stage execution, queue wait, copied bytes, and overlap; a faster isolated NPU primitive is not a hetero win unless total query wall or energy improves.
 - Do not ping-pong the same buffer NPU↔iGPU inside one stage. Scores stay host-visible USM; TopK is CPU.
 
 ## What not to do

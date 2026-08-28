@@ -4,6 +4,19 @@ Source: `tools/bench/bench.py` against `build-icpx` `ovvs.dll` (`OVVS_WITH_SYCL=
 Dataset: `data/sift-128-euclidean.hdf5` slice n=2000 dim=128 nq=32 k=10.
 Comparators: faiss-cpu 1.15.0, hnswlib 0.8.0.
 
+## SIFT1M matched quality gate
+
+Commit `93e688b`; pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=10`), exact HDF5 truth, M=16, seed 7, one warmup and five measured passes. ovVS used AUTO construction followed by FORCE_GPU search at `itopk=32`, width=1, batch=32. hnswlib 0.8.0 used `ef_construction=200`, `ef=32`, batch=32, and 20 explicit threads.
+
+| Lane | Recall@10 | Observed build | Median QPS | Validity |
+|---|---:|---:|---:|---|
+| ovVS CAGRA | 0.4057 | 830.0 s; final primitive CPU | 1,549.7 | FORCE_GPU search; valid finite unique output; `192/192/0/0` transfer |
+| hnswlib | 0.8903 | 61.7 s | 10,568.7 | valid finite unique output |
+
+The quality gate **failed**: `0.8903 - 0.4057 = 0.4846`, versus a maximum allowed absolute gap of 0.0200. Exact truth was 1,000×10 with 10,000 valid, duplicate-free IDs. Both lanes succeeded; ovVS recorded zero NPU fallbacks and no explicit dataset/graph uploads. This is a valid algorithm-quality failure, not a fixture, policy, or transfer failure.
+
+The timing columns are diagnostic only. Preflight sampled about 62.7% unrelated iGPU 3D load (WUDFHost, ChatGPT, and DWM), so neither QPS nor build wall is a publishable isolated-performance baseline. The recall gap is far from the threshold; the near-boundary hnswlib rerun rule did not apply. The artifact remains intentionally partial because this single pair omits the full curves and package energy.
+
 ## B2 work-group checkpoint
 
 Final bounded rerun after the B2 regression fixes: `bench.py --profile smoke --algorithms cagra --policies gpu --no-energy --repeats 3`. Energy was intentionally disabled, so this is a correctness and relative-throughput smoke, not B1 full-profile evidence.
@@ -17,7 +30,7 @@ Final bounded rerun after the B2 regression fixes: `bench.py --profile smoke --a
 | hnswlib | ef=64, batch=32 | 1.000000 | 49162.7 | 0.648 |
 | hnswlib | ef=64, batch=1 | 1.000000 | 39662.9 | 0.021 |
 
-The recall checkpoint holds at this scale, but ovVS remains roughly 10× slower at the lower-effort batch point and much farther behind at higher effort or batch size one. Later resource-local counters showed direct shared-USM index access and zero explicit dataset/graph uploads for every point in this bounded run; SIFT1M transfer evidence and leader-serial selection/sort remain open. This is not the SIFT1M gate.
+The recall checkpoint holds at this scale, but ovVS remains roughly 10× slower at the lower-effort batch point and much farther behind at higher effort or batch size one. Later resource-local counters showed direct shared-USM index access and zero explicit dataset/graph uploads for every point in this bounded run. Leader-serial selection/sort remains open. This is not the SIFT1M result above.
 
 ## Legacy pre-B2 comparison
 
