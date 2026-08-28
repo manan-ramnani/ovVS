@@ -12,29 +12,29 @@ The table reports medians across three independent full preflight processes; par
 
 | Lane | Recall@10 | Build wall | Median QPS | Isolated peak RSS | Validity |
 |---|---:|---:|---:|---:|---|
-| ovVS CAGRA | 0.9718 (same in all runs) | 8.686 s (8.672–8.800); final primitive CPU | 3,923.6 (3,874.5–3,941.5) | 398.4 MiB (398.2–398.5) | 192/192 GPU attributions per run; `192/192/0/0` transfer |
-| hnswlib | 0.9510 (0.9504–0.9525) | 1.682 s (1.643–1.695) | 22,142.6 (22,104.8–22,978.9) | 201.2 MiB (201.0–202.7) | 20 explicit threads; finite unique output |
+| ovVS CAGRA | 0.9718 (same in all runs) | 9.084 s (8.904–9.087); final primitive CPU | 3,946.1 (3,937.8–3,952.0) | 398.8 MiB (398.8–398.9) | 192/192 GPU attributions per run; `192/192/0/0` transfer |
+| hnswlib | 0.9533 (0.9503–0.9538) | 1.632 s (1.555–1.633) | 23,003.4 (21,984.3–23,301.6) | 202.9 MiB (200.9–203.5) | 20 explicit threads; finite unique output |
 
-CAGRA returned 208 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle, an absolute recall advantage of 0.0208. Recall is reported rather than thresholded because this prefix is not the plan's SIFT1M quality gate. By the three-run medians, hnswlib remained 5.64× faster in search and 5.16× faster to build, while CAGRA used 1.98× the isolated peak process RSS. The CAGRA peak includes the dataset, runtime, and index; it is not device-allocation telemetry. AUTO construction ends in the CPU host optimizer, so the reported final build primitive does not describe the complete mixed build pipeline.
+CAGRA returned 185 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle, an absolute recall advantage of 0.0185. Recall is reported rather than thresholded because this prefix is not the plan's SIFT1M quality gate. By the three-run medians, hnswlib remained 5.83× faster in search and 5.57× faster to build, while CAGRA used about 1.97× the isolated peak process RSS. The CAGRA peak includes the dataset, runtime, and index; it is not device-allocation telemetry. AUTO construction ends in the CPU host optimizer, so the reported final build primitive does not describe the complete mixed build pipeline.
 
-The preflight contract completed in all three runs with both lanes successful, exact truth, five QPS samples per lane, all 192 CAGRA searches per run attributed to GPU, zero NPU fallbacks, and zero explicit index uploads. Energy was disabled and no in-run device-occupancy trace was captured. These walls are therefore retained as diagnostic current-code measurements, not a publishable isolated performance baseline. Every artifact remains partial and noncanonical; the separate full SIFT1M section below contains the current full-scale gate.
+The preflight contract completed in all three runs at clean commit `5dc0ec7` with both lanes successful, exact truth, five QPS samples per lane, all 192 CAGRA searches per run attributed to GPU, zero NPU fallbacks, and zero explicit index uploads. Each artifact fingerprints the explicitly loaded DLL. Energy was disabled and no in-run device-occupancy trace was captured. These walls are therefore retained as diagnostic current-code measurements, not a publishable isolated performance baseline. Every artifact remains partial and noncanonical; the separate full SIFT1M section below contains the current full-scale gate. Build-stage evidence and raw hashes: `tables/arrow-lake/cagra-build-v1.md`.
 
 ## SIFT1M matched quality gate
 
-### Current-code rerun: recall-closeness pass
+### Clean current-code rerun: recall-closeness pass
 
 Checksum-pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=10`), exact validated HDF5 truth, M=16, seed 7, one warmup and five measured passes. ovVS used AUTO construction followed by FORCE_GPU search at `itopk=32`, width=1, batch=32. hnswlib 0.8.0 used `ef_construction=200`, `ef=32`, batch=32, and 20 explicit threads.
 
 | Lane | Recall@10 | Build wall | Median QPS (five-pass range) | Isolated peak RSS | Validity |
 |---|---:|---:|---:|---:|---|
-| ovVS CAGRA | 0.9036 | 185.3 s; final primitive CPU | 1,839.1 (1,692.2–1,853.8) | 2,342.5 MiB | 192/192 GPU attributions; `192/192/0/0` transfer |
-| hnswlib | 0.8915 | 96.7 s | 11,069.0 (9,814.8–13,485.6) | 1,383.0 MiB | 20 explicit threads; finite unique output |
+| ovVS CAGRA | 0.9036 (same in all runs) | 100.093 s (99.874–100.525); final primitive CPU | 3,465.0 (3,458.7–3,474.5) | 2,343.2 MiB | 192/192 GPU attributions per run; `192/192/0/0` transfer |
+| hnswlib | 0.8911 (0.8899–0.8915) | 76.869 s (76.566–80.493) | 11,417.3 (11,093.3–11,463.8) | 1,387.0 MiB | 20 explicit threads; finite unique output |
 
-The T13.4 recall-closeness gate **passed**: `0.8915 - 0.9036 = -0.0121`, within the maximum allowed gap of 0.0200. CAGRA returned 121 more exact top-10 hits across the 10,000-result oracle. This is a closeness verdict, not the plan's separate ≥0.95 product target: CAGRA remains 0.0464 below that target. All 192 CAGRA searches reported GPU with zero attribution failures and zero explicit index uploads. AUTO construction ends in the CPU host optimizer, so its final-primitive label does not describe the complete mixed pipeline.
+The T13.4 recall-closeness gate **passed in all three processes**. The median difference is `0.8911 - 0.9036 = -0.0125`, within the maximum allowed gap of 0.0200. CAGRA returned 125 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle. This is a closeness verdict, not the plan's separate ≥0.95 product target: CAGRA remains 0.0464 below that target. All 192 CAGRA searches per process reported GPU with zero attribution failures and zero explicit index uploads. AUTO construction ends in the CPU host optimizer, so its final-primitive label does not describe the complete mixed pipeline.
 
-The performance result remains negative in this diagnostic run: hnswlib was 6.02× faster in search, 1.92× faster to build, and 1.69× lighter by isolated peak process RSS. Energy was disabled. A contemporaneous counter sample showed the Intel compute engine saturated during CAGRA construction while unrelated 3D processes consumed roughly 50–60%, so these walls are not an isolated publishable baseline. The recall/completion verdict is unaffected. The artifact is intentionally partial and noncanonical because it contains one matched point rather than the full B1 curves and package energy.
+The performance result remains negative: hnswlib was 3.30× faster in median search throughput, 1.302× faster to build, 10.76× better in median amortized p99, and 1.689× lighter by isolated peak process RSS. Energy was disabled, the pre-run load sample was not retained, and the artifacts contain no in-run clock, thermal, or occupancy trace. The runs are clean revision-bound current-lab diagnostics rather than the full publishable B1 curve/energy baseline. Their build walls span only 0.65%.
 
-Compared with the prior result below, CAGRA recall improved by 0.4979 and observed build wall fell from 830.0 to 185.3 s. Those are end-to-end mixed-change/current-environment differences across the query seed, host graph optimizer, and NN-Descent rewrite; they do not isolate causality or constitute a controlled speedup claim.
+Compared with the prior pre-change failure below, CAGRA recall improved by 0.4979 and observed build wall fell from 830.0 to a clean 100.093-second median. Those are end-to-end mixed-change/current-environment differences across the query seed, host graph optimizer, NN-Descent rewrite, and machine load; they do not isolate causality or constitute a controlled speedup claim. The earlier 185.3-second current-code run is retained in history but superseded for current performance status. Full build attribution and raw artifact hashes: `tables/arrow-lake/cagra-build-v1.md`.
 
 ### Prior pre-change failure
 

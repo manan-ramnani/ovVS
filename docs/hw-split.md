@@ -56,8 +56,8 @@ CAGRA search
   candidate scoring inside the walk → fused in the SYCL kernel
 
 CAGRA build
-  NN-Descent init n>4096 → iGPU SYCL under AUTO
-  prune               → CPU until T13.3 (full FORCE_GPU build is unavailable)
+  NN-Descent init n>4096 → iGPU SYCL under AUTO (90.444 s / 90.36% of clean SIFT1M median build; synchronization/readback is first target)
+  prune               → CPU until T13.3 (9.034 s clean SIFT1M median; full FORCE_GPU build is unavailable)
   attribution         → success-only V1 stages plus call-local GPU lifecycle counters; external API wall remains the end-to-end measure
 
 Vamana / NN-Descent
