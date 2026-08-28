@@ -9,6 +9,9 @@ from ctypes import POINTER, c_char_p, c_float, c_int32, c_int64, c_uint32, c_uin
 from pathlib import Path
 
 
+_DLL_DIRECTORY_HANDLES = []
+
+
 OVVS_IVF_PQ_SEARCH_STATS_ABI_V1 = 1
 _IVFPQ_SEARCH_STATS_COUNTERS = (
     "successful_calls",
@@ -77,7 +80,8 @@ def _load():
         if p.exists():
             p = p.resolve()
             if sys.platform.startswith("win"):
-                os.add_dll_directory(str(p.parent))
+                # Windows removes the directory when this handle is closed.
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(p.parent)))
             return ctypes.CDLL(str(p))
     raise FileNotFoundError("libovvs not found; set OVVS_LIBRARY or build the C++ library")
 
