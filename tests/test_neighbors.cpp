@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -3172,6 +3173,8 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
   std::vector<int64_t> got(static_cast<size_t>(nq * k)), truth(static_cast<size_t>(nq * k));
   std::vector<float> gd(static_cast<size_t>(nq * k)), td(static_cast<size_t>(nq * k));
+  std::vector<int64_t> first_got;
+  std::vector<float> first_gd;
   int64_t walks_before = 0, direct_before = 0, uploads_before = 0, bytes_before = 0;
   expect_status(ovvsResourcesCagraTransferStats(res.r, &walks_before, &direct_before,
                                                 &uploads_before, &bytes_before),
@@ -3180,6 +3183,16 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
     expect_status(ovvsCagraSearch(res.r, ix, q.data(), nq, k, 32, 80, nullptr, got.data(),
                                   gd.data()),
                   "s");
+    if (repeat == 0) {
+      first_got = got;
+      first_gd = gd;
+    } else {
+      expect(got == first_got, "repeated GPU CAGRA search preserves exact IDs");
+      for (size_t i = 0; i < gd.size(); ++i) {
+        expect(std::bit_cast<uint32_t>(gd[i]) == std::bit_cast<uint32_t>(first_gd[i]),
+               "repeated GPU CAGRA search preserves distance bits");
+      }
+    }
   }
   int64_t walks_after = 0, direct_after = 0, uploads_after = 0, bytes_after = 0;
   expect_status(ovvsResourcesCagraTransferStats(res.r, &walks_after, &direct_after,
@@ -3212,11 +3225,11 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
 
 OVVS_TEST(cagra_query_seed_is_batch_invariant) {
   Res res;
-  const int64_t n = 640, dim = 8, nq = 6, k = 8;
-  constexpr int32_t itopk = 8;
+  const int64_t n = 2048, dim = 8, nq = 6, k = 8;
+  constexpr int32_t itopk = 32;
   constexpr int32_t search_width = 1;
-  /* Keep the walk non-exhaustive: 512 seeds + at most 48 degree-one expansions
-     cover fewer than 640 rows. The legacy call-ordinal seeds changed 4/6 rows. */
+  /* Keep the walk non-exhaustive: 512 seeds + at most 192 degree-one expansions
+     cover fewer than 2048 rows. */
   auto data = make_data(n, dim, 446);
   auto queries = make_data(nq, dim, 447);
 
@@ -3240,8 +3253,8 @@ OVVS_TEST(cagra_query_seed_is_batch_invariant) {
                   label);
   };
   const auto expect_single_partition = [&](ovvsPolicy policy, const std::vector<int64_t>& batch_ids,
-                                           const std::vector<float>& batch_distances,
-                                           const char* label) {
+                                            const std::vector<float>& batch_distances,
+                                            bool exact_distances, const char* label) {
     std::vector<int64_t> single_ids(static_cast<size_t>(k));
     std::vector<float> single_distances(static_cast<size_t>(k));
     expect_status(ovvsResourcesSetPolicy(res.r, policy), label);
@@ -3254,8 +3267,12 @@ OVVS_TEST(cagra_query_seed_is_batch_invariant) {
         const size_t offset = static_cast<size_t>(qi * k + t);
         expect(single_ids[static_cast<size_t>(t)] == batch_ids[offset],
                std::string(label) + " exact ID partition invariance");
-        expect(close_distance(single_distances[static_cast<size_t>(t)], batch_distances[offset]),
-               std::string(label) + " distance partition invariance");
+        const bool distance_matches = exact_distances
+                                          ? std::bit_cast<uint32_t>(single_distances[static_cast<size_t>(t)]) ==
+                                                std::bit_cast<uint32_t>(batch_distances[offset])
+                                          : close_distance(single_distances[static_cast<size_t>(t)],
+                                                           batch_distances[offset]);
+        expect(distance_matches, std::string(label) + " distance partition invariance");
       }
     }
   };
@@ -3263,7 +3280,8 @@ OVVS_TEST(cagra_query_seed_is_batch_invariant) {
   std::vector<int64_t> cpu_ids;
   std::vector<float> cpu_distances;
   run_batch(OVVS_POLICY_FORCE_CPU, queries.data(), nq, cpu_ids, cpu_distances, "CPU batch search");
-  expect_single_partition(OVVS_POLICY_FORCE_CPU, cpu_ids, cpu_distances, "CPU single search");
+  expect_single_partition(OVVS_POLICY_FORCE_CPU, cpu_ids, cpu_distances, false,
+                          "CPU single search");
 
   std::vector<float> reversed_queries(static_cast<size_t>(nq * dim));
   for (int64_t qi = 0; qi < nq; ++qi) {
@@ -3291,7 +3309,8 @@ OVVS_TEST(cagra_query_seed_is_batch_invariant) {
     std::vector<int64_t> gpu_ids;
     std::vector<float> gpu_distances;
     run_batch(OVVS_POLICY_FORCE_GPU, queries.data(), nq, gpu_ids, gpu_distances, "GPU batch search");
-    expect_single_partition(OVVS_POLICY_FORCE_GPU, gpu_ids, gpu_distances, "GPU single search");
+    expect_single_partition(OVVS_POLICY_FORCE_GPU, gpu_ids, gpu_distances, true,
+                            "GPU single search");
     for (size_t i = 0; i < cpu_ids.size(); ++i) {
       expect(gpu_ids[i] == cpu_ids[i], "CPU/GPU exact ID parity for deterministic seeds");
       expect(close_distance(gpu_distances[i], cpu_distances[i]),
@@ -3307,8 +3326,9 @@ OVVS_TEST(cagra_query_seed_is_batch_invariant) {
         const size_t original_offset = static_cast<size_t>(original_qi * k + t);
         expect(reversed_ids[reordered_offset] == gpu_ids[original_offset],
                "GPU exact ID reorder invariance");
-        expect(close_distance(reversed_distances[reordered_offset], gpu_distances[original_offset]),
-               "GPU distance reorder invariance");
+        expect(std::bit_cast<uint32_t>(reversed_distances[reordered_offset]) ==
+                   std::bit_cast<uint32_t>(gpu_distances[original_offset]),
+               "GPU exact distance-bit reorder invariance");
       }
     }
   }

@@ -2256,6 +2256,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
            }
            if (lid == 0) {
              state[0] = 0;
+             state[3] = 0;
              query_hash_state[0] = cagra_query_hash(Q + qi * D, static_cast<int64_t>(D));
            }
            item.barrier(sycl::access::fence_space::global_and_local);
@@ -2314,20 +2315,26 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                candidate_ids[static_cast<size_t>(count)] = id;
                candidate_distances[static_cast<size_t>(count)] = distance;
                candidate_expanded[static_cast<size_t>(count)] = 0;
+               if (count == 0 ||
+                   distance > candidate_distances[static_cast<size_t>(state[3])]) {
+                 state[3] = count;
+               }
                state[0] = count + 1;
                return;
              }
-             int32_t worst = 0;
-             for (int32_t i = 1; i < count; ++i) {
-               if (candidate_distances[static_cast<size_t>(i)] >
-                   candidate_distances[static_cast<size_t>(worst)]) {
-                 worst = i;
-               }
-             }
+             int32_t worst = state[3];
              if (distance < candidate_distances[static_cast<size_t>(worst)]) {
                candidate_ids[static_cast<size_t>(worst)] = id;
                candidate_distances[static_cast<size_t>(worst)] = distance;
                candidate_expanded[static_cast<size_t>(worst)] = 0;
+               worst = 0;
+               for (int32_t i = 1; i < count; ++i) {
+                 if (candidate_distances[static_cast<size_t>(i)] >
+                     candidate_distances[static_cast<size_t>(worst)]) {
+                   worst = i;
+                 }
+               }
+               state[3] = worst;
              }
            };
 
