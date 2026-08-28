@@ -73,6 +73,9 @@ typedef struct ovvsBinaryQuantizerImpl* ovvsBinaryQuantizer_t;
 typedef struct ovvsSpectralEmbedImpl* ovvsSpectralEmbed_t;
 typedef struct ovvsBatcherImpl* ovvsBatcher_t;
 
+/* Concurrent searches may share an immutable index when each worker has a distinct
+   Resources object. Do not mutate, serialize, or destroy an index concurrently. */
+
 OVVS_API const char* ovvsGetVersion(void);
 OVVS_API const char* ovvsStatusString(ovvsStatus status);
 

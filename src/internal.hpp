@@ -16,6 +16,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -144,6 +145,11 @@ struct ResourcesData {
   double nndescent_change_ratio = 0.0;
   int64_t nndescent_peak_device_bytes = 0;
   bool nndescent_converged = false;
+  std::mutex ivfpq_stats_mutex;
+  int64_t ivfpq_packed_rebuilds = 0;
+  int64_t ivfpq_packed_rebuild_rows = 0;
+  int64_t ivfpq_unfiltered_direct_rows = 0;
+  int64_t ivfpq_filtered_code_copy_bytes = 0;
   bool npu_busy = false;
   ovvsDevice large_gemm_winner = OVVS_DEVICE_AUTO;
   int64_t large_gemm_flops = 100000LL * 32LL * 768LL;

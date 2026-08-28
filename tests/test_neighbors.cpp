@@ -2,6 +2,7 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -135,6 +136,110 @@ static bool same_nndescent_stats(const NnDescentStatsSnapshot& lhs,
          lhs.pending_new_edges == rhs.pending_new_edges &&
          lhs.change_ratio == rhs.change_ratio &&
          lhs.peak_device_bytes == rhs.peak_device_bytes && lhs.converged == rhs.converged;
+}
+
+struct IvfPqStatsSnapshot {
+  int64_t packed_rebuilds = 0;
+  int64_t packed_rebuild_rows = 0;
+  int64_t unfiltered_direct_rows = 0;
+  int64_t filtered_code_copy_bytes = 0;
+};
+
+static IvfPqStatsSnapshot ivfpq_stats(ovvsResources_t resources) {
+  auto* data = ovvs::impl::rd(resources);
+  std::lock_guard<std::mutex> lock(data->ivfpq_stats_mutex);
+  return {data->ivfpq_packed_rebuilds, data->ivfpq_packed_rebuild_rows,
+          data->ivfpq_unfiltered_direct_rows, data->ivfpq_filtered_code_copy_bytes};
+}
+
+static std::vector<uint8_t> read_binary_file(const std::filesystem::path& path) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  expect(static_cast<bool>(file), "open binary file for reading");
+  const std::streamoff end = file.tellg();
+  expect(end >= 0, "read binary file size");
+  std::vector<uint8_t> bytes(static_cast<size_t>(end));
+  file.seekg(0, std::ios::beg);
+  if (!bytes.empty()) {
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    expect(static_cast<bool>(file), "read complete binary file");
+  }
+  return bytes;
+}
+
+static void write_binary_file(const std::filesystem::path& path,
+                              const std::vector<uint8_t>& bytes) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  expect(static_cast<bool>(file), "open binary file for writing");
+  if (!bytes.empty()) {
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+  }
+  expect(static_cast<bool>(file), "write complete binary file");
+}
+
+static std::filesystem::path unique_temp_file(const char* stem) {
+  static std::atomic<uint64_t> sequence{0};
+#ifdef _WIN32
+  const uint64_t process_id = static_cast<uint64_t>(GetCurrentProcessId());
+#else
+  const uint64_t process_id = static_cast<uint64_t>(getpid());
+#endif
+  return std::filesystem::temp_directory_path() /
+         (std::string(stem) + "-" + std::to_string(process_id) + "-" +
+          std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".bin");
+}
+
+template <typename T>
+static void append_binary(std::vector<uint8_t>& bytes, const T& value) {
+  const size_t offset = bytes.size();
+  bytes.resize(offset + sizeof(T));
+  std::memcpy(bytes.data() + offset, &value, sizeof(T));
+}
+
+template <typename T>
+static void append_binary(std::vector<uint8_t>& bytes, const std::vector<T>& values) {
+  const size_t offset = bytes.size();
+  bytes.resize(offset + values.size() * sizeof(T));
+  if (!values.empty()) {
+    std::memcpy(bytes.data() + offset, values.data(), values.size() * sizeof(T));
+  }
+}
+
+static std::vector<uint8_t> make_legacy_ivfpq_v1_blob() {
+  std::vector<uint8_t> bytes;
+  const uint32_t magic = 0x31515049u;
+  const int32_t version = 1;
+  const int64_t n = 4;
+  const int64_t dim = 2;
+  const int32_t nlist = 1;
+  const int32_t pq_m = 1;
+  const int32_t pq_ks = 16;
+  const int32_t dsub = 2;
+  const int32_t metric = OVVS_METRIC_L2_EXPANDED;
+  append_binary(bytes, magic);
+  append_binary(bytes, version);
+  append_binary(bytes, n);
+  append_binary(bytes, dim);
+  append_binary(bytes, nlist);
+  append_binary(bytes, pq_m);
+  append_binary(bytes, pq_ks);
+  append_binary(bytes, dsub);
+  append_binary(bytes, metric);
+  append_binary(bytes, std::vector<float>{0.f, 0.f});
+  std::vector<float> codebook(static_cast<size_t>(pq_ks * dsub), 100.f);
+  for (int32_t code = 0; code < 4; ++code) {
+    codebook[static_cast<size_t>(code * dsub)] = static_cast<float>(code);
+    codebook[static_cast<size_t>(code * dsub + 1)] = 0.f;
+  }
+  append_binary(bytes, codebook);
+  append_binary(bytes, std::vector<uint8_t>{0, 1, 2, 3});
+  append_binary(bytes, std::vector<float>{0.f, 0.f, 1.f, 0.f, 2.f, 0.f, 3.f, 0.f});
+  append_binary(bytes, std::vector<int32_t>{0, 0, 0, 0});
+  const int32_t list_size = 4;
+  append_binary(bytes, list_size);
+  append_binary(bytes, std::vector<int64_t>{0, 1, 2, 3});
+  expect(bytes.size() == 268, "legacy IPQ1 v1 fixture size");
+  return bytes;
 }
 
 static float l2_distance(const float* data, int64_t dim, int64_t lhs, int64_t rhs) {
@@ -521,6 +626,286 @@ OVVS_TEST(ivf_pq_recall) {
   expect_status(ovvsIvfPqExtend(res.r, loaded, extra.data(), 4), "pqext");
   ovvsIvfPqDestroy(loaded);
   ovvsIvfPqDestroy(ix);
+}
+
+OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
+  Res res;
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "packed-layout CPU policy");
+  const int64_t n = 64, dim = 8, nq = 3, k = 5;
+  const int32_t nlist = 8, pq_m = 4;
+  auto data = make_data(n, dim, 216);
+  auto queries = make_data(nq, dim, 217);
+  const IvfPqStatsSnapshot before = ivfpq_stats(res.r);
+
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                               nlist, pq_m, 4, &index),
+                "packed-layout build");
+  const IvfPqStatsSnapshot built = ivfpq_stats(res.r);
+  expect(built.packed_rebuilds == before.packed_rebuilds + 1,
+         "packed-layout build commits one packed rebuild");
+  expect(built.packed_rebuild_rows == before.packed_rebuild_rows + n,
+         "packed-layout build records every row");
+
+  std::vector<int64_t> direct_ids(static_cast<size_t>(nq * k));
+  std::vector<int64_t> repeated_ids(static_cast<size_t>(nq * k));
+  std::vector<int64_t> filtered_ids(static_cast<size_t>(nq * k));
+  std::vector<float> direct_distances(static_cast<size_t>(nq * k));
+  std::vector<float> repeated_distances(static_cast<size_t>(nq * k));
+  std::vector<float> filtered_distances(static_cast<size_t>(nq * k));
+  expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), nullptr, direct_ids.data(),
+                                direct_distances.data()),
+                "packed-layout direct search");
+  expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), nullptr, repeated_ids.data(),
+                                repeated_distances.data()),
+                "packed-layout repeated direct search");
+  expect(repeated_ids == direct_ids, "packed-layout repeated IDs are stable");
+  expect(repeated_distances == direct_distances,
+         "packed-layout repeated distances are stable");
+  const IvfPqStatsSnapshot direct = ivfpq_stats(res.r);
+  expect(direct.unfiltered_direct_rows ==
+             built.unfiltered_direct_rows + 2 * nq * n,
+         "packed-layout direct search records rows without repacking");
+  expect(direct.filtered_code_copy_bytes == built.filtered_code_copy_bytes,
+         "packed-layout direct search copies no PQ codes");
+
+  std::vector<uint8_t> all_allowed(static_cast<size_t>((n + 7) / 8), 0xff);
+  expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), all_allowed.data(),
+                                filtered_ids.data(), filtered_distances.data()),
+                "packed-layout all-allowed search");
+  expect(filtered_ids == direct_ids, "all-allowed filter preserves packed ID alignment");
+  expect(filtered_distances == direct_distances,
+         "all-allowed filter preserves packed distances");
+  const IvfPqStatsSnapshot all_allowed_stats = ivfpq_stats(res.r);
+  expect(all_allowed_stats.unfiltered_direct_rows == direct.unfiltered_direct_rows,
+         "filtered search does not count direct rows");
+  expect(all_allowed_stats.filtered_code_copy_bytes ==
+             direct.filtered_code_copy_bytes + nq * n * pq_m,
+         "all-allowed filter records aligned PQ scratch copies");
+
+  const std::vector<int64_t> allowed_ids{2, 19, 47};
+  std::vector<uint8_t> selective(static_cast<size_t>((n + 7) / 8), 0);
+  for (int64_t id : allowed_ids) {
+    selective[static_cast<size_t>(id >> 3)] |=
+        static_cast<uint8_t>(1u << (id & 7));
+  }
+  std::vector<int64_t> selective_ids(4);
+  std::vector<float> selective_distances(4);
+  const float* self_query = data.data() + 19 * dim;
+  expect_status(ovvsIvfPqSearch(res.r, index, self_query, 1, 4, nlist,
+                                static_cast<int32_t>(n), selective.data(),
+                                selective_ids.data(), selective_distances.data()),
+                "packed-layout selective search");
+  expect(selective_ids[0] == 19 && std::fabs(selective_distances[0]) < 1e-5f,
+         "selective filter preserves self-match");
+  for (size_t i = 0; i < allowed_ids.size(); ++i) {
+    expect(std::find(allowed_ids.begin(), allowed_ids.end(), selective_ids[i]) !=
+               allowed_ids.end(),
+           "selective filter returns only allowed IDs");
+  }
+  expect(selective_ids[3] == -1 && std::isinf(selective_distances[3]),
+         "selective filter fills an exhausted result");
+  const IvfPqStatsSnapshot selective_stats = ivfpq_stats(res.r);
+  expect(selective_stats.filtered_code_copy_bytes ==
+             all_allowed_stats.filtered_code_copy_bytes +
+                 static_cast<int64_t>(allowed_ids.size()) * pq_m,
+         "selective filter records only copied allowed codes");
+
+  std::vector<int64_t> final_ids(static_cast<size_t>(nq * k));
+  std::vector<float> final_distances(static_cast<size_t>(nq * k));
+  expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), nullptr, final_ids.data(),
+                                final_distances.data()),
+                "packed-layout final direct search");
+  expect(final_ids == direct_ids && final_distances == direct_distances,
+         "filter scratch does not mutate persistent packed storage");
+  ovvsIvfPqDestroy(index);
+}
+
+OVVS_TEST(ivf_pq_legacy_ipq1_compatibility_and_corruption) {
+  Res res;
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "legacy IPQ1 CPU policy");
+  const auto input_path = unique_temp_file("ovvs_ivfpq_legacy_v1");
+  const auto output_path = unique_temp_file("ovvs_ivfpq_legacy_v1_roundtrip");
+  const auto corrupt_path = unique_temp_file("ovvs_ivfpq_legacy_v1_corrupt");
+  const std::vector<uint8_t> legacy = make_legacy_ivfpq_v1_blob();
+  write_binary_file(input_path, legacy);
+
+  const IvfPqStatsSnapshot before = ivfpq_stats(res.r);
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqDeserialize(res.r, input_path.string().c_str(), &index),
+                "legacy IPQ1 deserialize");
+  const IvfPqStatsSnapshot loaded = ivfpq_stats(res.r);
+  expect(loaded.packed_rebuilds == before.packed_rebuilds + 1 &&
+             loaded.packed_rebuild_rows == before.packed_rebuild_rows + 4,
+         "legacy IPQ1 rebuilds derived packed storage");
+  const float query[2] = {1.1f, 0.f};
+  int64_t ids[2] = {-1, -1};
+  float distances[2] = {};
+  expect_status(ovvsIvfPqSearch(res.r, index, query, 1, 2, 1, 4, nullptr, ids,
+                                distances),
+                "legacy IPQ1 search");
+  expect(ids[0] == 1 && ids[1] == 2, "legacy IPQ1 search rank order");
+  expect(std::fabs(distances[0] - 0.01f) < 1e-5f &&
+             std::fabs(distances[1] - 0.81f) < 1e-5f,
+         "legacy IPQ1 search distances");
+  expect_status(ovvsIvfPqSerialize(index, output_path.string().c_str()),
+                "legacy IPQ1 reserialize");
+  expect(read_binary_file(output_path) == legacy,
+         "legacy IPQ1 round trip remains byte compatible");
+  ovvsIvfPqDestroy(index);
+
+  auto rejected_stats = ivfpq_stats(res.r);
+  std::vector<uint8_t> corrupt = legacy;
+  const int32_t version2 = 2;
+  std::memcpy(corrupt.data() + 4, &version2, sizeof(version2));
+  write_binary_file(corrupt_path, corrupt);
+  index = reinterpret_cast<ovvsIvfPqIndex_t>(uintptr_t{1});
+  expect(ovvsIvfPqDeserialize(res.r, corrupt_path.string().c_str(), &index) ==
+             OVVS_STATUS_UNSUPPORTED,
+         "legacy IPQ1 rejects an unknown version as unsupported");
+  expect(index == nullptr, "unknown IPQ1 version clears output handle");
+
+  corrupt = legacy;
+  corrupt.pop_back();
+  write_binary_file(corrupt_path, corrupt);
+  index = reinterpret_cast<ovvsIvfPqIndex_t>(uintptr_t{1});
+  expect(ovvsIvfPqDeserialize(res.r, corrupt_path.string().c_str(), &index) ==
+             OVVS_STATUS_IO,
+         "legacy IPQ1 rejects truncation");
+  expect(index == nullptr, "truncated IPQ1 clears output handle");
+
+  corrupt = legacy;
+  const int64_t out_of_range_id = 4;
+  std::memcpy(corrupt.data() + 236, &out_of_range_id, sizeof(out_of_range_id));
+  write_binary_file(corrupt_path, corrupt);
+  index = reinterpret_cast<ovvsIvfPqIndex_t>(uintptr_t{1});
+  expect(ovvsIvfPqDeserialize(res.r, corrupt_path.string().c_str(), &index) ==
+             OVVS_STATUS_IO,
+         "legacy IPQ1 rejects an out-of-range list ID");
+  expect(index == nullptr, "invalid IPQ1 list ID clears output handle");
+
+  corrupt = legacy;
+  const int64_t duplicate_id = 0;
+  std::memcpy(corrupt.data() + 244, &duplicate_id, sizeof(duplicate_id));
+  write_binary_file(corrupt_path, corrupt);
+  index = reinterpret_cast<ovvsIvfPqIndex_t>(uintptr_t{1});
+  expect(ovvsIvfPqDeserialize(res.r, corrupt_path.string().c_str(), &index) ==
+             OVVS_STATUS_IO,
+         "legacy IPQ1 rejects duplicate and missing list IDs");
+  expect(index == nullptr, "duplicate IPQ1 list ID clears output handle");
+  const IvfPqStatsSnapshot after_rejections = ivfpq_stats(res.r);
+  expect(after_rejections.packed_rebuilds == rejected_stats.packed_rebuilds &&
+             after_rejections.packed_rebuild_rows == rejected_stats.packed_rebuild_rows,
+         "rejected IPQ1 files do not publish rebuild telemetry");
+
+  std::filesystem::remove(input_path);
+  std::filesystem::remove(output_path);
+  std::filesystem::remove(corrupt_path);
+}
+
+OVVS_TEST(ivf_pq_extend_is_transactional_and_rebuilds_packed_storage) {
+  Res res;
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "transactional extend CPU policy");
+  const int64_t n = 64, dim = 8, nq = 4, k = 4;
+  const int32_t nlist = 8, pq_m = 4;
+  auto data = make_data(n, dim, 218);
+  auto extra = make_data(nq, dim, 219);
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                               nlist, pq_m, 4, &index),
+                "transactional extend build");
+  std::vector<int64_t> baseline_ids(static_cast<size_t>(nq * k));
+  std::vector<float> baseline_distances(static_cast<size_t>(nq * k));
+  expect_status(ovvsIvfPqSearch(res.r, index, data.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), nullptr, baseline_ids.data(),
+                                baseline_distances.data()),
+                "transactional extend baseline search");
+  const auto before_path = unique_temp_file("ovvs_ivfpq_extend_before");
+  const auto after_path = unique_temp_file("ovvs_ivfpq_extend_after");
+  const auto reloaded_path = unique_temp_file("ovvs_ivfpq_extend_reloaded");
+  expect_status(ovvsIvfPqSerialize(index, before_path.string().c_str()),
+                "transactional extend baseline serialize");
+  const std::vector<uint8_t> before_bytes = read_binary_file(before_path);
+  const IvfPqStatsSnapshot before_failure = ivfpq_stats(res.r);
+
+  auto failing_extra = extra;
+  failing_extra[0] = std::numeric_limits<float>::quiet_NaN();
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
+                "transactional extend forced NPU policy");
+  expect(ovvsIvfPqExtend(res.r, index, failing_extra.data(), nq) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "transactional extend propagates primitive failure");
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "transactional extend restore CPU policy");
+  expect_status(ovvsIvfPqSerialize(index, after_path.string().c_str()),
+                "transactional extend serialize after failure");
+  expect(read_binary_file(after_path) == before_bytes,
+         "failed extend leaves serialized index unchanged");
+  std::vector<int64_t> after_failure_ids(static_cast<size_t>(nq * k));
+  std::vector<float> after_failure_distances(static_cast<size_t>(nq * k));
+  expect_status(ovvsIvfPqSearch(res.r, index, data.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), nullptr,
+                                after_failure_ids.data(), after_failure_distances.data()),
+                "transactional extend search after failure");
+  expect(after_failure_ids == baseline_ids &&
+             after_failure_distances == baseline_distances,
+         "failed extend leaves search results unchanged");
+  const IvfPqStatsSnapshot after_failure = ivfpq_stats(res.r);
+  expect(after_failure.packed_rebuilds == before_failure.packed_rebuilds &&
+             after_failure.packed_rebuild_rows == before_failure.packed_rebuild_rows,
+         "failed extend publishes no packed rebuild");
+
+  expect_status(ovvsIvfPqExtend(res.r, index, extra.data(), nq),
+                "transactional extend success");
+  const int64_t extended_n = n + nq;
+  const IvfPqStatsSnapshot extended = ivfpq_stats(res.r);
+  expect(extended.packed_rebuilds == after_failure.packed_rebuilds + 1 &&
+             extended.packed_rebuild_rows ==
+                 after_failure.packed_rebuild_rows + extended_n,
+         "successful extend atomically records the rebuilt rows");
+  std::vector<int64_t> extended_ids(static_cast<size_t>(nq));
+  std::vector<float> extended_distances(static_cast<size_t>(nq));
+  expect_status(ovvsIvfPqSearch(res.r, index, extra.data(), nq, 1, nlist,
+                                static_cast<int32_t>(extended_n), nullptr,
+                                extended_ids.data(), extended_distances.data()),
+                "transactional extend self search");
+  for (int64_t i = 0; i < nq; ++i) {
+    expect(extended_ids[static_cast<size_t>(i)] == n + i,
+           "extended vector is its own nearest neighbor");
+    expect(std::fabs(extended_distances[static_cast<size_t>(i)]) < 1e-5f,
+           "extended vector has zero self distance");
+  }
+
+  expect_status(ovvsIvfPqSerialize(index, after_path.string().c_str()),
+                "transactional extend serialize success");
+  ovvsIvfPqIndex_t reloaded = nullptr;
+  expect_status(ovvsIvfPqDeserialize(res.r, after_path.string().c_str(), &reloaded),
+                "transactional extend deserialize success");
+  std::vector<int64_t> reloaded_ids(static_cast<size_t>(nq));
+  std::vector<float> reloaded_distances(static_cast<size_t>(nq));
+  expect_status(ovvsIvfPqSearch(res.r, reloaded, extra.data(), nq, 1, nlist,
+                                static_cast<int32_t>(extended_n), nullptr,
+                                reloaded_ids.data(), reloaded_distances.data()),
+                "transactional extend reloaded search");
+  expect(reloaded_ids == extended_ids && reloaded_distances == extended_distances,
+         "extended packed storage survives serialization");
+  expect_status(ovvsIvfPqSerialize(reloaded, reloaded_path.string().c_str()),
+                "transactional extend reloaded serialize");
+  expect(read_binary_file(reloaded_path) == read_binary_file(after_path),
+         "extended IPQ1 remains byte stable after reload");
+
+  ovvsIvfPqDestroy(reloaded);
+  ovvsIvfPqDestroy(index);
+  std::filesystem::remove(before_path);
+  std::filesystem::remove(after_path);
+  std::filesystem::remove(reloaded_path);
 }
 
 OVVS_TEST(ivf_pq_auto_matches_cpu_on_wide_range) {

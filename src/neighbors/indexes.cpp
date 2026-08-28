@@ -40,6 +40,9 @@ struct IvfPq {
   std::vector<float> codebooks; /* [pq_m, pq_ks, dsub] */
   std::vector<uint8_t> codes;   /* [n, pq_m] */
   std::vector<std::vector<int64_t>> lists;
+  std::vector<int64_t> list_offsets; /* [nlist + 1] */
+  std::vector<int64_t> packed_ids;   /* list-major [n] */
+  std::vector<uint8_t> packed_codes; /* list-major [n, pq_m] */
 };
 
 void build_ivf_lists(const int32_t* assign, int64_t n, int32_t nlist,
@@ -48,6 +51,96 @@ void build_ivf_lists(const int32_t* assign, int64_t n, int32_t nlist,
   for (int64_t i = 0; i < n; ++i) {
     const int32_t a = assign[i];
     if (a >= 0 && a < nlist) lists[static_cast<size_t>(a)].push_back(i);
+  }
+}
+
+ovvsStatus make_ivf_pq_packed(int64_t n, int32_t nlist, int32_t pq_m, int32_t pq_ks,
+                              const std::vector<int32_t>& assign,
+                              const std::vector<uint8_t>& codes,
+                              const std::vector<std::vector<int64_t>>& lists,
+                              std::vector<int64_t>& list_offsets,
+                              std::vector<int64_t>& packed_ids,
+                              std::vector<uint8_t>& packed_codes) {
+  if (n <= 0 || nlist <= 0 || pq_m <= 0 || pq_ks <= 0 || pq_ks > 256 ||
+      lists.size() != static_cast<size_t>(nlist) ||
+      assign.size() != static_cast<size_t>(n) ||
+      static_cast<uint64_t>(n) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(pq_m) ||
+      codes.size() != static_cast<size_t>(n) * static_cast<size_t>(pq_m)) {
+    return OVVS_STATUS_ERROR;
+  }
+
+  std::vector<int64_t> next_offsets(static_cast<size_t>(nlist) + 1, 0);
+  uint64_t total = 0;
+  for (int32_t c = 0; c < nlist; ++c) {
+    const size_t list_size = lists[static_cast<size_t>(c)].size();
+    if (static_cast<uint64_t>(list_size) > static_cast<uint64_t>(n) - total) {
+      return OVVS_STATUS_ERROR;
+    }
+    total += static_cast<uint64_t>(list_size);
+    next_offsets[static_cast<size_t>(c + 1)] = static_cast<int64_t>(total);
+  }
+  if (total != static_cast<uint64_t>(n)) return OVVS_STATUS_ERROR;
+
+  std::vector<int64_t> next_ids(static_cast<size_t>(n));
+  std::vector<uint8_t> next_codes(static_cast<size_t>(n) * static_cast<size_t>(pq_m));
+  std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
+  size_t position = 0;
+  for (int32_t c = 0; c < nlist; ++c) {
+    for (int64_t id : lists[static_cast<size_t>(c)]) {
+      if (id < 0 || id >= n || seen[static_cast<size_t>(id)] != 0 ||
+          assign[static_cast<size_t>(id)] != c) {
+        return OVVS_STATUS_ERROR;
+      }
+      const uint8_t* source = codes.data() + static_cast<size_t>(id) * static_cast<size_t>(pq_m);
+      for (int32_t m = 0; m < pq_m; ++m) {
+        if (source[static_cast<size_t>(m)] >= pq_ks) return OVVS_STATUS_ERROR;
+      }
+      seen[static_cast<size_t>(id)] = 1;
+      next_ids[position] = id;
+      std::memcpy(next_codes.data() + position * static_cast<size_t>(pq_m), source,
+                  static_cast<size_t>(pq_m));
+      ++position;
+    }
+  }
+
+  list_offsets.swap(next_offsets);
+  packed_ids.swap(next_ids);
+  packed_codes.swap(next_codes);
+  return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus rebuild_ivf_pq_packed(IvfPq& ix) {
+  return make_ivf_pq_packed(ix.ds.n, ix.nlist, ix.pq_m, ix.pq_ks, ix.assign, ix.codes,
+                            ix.lists, ix.list_offsets, ix.packed_ids, ix.packed_codes);
+}
+
+void saturating_add(int64_t& value, int64_t delta) noexcept {
+  if (delta <= 0) return;
+  if (value > std::numeric_limits<int64_t>::max() - delta) {
+    value = std::numeric_limits<int64_t>::max();
+  } else {
+    value += delta;
+  }
+}
+
+void record_ivf_pq_rebuild(ResourcesData& resources, int64_t rows) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(resources.ivfpq_stats_mutex);
+    saturating_add(resources.ivfpq_packed_rebuilds, 1);
+    saturating_add(resources.ivfpq_packed_rebuild_rows, rows);
+  } catch (...) {
+  }
+}
+
+void record_ivf_pq_search_layout(ResourcesData& resources, int64_t direct_rows,
+                                 int64_t filtered_copy_bytes) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(resources.ivfpq_stats_mutex);
+    saturating_add(resources.ivfpq_unfiltered_direct_rows, direct_rows);
+    saturating_add(resources.ivfpq_filtered_code_copy_bytes, filtered_copy_bytes);
+  } catch (...) {
   }
 }
 
@@ -385,7 +478,10 @@ ovvsStatus ovvsIvfPqBuild(ovvsResources_t res, const float* dataset, int64_t n, 
     ix->codes.resize(static_cast<size_t>(n) * static_cast<size_t>(pq_m));
     pq_encode(resid.data(), n, dim, pq_m, ks, ix->dsub, ix->codebooks.data(),
               ix->codes.data());
+    status = rebuild_ivf_pq_packed(*ix);
+    if (status != OVVS_STATUS_SUCCESS) return status;
     *index = reinterpret_cast<ovvsIvfPqIndex_t>(ix.release());
+    record_ivf_pq_rebuild(*rd(res), n);
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
@@ -408,7 +504,16 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
     return OVVS_STATUS_SHAPE_MISMATCH;
   }
   auto* ix = reinterpret_cast<IvfPq*>(index);
-  if (ix->ds.dim <= 0 || ix->nlist <= 0 || ix->pq_m <= 0 || ix->pq_ks <= 0 ||
+  if (ix->ds.n <= 0 || ix->ds.dim <= 0 || ix->nlist <= 0 || ix->pq_m <= 0 ||
+      ix->pq_ks <= 0 ||
+      ix->list_offsets.size() != static_cast<size_t>(ix->nlist) + 1 ||
+      ix->list_offsets.front() != 0 || ix->list_offsets.back() != ix->ds.n ||
+      ix->packed_ids.size() != static_cast<size_t>(ix->ds.n) ||
+      static_cast<uint64_t>(ix->ds.n) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(ix->pq_m) ||
+      ix->packed_codes.size() !=
+          static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m) ||
       static_cast<uint64_t>(nq) >
           static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float)) /
               static_cast<uint64_t>(ix->ds.dim) ||
@@ -423,6 +528,8 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
   nprobe = std::max(1, std::min(nprobe, ix->nlist));
   if (krefine < static_cast<int32_t>(k)) krefine = static_cast<int32_t>(k);
   try {
+    int64_t direct_rows = 0;
+    int64_t filtered_copy_bytes = 0;
     std::vector<int64_t> cl(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
     std::vector<float> cd(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
     std::vector<float> cscores(static_cast<size_t>(nq) * static_cast<size_t>(ix->nlist));
@@ -457,23 +564,56 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
                 l2sq(sub, cb + cs * ix->dsub, ix->dsub);
           }
         }
-        std::vector<int64_t> list_ids;
-        std::vector<uint8_t> list_codes;
-        for (int64_t id : ix->lists[static_cast<size_t>(c)]) {
-          if (id < 0 || id >= ix->ds.n) return OVVS_STATUS_ERROR;
-          if (bitset && !allowed(bitset, id)) continue;
-          list_ids.push_back(id);
-          const uint8_t* code = ix->codes.data() + id * ix->pq_m;
-          list_codes.insert(list_codes.end(), code, code + ix->pq_m);
+        const int64_t list_begin = ix->list_offsets[static_cast<size_t>(c)];
+        const int64_t list_end = ix->list_offsets[static_cast<size_t>(c + 1)];
+        if (list_begin < 0 || list_end < list_begin ||
+            list_end > static_cast<int64_t>(ix->packed_ids.size())) {
+          return OVVS_STATUS_ERROR;
         }
-        if (!list_ids.empty()) {
-          std::vector<float> scores(list_ids.size());
-          status = prim_pq_adc(*rd(res), tables.data(), ix->pq_m, ix->pq_ks,
-                               list_codes.data(), static_cast<int64_t>(list_ids.size()),
-                               scores.data());
+        const int64_t list_size = list_end - list_begin;
+        if (!bitset && list_size > 0) {
+          const size_t begin = static_cast<size_t>(list_begin);
+          std::vector<float> scores(static_cast<size_t>(list_size));
+          status = prim_pq_adc(
+              *rd(res), tables.data(), ix->pq_m, ix->pq_ks,
+              ix->packed_codes.data() + begin * static_cast<size_t>(ix->pq_m), list_size,
+              scores.data());
           if (status != OVVS_STATUS_SUCCESS) return status;
-          ids.insert(ids.end(), list_ids.begin(), list_ids.end());
+          ids.insert(ids.end(), ix->packed_ids.begin() + list_begin,
+                     ix->packed_ids.begin() + list_end);
           adc.insert(adc.end(), scores.begin(), scores.end());
+          saturating_add(direct_rows, list_size);
+        } else if (bitset && list_size > 0) {
+          std::vector<int64_t> list_ids;
+          std::vector<uint8_t> list_codes;
+          list_ids.reserve(static_cast<size_t>(list_size));
+          list_codes.reserve(static_cast<size_t>(list_size) * static_cast<size_t>(ix->pq_m));
+          for (int64_t position = list_begin; position < list_end; ++position) {
+            const size_t packed_position = static_cast<size_t>(position);
+            const int64_t id = ix->packed_ids[packed_position];
+            if (id < 0 || id >= ix->ds.n) return OVVS_STATUS_ERROR;
+            if (!allowed(bitset, id)) continue;
+            list_ids.push_back(id);
+            const uint8_t* code =
+                ix->packed_codes.data() + packed_position * static_cast<size_t>(ix->pq_m);
+            list_codes.insert(list_codes.end(), code, code + ix->pq_m);
+          }
+          if (!list_ids.empty()) {
+            std::vector<float> scores(list_ids.size());
+            status = prim_pq_adc(*rd(res), tables.data(), ix->pq_m, ix->pq_ks,
+                                 list_codes.data(), static_cast<int64_t>(list_ids.size()),
+                                 scores.data());
+            if (status != OVVS_STATUS_SUCCESS) return status;
+            ids.insert(ids.end(), list_ids.begin(), list_ids.end());
+            adc.insert(adc.end(), scores.begin(), scores.end());
+            const size_t copied_bytes =
+                list_ids.size() * static_cast<size_t>(ix->pq_m);
+            saturating_add(
+                filtered_copy_bytes,
+                copied_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())
+                    ? std::numeric_limits<int64_t>::max()
+                    : static_cast<int64_t>(copied_bytes));
+          }
         }
       }
       if (ids.empty()) {
@@ -526,6 +666,7 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         }
       }
     }
+    record_ivf_pq_search_layout(*rd(res), direct_rows, filtered_copy_bytes);
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
@@ -540,6 +681,8 @@ ovvsStatus ovvsIvfPqDestroy(ovvsIvfPqIndex_t index) {
 }
 
 constexpr uint32_t kIvfPqMagic = 0x31515049u; /* 'IPQ1' */
+constexpr uint64_t kIvfPqV1HeaderBytes = sizeof(uint32_t) + sizeof(int32_t) +
+                                         2 * sizeof(int64_t) + 5 * sizeof(int32_t);
 
 ovvsStatus ovvsIvfPqSerialize(ovvsIvfPqIndex_t index, const char* path) {
   if (!index || !path) return OVVS_STATUS_INVALID_ARGUMENT;
@@ -577,53 +720,143 @@ ovvsStatus ovvsIvfPqSerialize(ovvsIvfPqIndex_t index, const char* path) {
 }
 
 ovvsStatus ovvsIvfPqDeserialize(ovvsResources_t res, const char* path, ovvsIvfPqIndex_t* index) {
+  if (index) *index = nullptr;
   if (!res || !path || !index) return OVVS_STATUS_INVALID_ARGUMENT;
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return OVVS_STATUS_IO;
-  uint32_t magic = 0;
-  f.read(reinterpret_cast<char*>(&magic), 4);
-  if (magic != kIvfPqMagic) return OVVS_STATUS_IO;
-  int32_t ver = 0;
-  f.read(reinterpret_cast<char*>(&ver), 4);
-  auto* ix = new IvfPq();
-  f.read(reinterpret_cast<char*>(&ix->ds.n), 8);
-  f.read(reinterpret_cast<char*>(&ix->ds.dim), 8);
-  f.read(reinterpret_cast<char*>(&ix->nlist), 4);
-  f.read(reinterpret_cast<char*>(&ix->pq_m), 4);
-  f.read(reinterpret_cast<char*>(&ix->pq_ks), 4);
-  f.read(reinterpret_cast<char*>(&ix->dsub), 4);
-  int32_t metric = 0;
-  f.read(reinterpret_cast<char*>(&metric), 4);
-  ix->ds.metric = static_cast<ovvsMetric>(metric);
-  ix->centroids.resize(static_cast<size_t>(ix->nlist) * static_cast<size_t>(ix->ds.dim));
-  ix->codebooks.resize(static_cast<size_t>(ix->pq_m) * ix->pq_ks * ix->dsub);
-  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
-  ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
-  ix->assign.resize(static_cast<size_t>(ix->ds.n));
-  f.read(reinterpret_cast<char*>(ix->centroids.data()),
-         static_cast<std::streamsize>(ix->centroids.size() * sizeof(float)));
-  f.read(reinterpret_cast<char*>(ix->codebooks.data()),
-         static_cast<std::streamsize>(ix->codebooks.size() * sizeof(float)));
-  f.read(reinterpret_cast<char*>(ix->codes.data()), static_cast<std::streamsize>(ix->codes.size()));
-  f.read(reinterpret_cast<char*>(ix->ds.x.data()),
-         static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
-  f.read(reinterpret_cast<char*>(ix->assign.data()),
-         static_cast<std::streamsize>(ix->assign.size() * sizeof(int32_t)));
-  ix->lists.resize(static_cast<size_t>(ix->nlist));
-  for (int32_t c = 0; c < ix->nlist; ++c) {
-    int32_t sz = 0;
-    f.read(reinterpret_cast<char*>(&sz), 4);
-    ix->lists[static_cast<size_t>(c)].resize(static_cast<size_t>(std::max(sz, 0)));
-    if (sz > 0)
-      f.read(reinterpret_cast<char*>(ix->lists[static_cast<size_t>(c)].data()),
-             static_cast<std::streamsize>(static_cast<size_t>(sz) * sizeof(int64_t)));
-  }
-  if (!f) {
-    delete ix;
+  try {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return OVVS_STATUS_IO;
+    f.seekg(0, std::ios::end);
+    const std::streamoff file_end = f.tellg();
+    if (file_end < 0) return OVVS_STATUS_IO;
+    const uint64_t file_bytes = static_cast<uint64_t>(file_end);
+    f.seekg(0, std::ios::beg);
+    if (!f) return OVVS_STATUS_IO;
+    const auto read_exact = [&](void* destination, size_t bytes) {
+      if (bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) return false;
+      f.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(bytes));
+      return static_cast<bool>(f);
+    };
+    const auto checked_product = [](uint64_t a, uint64_t b, size_t& product) {
+      if (b != 0 && a > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) / b) {
+        return false;
+      }
+      product = static_cast<size_t>(a * b);
+      return true;
+    };
+    const auto checked_add_bytes = [](uint64_t count, uint64_t element_bytes,
+                                      uint64_t& total) {
+      if (element_bytes != 0 &&
+          count > (std::numeric_limits<uint64_t>::max() - total) / element_bytes) {
+        return false;
+      }
+      total += count * element_bytes;
+      return true;
+    };
+
+    uint32_t magic = 0;
+    int32_t version = 0;
+    if (!read_exact(&magic, sizeof(magic)) || !read_exact(&version, sizeof(version)) ||
+        magic != kIvfPqMagic) {
+      return OVVS_STATUS_IO;
+    }
+    if (version != 1) return OVVS_STATUS_UNSUPPORTED;
+
+    auto ix = std::make_unique<IvfPq>();
+    int32_t metric = 0;
+    if (!read_exact(&ix->ds.n, sizeof(ix->ds.n)) ||
+        !read_exact(&ix->ds.dim, sizeof(ix->ds.dim)) ||
+        !read_exact(&ix->nlist, sizeof(ix->nlist)) ||
+        !read_exact(&ix->pq_m, sizeof(ix->pq_m)) ||
+        !read_exact(&ix->pq_ks, sizeof(ix->pq_ks)) ||
+        !read_exact(&ix->dsub, sizeof(ix->dsub)) || !read_exact(&metric, sizeof(metric))) {
+      return OVVS_STATUS_IO;
+    }
+    if (ix->ds.n <= 0 || ix->ds.n > std::numeric_limits<int32_t>::max() || ix->ds.dim <= 0 ||
+        ix->nlist <= 0 || ix->nlist > ix->ds.n || ix->pq_m <= 0 || ix->pq_ks < 16 ||
+        ix->pq_ks > 256 || (ix->pq_ks & (ix->pq_ks - 1)) != 0 || ix->dsub <= 0 ||
+        ix->ds.dim % ix->pq_m != 0 || ix->dsub != ix->ds.dim / ix->pq_m ||
+        metric < OVVS_METRIC_L2_EXPANDED || metric > OVVS_METRIC_LP_UNEXPANDED) {
+      return OVVS_STATUS_IO;
+    }
+    ix->ds.metric = static_cast<ovvsMetric>(metric);
+
+    size_t centroid_count = 0;
+    size_t codebook_prefix = 0;
+    size_t codebook_count = 0;
+    size_t code_count = 0;
+    size_t dataset_count = 0;
+    if (!checked_product(static_cast<uint64_t>(ix->nlist), static_cast<uint64_t>(ix->ds.dim),
+                         centroid_count) ||
+        !checked_product(static_cast<uint64_t>(ix->pq_m), static_cast<uint64_t>(ix->pq_ks),
+                         codebook_prefix) ||
+        !checked_product(static_cast<uint64_t>(codebook_prefix), static_cast<uint64_t>(ix->dsub),
+                         codebook_count) ||
+        !checked_product(static_cast<uint64_t>(ix->ds.n), static_cast<uint64_t>(ix->pq_m),
+                         code_count) ||
+        !checked_product(static_cast<uint64_t>(ix->ds.n), static_cast<uint64_t>(ix->ds.dim),
+                         dataset_count) ||
+        centroid_count > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()) /
+                             sizeof(float) ||
+        codebook_count > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()) /
+                             sizeof(float) ||
+        dataset_count > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()) /
+                            sizeof(float)) {
+      return OVVS_STATUS_IO;
+    }
+    uint64_t expected_bytes = kIvfPqV1HeaderBytes;
+    if (!checked_add_bytes(centroid_count, sizeof(float), expected_bytes) ||
+        !checked_add_bytes(codebook_count, sizeof(float), expected_bytes) ||
+        !checked_add_bytes(code_count, sizeof(uint8_t), expected_bytes) ||
+        !checked_add_bytes(dataset_count, sizeof(float), expected_bytes) ||
+        !checked_add_bytes(static_cast<uint64_t>(ix->ds.n), sizeof(int32_t), expected_bytes) ||
+        !checked_add_bytes(static_cast<uint64_t>(ix->nlist), sizeof(int32_t), expected_bytes) ||
+        !checked_add_bytes(static_cast<uint64_t>(ix->ds.n), sizeof(int64_t), expected_bytes) ||
+        file_bytes != expected_bytes) {
+      return OVVS_STATUS_IO;
+    }
+
+    ix->centroids.resize(centroid_count);
+    ix->codebooks.resize(codebook_count);
+    ix->codes.resize(code_count);
+    ix->ds.x.resize(dataset_count);
+    ix->assign.resize(static_cast<size_t>(ix->ds.n));
+    if (!read_exact(ix->centroids.data(), ix->centroids.size() * sizeof(float)) ||
+        !read_exact(ix->codebooks.data(), ix->codebooks.size() * sizeof(float)) ||
+        !read_exact(ix->codes.data(), ix->codes.size()) ||
+        !read_exact(ix->ds.x.data(), ix->ds.x.size() * sizeof(float)) ||
+        !read_exact(ix->assign.data(), ix->assign.size() * sizeof(int32_t))) {
+      return OVVS_STATUS_IO;
+    }
+
+    ix->lists.resize(static_cast<size_t>(ix->nlist));
+    int64_t total_ids = 0;
+    for (int32_t c = 0; c < ix->nlist; ++c) {
+      int32_t list_size = 0;
+      if (!read_exact(&list_size, sizeof(list_size)) || list_size < 0 ||
+          list_size > ix->ds.n - total_ids) {
+        return OVVS_STATUS_IO;
+      }
+      total_ids += list_size;
+      auto& list = ix->lists[static_cast<size_t>(c)];
+      list.resize(static_cast<size_t>(list_size));
+      if (list_size > 0 && !read_exact(list.data(), list.size() * sizeof(int64_t))) {
+        return OVVS_STATUS_IO;
+      }
+    }
+    if (total_ids != ix->ds.n || rebuild_ivf_pq_packed(*ix) != OVVS_STATUS_SUCCESS) {
+      return OVVS_STATUS_IO;
+    }
+    const int64_t rebuilt_rows = ix->ds.n;
+    *index = reinterpret_cast<ovvsIvfPqIndex_t>(ix.release());
+    record_ivf_pq_rebuild(*rd(res), rebuilt_rows);
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::length_error&) {
     return OVVS_STATUS_IO;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
   }
-  *index = reinterpret_cast<ovvsIvfPqIndex_t>(ix);
-  return OVVS_STATUS_SUCCESS;
 }
 
 ovvsStatus ovvsIvfPqExtend(ovvsResources_t res, ovvsIvfPqIndex_t index, const float* extra, int64_t nextra) {
@@ -631,25 +864,106 @@ ovvsStatus ovvsIvfPqExtend(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
   auto* ix = reinterpret_cast<IvfPq*>(index);
   const int64_t dim = ix->ds.dim;
   const int64_t old_n = ix->ds.n;
-  ix->ds.x.insert(ix->ds.x.end(), extra, extra + nextra * dim);
-  ix->ds.n += nextra;
-  std::vector<int64_t> labels(static_cast<size_t>(nextra));
-  std::vector<float> d(static_cast<size_t>(nextra));
-  std::vector<float> scores(static_cast<size_t>(nextra) * static_cast<size_t>(ix->nlist));
-  prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, extra, nextra, ix->centroids.data(), ix->nlist, dim,
-                scores.data(), 2.f);
-  prim_topk(*rd(res), scores.data(), nextra, ix->nlist, 1, labels.data(), d.data(), false);
-  std::vector<float> resid(static_cast<size_t>(nextra) * static_cast<size_t>(dim));
-  ix->assign.resize(static_cast<size_t>(ix->ds.n));
-  for (int64_t i = 0; i < nextra; ++i) {
-    const int32_t a = static_cast<int32_t>(labels[static_cast<size_t>(i)]);
-    ix->assign[static_cast<size_t>(old_n + i)] = a;
-    if (a >= 0 && a < ix->nlist) ix->lists[static_cast<size_t>(a)].push_back(old_n + i);
-    const float* c = ix->centroids.data() + static_cast<size_t>(std::max(a, 0)) * dim;
-    for (int64_t t = 0; t < dim; ++t) resid[static_cast<size_t>(i * dim + t)] = extra[i * dim + t] - c[t];
+  if (old_n <= 0 || dim <= 0 || ix->nlist <= 0 || ix->pq_m <= 0 || ix->pq_ks <= 0 ||
+      ix->dsub <= 0 || nextra > std::numeric_limits<int64_t>::max() - old_n ||
+      nextra > std::numeric_limits<int64_t>::max() / dim) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
   }
-  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
-  pq_encode(resid.data(), nextra, dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
-            ix->codes.data() + old_n * ix->pq_m);
-  return OVVS_STATUS_SUCCESS;
+  const int64_t new_n = old_n + nextra;
+  if (new_n > std::numeric_limits<int32_t>::max() ||
+      static_cast<uint64_t>(nextra) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(ix->nlist) ||
+      static_cast<uint64_t>(nextra) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(dim) ||
+      static_cast<uint64_t>(new_n) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(dim) ||
+      static_cast<uint64_t>(new_n) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(ix->pq_m)) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  const size_t old_dataset_elements =
+      static_cast<size_t>(old_n) * static_cast<size_t>(dim);
+  const size_t old_code_elements =
+      static_cast<size_t>(old_n) * static_cast<size_t>(ix->pq_m);
+  if (ix->ds.x.size() != old_dataset_elements ||
+      ix->assign.size() != static_cast<size_t>(old_n) ||
+      ix->codes.size() != old_code_elements ||
+      ix->lists.size() != static_cast<size_t>(ix->nlist) ||
+      ix->list_offsets.size() != static_cast<size_t>(ix->nlist) + 1 ||
+      ix->packed_ids.size() != static_cast<size_t>(old_n) ||
+      ix->packed_codes.size() != old_code_elements) {
+    return OVVS_STATUS_ERROR;
+  }
+
+  try {
+    const size_t extra_elements =
+        static_cast<size_t>(nextra) * static_cast<size_t>(dim);
+    std::vector<float> extra_values(extra, extra + extra_elements);
+    std::vector<int64_t> labels(static_cast<size_t>(nextra));
+    std::vector<float> label_distances(static_cast<size_t>(nextra));
+    std::vector<float> scores(static_cast<size_t>(nextra) * static_cast<size_t>(ix->nlist));
+    ovvsStatus status =
+        prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, extra_values.data(), nextra,
+                      ix->centroids.data(), ix->nlist, dim, scores.data(), 2.f);
+    if (status != OVVS_STATUS_SUCCESS) return status;
+    status = prim_topk(*rd(res), scores.data(), nextra, ix->nlist, 1, labels.data(),
+                       label_distances.data(), false);
+    if (status != OVVS_STATUS_SUCCESS) return status;
+
+    std::vector<int32_t> next_assign = ix->assign;
+    std::vector<std::vector<int64_t>> next_lists = ix->lists;
+    next_assign.resize(static_cast<size_t>(new_n));
+    std::vector<float> residuals(static_cast<size_t>(nextra) * static_cast<size_t>(dim));
+    for (int64_t i = 0; i < nextra; ++i) {
+      const int64_t label = labels[static_cast<size_t>(i)];
+      if (label < 0 || label >= ix->nlist) return OVVS_STATUS_ERROR;
+      const int32_t assignment = static_cast<int32_t>(label);
+      next_assign[static_cast<size_t>(old_n + i)] = assignment;
+      next_lists[static_cast<size_t>(assignment)].push_back(old_n + i);
+      const float* centroid =
+          ix->centroids.data() + static_cast<size_t>(assignment) * static_cast<size_t>(dim);
+      for (int64_t t = 0; t < dim; ++t) {
+        residuals[static_cast<size_t>(i * dim + t)] =
+            extra_values[static_cast<size_t>(i * dim + t)] - centroid[t];
+      }
+    }
+
+    std::vector<uint8_t> next_codes = ix->codes;
+    next_codes.resize(static_cast<size_t>(new_n) * static_cast<size_t>(ix->pq_m));
+    pq_encode(residuals.data(), nextra, dim, ix->pq_m, ix->pq_ks, ix->dsub,
+              ix->codebooks.data(),
+              next_codes.data() + static_cast<size_t>(old_n) * static_cast<size_t>(ix->pq_m));
+
+    std::vector<int64_t> next_offsets;
+    std::vector<int64_t> next_packed_ids;
+    std::vector<uint8_t> next_packed_codes;
+    status = make_ivf_pq_packed(new_n, ix->nlist, ix->pq_m, ix->pq_ks, next_assign,
+                                next_codes, next_lists, next_offsets, next_packed_ids,
+                                next_packed_codes);
+    if (status != OVVS_STATUS_SUCCESS) return status;
+
+    const size_t new_dataset_elements =
+        static_cast<size_t>(new_n) * static_cast<size_t>(dim);
+    ix->ds.x.reserve(new_dataset_elements);
+    ix->ds.x.insert(ix->ds.x.end(), extra_values.begin(), extra_values.end());
+    ix->assign.swap(next_assign);
+    ix->codes.swap(next_codes);
+    ix->lists.swap(next_lists);
+    ix->list_offsets.swap(next_offsets);
+    ix->packed_ids.swap(next_packed_ids);
+    ix->packed_codes.swap(next_packed_codes);
+    ix->ds.n = new_n;
+    record_ivf_pq_rebuild(*rd(res), new_n);
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::length_error&) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }

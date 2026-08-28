@@ -2,7 +2,7 @@
 
 Status: **correctness guarded; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
 
-Local development artifacts are `out/bench/ivfpq-b3-baseline-smoke.json` and `out/bench/ivfpq-b3-guarded-smoke.json` with their sibling Markdown files. Both artifacts are overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. The final guarded artifact emits the corrected `float32_cast_on_load` label.
+Local development artifacts are `out/bench/ivfpq-b3-baseline-smoke.json`, `out/bench/ivfpq-b3-guarded-smoke.json`, and three `ivfpq-b3-packed-smoke*.json` runs with sibling Markdown files. They are overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
 
 ## Numeric defect and correction
 
@@ -31,6 +31,29 @@ Unsafe AUTO execution falls back to CPU. Unsafe FORCE_NPU returns `DEVICE_UNAVAI
 
 The guarded AUTO path is correct but not fast: at `nprobe=8`, FORCE_CPU was 6.82× faster. The smoke's ovVS lane uses exact refinement while its FAISS lane uses raw `IndexIVFPQ`, so no ovVS-versus-FAISS conclusion is drawn from this artifact.
 
+## Persistent list-major storage
+
+IVF-PQ now derives list offsets, original IDs, and contiguous PQ codes at build, deserialize, and extend. The row-major codes and list vectors remain the canonical `IPQ1` v1 state; the derived CSR is not serialized. Its additional storage is `n*(8+pq_m) + 8*(nlist+1)` bytes, about 15.27 MiB at SIFT1M with `pq_m=8` and `nlist=1,024`.
+
+Focused native telemetry validates the intended runtime behavior:
+
+| Operation | Direct ADC rows | Filter code-copy bytes | Result |
+|---|---:|---:|---|
+| Two unfiltered full-probe searches, `n=64`, `nq=3` | 384 | 0 | exact repeat ID/distance parity |
+| All-allowed bitset, same three queries, `pq_m=4` | 0 | 768 | exact parity with unfiltered search |
+| Three-ID allow list, one query | 0 | 12 | allowed-only results plus `-1/+inf` fill |
+
+A hand-authored 268-byte legacy `IPQ1` file round-trips byte-for-byte. Truncation and invalid/duplicate list IDs fail without publishing state; version 2 reports `UNSUPPORTED`. Extend now stages assignments, lists, row-major codes, and CSR before mutation, propagates primitive failures, then appends the preserved input rows and commits via no-throw swaps. A forced-NPU failure leaves serialized bytes, search results, and rebuild telemetry unchanged.
+
+Three repeated current-code smokes retained recall 0.6375 and 0.946875 at `nprobe=2/8`:
+
+| Search policy | nprobe 2 QPS, three-run median (range) | nprobe 8 QPS, three-run median (range) |
+|---|---:|---:|
+| AUTO | 12,910.5 (12,381.5–13,015.5) | 3,479.1 (3,389.5–3,513.9) |
+| FORCE_CPU | 74,888.8 (66,445.2–78,817.7) | 31,815.5 (25,153.3–32,245.1) |
+
+One earlier guarded run measured FORCE_CPU at 63,103.9/23,463.9 QPS, but that single before-run plus the current variance is not a controlled A/B. Direct persistent code spans and zero unfiltered host list-code scratch are proven; final candidate-ID aggregation and backend/request copies are not measured, and a stable end-to-end speedup is not established. AUTO remains 9.14× slower than FORCE_CPU at `nprobe=8` because safe-list NPU dispatch is still launch-bound. Forced NPU remains explicitly unavailable for the complete search. Raw FAISS results are retained in the local artifacts but are not refinement-equivalent.
+
 ## Software-only direction probes
 
 These one-off local probes prefilled request-owned tensors and exclude input packing, output consumption, candidate selection, memory growth, package energy, and full IVF-PQ wall. No raw artifact was preserved. They justify implementation experiments only.
@@ -47,11 +70,11 @@ An isolated per-LUT scaling probe used a conservative 60,000 headroom, then de-s
 
 ## Remaining B3 gate
 
-1. Persist list offsets, IDs, and list-contiguous codes; repeated unfiltered searches must report zero repacks.
-2. Validate per-LUT scaling at production geometry before re-enabling unsafe-range NPU work.
-3. Batch query/list work descriptors and use fixed buckets 128/256/512/1,024/2,048 without allowing padded entries into selection.
-4. Bake off reusable request depths 1/2/4 with queue, cache, tail, copy, memory, and stage-device telemetry.
+1. Validate per-LUT scaling at production geometry before re-enabling unsafe-range NPU work.
+2. Batch query/list work descriptors and use fixed buckets 128/256/512/1,024/2,048 without allowing padded entries into selection.
+3. Bake off reusable request depths 1/2/4 with queue, cache, tail, copy, memory, and stage-device telemetry.
+4. Add the iGPU variable-length scan/select path and compare it with padded NPU execution per SKU.
 5. Compare raw ovVS and raw FAISS at identical `nlist`, `nprobe`, `pq_m`, `nbits`, and `krefine=k`; refined comparisons need an equivalent FAISS refinement lane.
 6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, and package-energy evidence before claiming a win.
 
-Latest checkpoint verification: 73/73 native tests, 6/6 CTest lanes, 57/57 benchmark-harness tests, and 6/6 SIFT-fetcher tests. CTest re-runs native subsets plus the two consumers, so its count is not additive.
+Latest checkpoint verification: 76/76 accelerator-enabled native tests, 6/6 CTest lanes, 57/57 benchmark-harness tests, and 6/6 SIFT-fetcher tests. CTest re-runs native subsets plus the two consumers, so its count is not additive.
