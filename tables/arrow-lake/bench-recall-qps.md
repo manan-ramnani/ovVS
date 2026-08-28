@@ -17,9 +17,26 @@ The table reports medians across three independent full preflight processes; par
 
 CAGRA returned 208 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle, an absolute recall advantage of 0.0208. Recall is reported rather than thresholded because this prefix is not the plan's SIFT1M quality gate. By the three-run medians, hnswlib remained 5.64× faster in search and 5.16× faster to build, while CAGRA used 1.98× the isolated peak process RSS. The CAGRA peak includes the dataset, runtime, and index; it is not device-allocation telemetry. AUTO construction ends in the CPU host optimizer, so the reported final build primitive does not describe the complete mixed build pipeline.
 
-The preflight contract completed in all three runs with both lanes successful, exact truth, five QPS samples per lane, all 192 CAGRA searches per run attributed to GPU, zero NPU fallbacks, and zero explicit index uploads. Energy was disabled and no in-run device-occupancy trace was captured. These walls are therefore retained as diagnostic current-code measurements, not a publishable isolated performance baseline. Every artifact remains partial and noncanonical; the older full SIFT1M result below is still the latest full-scale measurement.
+The preflight contract completed in all three runs with both lanes successful, exact truth, five QPS samples per lane, all 192 CAGRA searches per run attributed to GPU, zero NPU fallbacks, and zero explicit index uploads. Energy was disabled and no in-run device-occupancy trace was captured. These walls are therefore retained as diagnostic current-code measurements, not a publishable isolated performance baseline. Every artifact remains partial and noncanonical; the separate full SIFT1M section below contains the current full-scale gate.
 
 ## SIFT1M matched quality gate
+
+### Current-code rerun: recall-closeness pass
+
+Checksum-pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=10`), exact validated HDF5 truth, M=16, seed 7, one warmup and five measured passes. ovVS used AUTO construction followed by FORCE_GPU search at `itopk=32`, width=1, batch=32. hnswlib 0.8.0 used `ef_construction=200`, `ef=32`, batch=32, and 20 explicit threads.
+
+| Lane | Recall@10 | Build wall | Median QPS (five-pass range) | Isolated peak RSS | Validity |
+|---|---:|---:|---:|---:|---|
+| ovVS CAGRA | 0.9036 | 185.3 s; final primitive CPU | 1,839.1 (1,692.2–1,853.8) | 2,342.5 MiB | 192/192 GPU attributions; `192/192/0/0` transfer |
+| hnswlib | 0.8915 | 96.7 s | 11,069.0 (9,814.8–13,485.6) | 1,383.0 MiB | 20 explicit threads; finite unique output |
+
+The T13.4 recall-closeness gate **passed**: `0.8915 - 0.9036 = -0.0121`, within the maximum allowed gap of 0.0200. CAGRA returned 121 more exact top-10 hits across the 10,000-result oracle. This is a closeness verdict, not the plan's separate ≥0.95 product target: CAGRA remains 0.0464 below that target. All 192 CAGRA searches reported GPU with zero attribution failures and zero explicit index uploads. AUTO construction ends in the CPU host optimizer, so its final-primitive label does not describe the complete mixed pipeline.
+
+The performance result remains negative in this diagnostic run: hnswlib was 6.02× faster in search, 1.92× faster to build, and 1.69× lighter by isolated peak process RSS. Energy was disabled. A contemporaneous counter sample showed the Intel compute engine saturated during CAGRA construction while unrelated 3D processes consumed roughly 50–60%, so these walls are not an isolated publishable baseline. The recall/completion verdict is unaffected. The artifact is intentionally partial and noncanonical because it contains one matched point rather than the full B1 curves and package energy.
+
+Compared with the prior result below, CAGRA recall improved by 0.4979 and observed build wall fell from 830.0 to 185.3 s. Those are end-to-end mixed-change/current-environment differences across the query seed, host graph optimizer, and NN-Descent rewrite; they do not isolate causality or constitute a controlled speedup claim.
+
+### Prior pre-change failure
 
 Commit `93e688b`; pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=10`), exact HDF5 truth, M=16, seed 7, one warmup and five measured passes. ovVS used AUTO construction followed by FORCE_GPU search at `itopk=32`, width=1, batch=32. hnswlib 0.8.0 used `ef_construction=200`, `ef=32`, batch=32, and 20 explicit threads.
 
@@ -28,7 +45,7 @@ Commit `93e688b`; pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=1
 | ovVS CAGRA | 0.4057 | 830.0 s; final primitive CPU | 1,549.7 | FORCE_GPU search; valid finite unique output; `192/192/0/0` transfer |
 | hnswlib | 0.8903 | 61.7 s | 10,568.7 | valid finite unique output |
 
-The quality gate **failed**: `0.8903 - 0.4057 = 0.4846`, versus a maximum allowed absolute gap of 0.0200. Exact truth was 1,000×10 with 10,000 valid, duplicate-free IDs against the full 1M-vector index. Both lanes succeeded; ovVS recorded zero NPU fallbacks and no explicit dataset/graph uploads. This is a valid algorithm-quality failure, not a fixture, policy, or transfer failure. It predates the query-content seed fix and host detour-rank optimizer and has not been rerun, so it remains the latest measured failure rather than a current-code recall claim.
+The quality gate **failed**: `0.8903 - 0.4057 = 0.4846`, versus a maximum allowed absolute gap of 0.0200. Exact truth was 1,000×10 with 10,000 valid, duplicate-free IDs against the full 1M-vector index. Both lanes succeeded; ovVS recorded zero NPU fallbacks and no explicit dataset/graph uploads. This was a valid algorithm-quality failure, not a fixture, policy, or transfer failure. It predates the query-content seed fix, host detour-rank optimizer, and bounded NEW/OLD reverse-join rewrite; the current-code rerun above supersedes it for present status.
 
 The timing columns are diagnostic only. Preflight sampled about 62.7% unrelated iGPU 3D load (WUDFHost, ChatGPT, and DWM), so neither QPS nor build wall is a publishable isolated-performance baseline. The recall gap is far from the threshold; the near-boundary hnswlib rerun rule did not apply. The artifact remains intentionally partial because this single pair omits the full curves and package energy.
 

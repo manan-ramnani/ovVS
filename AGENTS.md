@@ -65,10 +65,10 @@ Work the plan’s phases in sequence. **v0.2.0 already has C ABI symbols through
 
 `prim::gemm`, `prim::topk`, and `prim::gather` exist. Remaining work is **accelerated quality and scale**, not first implementations. Current critical path (2026-08-28, `.claude/backlog.md`):
 
-1. SIFT1M / 1e5×768 recall–QPS vs FAISS-CPU and hnswlib (B1)
-2. CAGRA search kernel T13.4: work-group per query, SLM itopk, bounded hashmap (B2). Gate: SIFT1M recall within 2% of hnswlib at similar M/ef before chasing QPS
-3. NN-Descent iGPU for n≫4096 (B5) so CAGRA init scales
-4. IVF-PQ search rewrite around batched ADC, then RaBitQ packed binary GEMM (B3, B4)
+1. B1 harness core and the current-code matched SIFT1M CAGRA gate are complete; full curves/energy and the real 100K×768 corpus remain open.
+2. B2/B5 pass the SIFT1M recall-closeness gate (0.9036 versus hnswlib 0.8915), but ≥0.95 recall, CAGRA QPS, NN-Descent convergence, and GPU prune remain open.
+3. **Next implementation:** IVF-PQ search rewrite around persistent/batched ADC, then RaBitQ packed binary GEMM (B3, B4). Apply software-only request/buffer reuse and bounded async overlap; do not require BIOS changes.
+4. Continue CAGRA throughput work only from profiling evidence; never weaken hnswlib settings.
 5. HETERO stage overlap (B6); NPU L0 dataset-home experiment (B7); Lunar Lake bakeoff when hardware exists (B8)
 6. Then plan v1.0 polish (B9–B20). Vamana/ScaNN/SLINK/bindings are v1.1 (B21+) — do not start them ahead of B2
 

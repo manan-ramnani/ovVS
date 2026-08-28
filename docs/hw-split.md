@@ -52,7 +52,7 @@ IVF-PQ / RaBitQ
   refine              → CPU
 
 CAGRA search
-  graph walk          → iGPU SYCL (work-group/query checkpoint; B2 quality/perf gate open)
+  graph walk          → iGPU SYCL (work-group/query; SIFT1M recall-closeness gate passed, QPS open)
   candidate scoring inside the walk → fused in the SYCL kernel
 
 CAGRA build
@@ -60,7 +60,7 @@ CAGRA build
   prune               → CPU until T13.3 (full FORCE_GPU build is unavailable)
 
 Vamana / NN-Descent
-  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (B5 partial)
+  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (SIFT1M CAGRA-vs-hnswlib closeness passed; T12.5 IVF-PQ comparison/prune open)
   Vamana prune/walk  → host control path (B21 remains open)
 
 k-means
