@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+_Static_assert(OVVS_IVF_PQ_SEARCH_STATS_ABI_V1 == 1u, "unexpected IVF-PQ stats ABI version");
+_Static_assert(sizeof(ovvsIvfPqSearchStatsV1) == 200, "unexpected IVF-PQ stats ABI size");
+
 static float l2sq(const float* a, const float* b, int64_t d) {
   float s = 0.f;
   for (int64_t i = 0; i < d; ++i) {
@@ -17,6 +20,13 @@ int main(void) {
   ovvsResources_t res = NULL;
   if (ovvsResourcesCreate(&res) != OVVS_STATUS_SUCCESS) {
     fprintf(stderr, "create failed\n");
+    return 1;
+  }
+  ovvsIvfPqSearchStatsV1 ivfpq_stats = {0};
+  if (ovvsResourcesIvfPqSearchStatsV1(res, &ivfpq_stats) != OVVS_STATUS_SUCCESS ||
+      ivfpq_stats.abi_version != OVVS_IVF_PQ_SEARCH_STATS_ABI_V1 ||
+      ivfpq_stats.struct_size != sizeof(ivfpq_stats)) {
+    fprintf(stderr, "IVF-PQ stats ABI mismatch\n");
     return 1;
   }
   const int64_t n = 12, dim = 4, k = 3;

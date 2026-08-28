@@ -1,5 +1,7 @@
 #include "internal.hpp"
 
+#include <chrono>
+
 using namespace ovvs::impl;
 
 namespace {
@@ -134,10 +136,19 @@ void record_ivf_pq_rebuild(ResourcesData& resources, int64_t rows) noexcept {
   }
 }
 
-void record_ivf_pq_search_layout(ResourcesData& resources, int64_t direct_rows,
-                                 int64_t id_copy_bytes_avoided,
-                                 int64_t selected_id_resolutions,
-                                 int64_t filtered_copy_bytes) noexcept {
+using SearchClock = std::chrono::steady_clock;
+
+int64_t elapsed_ns(SearchClock::time_point begin, SearchClock::time_point end) noexcept {
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+  return elapsed > 0 ? elapsed : 0;
+}
+
+void record_ivf_pq_search_stats(ResourcesData& resources,
+                                const ovvsIvfPqSearchStatsV1& delta,
+                                int64_t direct_rows,
+                                int64_t id_copy_bytes_avoided,
+                                int64_t selected_id_resolutions,
+                                int64_t filtered_copy_bytes) noexcept {
   try {
     std::lock_guard<std::mutex> lock(resources.ivfpq_stats_mutex);
     saturating_add(resources.ivfpq_unfiltered_direct_rows, direct_rows);
@@ -146,6 +157,34 @@ void record_ivf_pq_search_layout(ResourcesData& resources, int64_t direct_rows,
     saturating_add(resources.ivfpq_selected_id_resolutions,
                    selected_id_resolutions);
     saturating_add(resources.ivfpq_filtered_code_copy_bytes, filtered_copy_bytes);
+    auto& total = resources.ivfpq_search_stats;
+    total.abi_version = OVVS_IVF_PQ_SEARCH_STATS_ABI_V1;
+    total.struct_size = static_cast<uint32_t>(sizeof(total));
+    saturating_add(total.successful_calls, delta.successful_calls);
+    saturating_add(total.blocks, delta.blocks);
+    saturating_add(total.queries, delta.queries);
+    saturating_add(total.tasks, delta.tasks);
+    saturating_add(total.candidate_rows, delta.candidate_rows);
+    saturating_add(total.selected_rows, delta.selected_rows);
+    saturating_add(total.total_wall_ns, delta.total_wall_ns);
+    saturating_add(total.coarse_pairwise_ns, delta.coarse_pairwise_ns);
+    saturating_add(total.coarse_topk_ns, delta.coarse_topk_ns);
+    saturating_add(total.planning_ns, delta.planning_ns);
+    saturating_add(total.lut_build_ns, delta.lut_build_ns);
+    saturating_add(total.adc_scan_select_ns, delta.adc_scan_select_ns);
+    saturating_add(total.shortlist_select_validate_ns,
+                   delta.shortlist_select_validate_ns);
+    saturating_add(total.refine_gather_ns, delta.refine_gather_ns);
+    saturating_add(total.refine_distance_ns, delta.refine_distance_ns);
+    saturating_add(total.refine_topk_ns, delta.refine_topk_ns);
+    saturating_add(total.gpu_allocation_calls, delta.gpu_allocation_calls);
+    saturating_add(total.gpu_allocation_bytes, delta.gpu_allocation_bytes);
+    saturating_add(total.gpu_h2d_calls, delta.gpu_h2d_calls);
+    saturating_add(total.gpu_h2d_bytes, delta.gpu_h2d_bytes);
+    saturating_add(total.gpu_d2h_calls, delta.gpu_d2h_calls);
+    saturating_add(total.gpu_d2h_bytes, delta.gpu_d2h_bytes);
+    saturating_add(total.gpu_kernel_launches, delta.gpu_kernel_launches);
+    saturating_add(total.gpu_wait_calls, delta.gpu_wait_calls);
   } catch (...) {
   }
 }
@@ -499,6 +538,7 @@ ovvsStatus ovvsIvfPqBuild(ovvsResources_t res, const float* dataset, int64_t n, 
 ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const float* queries,
                            int64_t nq, int64_t k, int32_t nprobe, int32_t krefine,
                            const uint8_t* bitset, int64_t* neighbors, float* distances) {
+  const auto search_started = SearchClock::now();
   if (!res || !index || !queries || !neighbors || !distances || nq <= 0 || k <= 0 ||
       k > std::numeric_limits<int32_t>::max()) {
     return OVVS_STATUS_INVALID_ARGUMENT;
@@ -543,6 +583,10 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
     return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
   try {
+    ovvsIvfPqSearchStatsV1 call_stats{};
+    call_stats.successful_calls = 1;
+    call_stats.queries = nq;
+    GpuWorkStats gpu_work{};
     int64_t direct_rows = 0;
     int64_t id_copy_bytes_avoided = 0;
     int64_t selected_id_resolutions = 0;
@@ -550,12 +594,18 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
     std::vector<int64_t> cl(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
     std::vector<float> cd(static_cast<size_t>(nq) * static_cast<size_t>(nprobe));
     std::vector<float> cscores(static_cast<size_t>(nq) * static_cast<size_t>(ix->nlist));
-    ovvsStatus status =
-        prim_pairwise(*rd(res), OVVS_METRIC_L2_EXPANDED, queries, nq,
-                      ix->centroids.data(), ix->nlist, ix->ds.dim, cscores.data(), 2.f);
+    const auto coarse_pairwise_started = SearchClock::now();
+    ovvsStatus status = prim_pairwise(
+        *rd(res), OVVS_METRIC_L2_EXPANDED, queries, nq, ix->centroids.data(),
+        ix->nlist, ix->ds.dim, cscores.data(), 2.f, &gpu_work);
+    saturating_add(call_stats.coarse_pairwise_ns,
+                   elapsed_ns(coarse_pairwise_started, SearchClock::now()));
     if (status != OVVS_STATUS_SUCCESS) return status;
+    const auto coarse_topk_started = SearchClock::now();
     status = prim_topk(*rd(res), cscores.data(), nq, ix->nlist, nprobe, cl.data(),
-                       cd.data(), false);
+                       cd.data(), false, &gpu_work);
+    saturating_add(call_stats.coarse_topk_ns,
+                   elapsed_ns(coarse_topk_started, SearchClock::now()));
     if (status != OVVS_STATUS_SUCCESS) return status;
 
     const int64_t dim = ix->ds.dim;
@@ -660,6 +710,13 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         }
         query_offsets[static_cast<size_t>(q - block_begin + 1)] = candidate_rows;
       }
+      saturating_add(call_stats.blocks, 1);
+      saturating_add(
+          call_stats.tasks,
+          plans.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())
+              ? std::numeric_limits<int64_t>::max()
+              : static_cast<int64_t>(plans.size()));
+      saturating_add(call_stats.candidate_rows, candidate_rows);
 
       if (plans.size() > std::numeric_limits<size_t>::max() / table_elements) {
         return OVVS_STATUS_SHAPE_MISMATCH;
@@ -704,6 +761,7 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         }
       }
 
+      const auto lut_started = SearchClock::now();
       for (size_t task_index = 0; task_index < plans.size(); ++task_index) {
         const AdcPlan& plan = plans[task_index];
         const float* query = queries + plan.query * dim;
@@ -722,7 +780,13 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
                 l2sq(sub, cb + cs * ix->dsub, ix->dsub);
           }
         }
+      }
+      saturating_add(call_stats.lut_build_ns,
+                     elapsed_ns(lut_started, SearchClock::now()));
 
+      for (size_t task_index = 0; task_index < plans.size(); ++task_index) {
+        const AdcPlan& plan = plans[task_index];
+        float* table = lut_storage.data() + task_index * table_elements;
         if (use_fused_gpu_scan) {
           const int64_t local_query = plan.query - block_begin;
           if (local_query < 0 || local_query >= block_queries ||
@@ -808,20 +872,26 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
           }
           const int64_t bitset_bytes =
               bitset ? (ix->ds.n / 8 + (ix->ds.n % 8 != 0 ? 1 : 0)) : 0;
+          const auto adc_started = SearchClock::now();
           status = prim_ivfpq_scan_select(
               *rd(res), gpu_tasks.data(), static_cast<int64_t>(gpu_tasks.size()),
               lut_storage.data(), static_cast<int64_t>(lut_storage.size()),
               ix->packed_ids.data(), ix->packed_codes.data(), ix->ds.n, bitset,
               bitset_bytes, block_queries, ix->pq_m, ix->pq_ks, krefine,
-              gpu_packed_positions.data(), gpu_selected_counts.data());
+              gpu_packed_positions.data(), gpu_selected_counts.data(), &gpu_work);
+          saturating_add(call_stats.adc_scan_select_ns,
+                         elapsed_ns(adc_started, SearchClock::now()));
           if (status != OVVS_STATUS_SUCCESS) return status;
         } else if (!gpu_tasks.empty()) {
           return OVVS_STATUS_ERROR;
         }
       } else if (candidate_rows > 0) {
         if (tasks.empty()) return OVVS_STATUS_ERROR;
+        const auto adc_started = SearchClock::now();
         status = prim_pq_adc_batch(*rd(res), tasks.data(), static_cast<int64_t>(tasks.size()),
                                    ix->pq_m, ix->pq_ks, adc.data(), candidate_rows);
+        saturating_add(call_stats.adc_scan_select_ns,
+                       elapsed_ns(adc_started, SearchClock::now()));
         if (status != OVVS_STATUS_SUCCESS) return status;
       } else if (!tasks.empty()) {
         return OVVS_STATUS_ERROR;
@@ -849,6 +919,7 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         return id >= 0 && id < ix->ds.n;
       };
 
+      const auto shortlist_validation_started = SearchClock::now();
       int64_t max_refine = 0;
       std::vector<int32_t> validation_positions;
       for (int64_t local_query = 0; local_query < block_queries; ++local_query) {
@@ -930,6 +1001,8 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         }
         max_refine = std::max(max_refine, static_cast<int64_t>(selected_count));
       }
+      saturating_add(call_stats.shortlist_select_validate_ns,
+                     elapsed_ns(shortlist_validation_started, SearchClock::now()));
       const size_t refine_count = static_cast<size_t>(max_refine);
       if (refine_count > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
         return OVVS_STATUS_SHAPE_MISMATCH;
@@ -956,6 +1029,8 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
         const int64_t kr = use_fused_gpu_scan
                                ? query_rows
                                : std::min(static_cast<int64_t>(krefine), query_rows);
+        saturating_add(call_stats.selected_rows, kr);
+        const auto shortlist_started = SearchClock::now();
         if (use_fused_gpu_scan) {
           const size_t selected_base =
               static_cast<size_t>(local_query) * static_cast<size_t>(krefine);
@@ -969,7 +1044,7 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
           }
         } else {
           status = prim_topk(*rd(res), adc.data() + query_begin, 1, query_rows, kr,
-                             topk_indices.data(), topk_values.data(), false);
+                             topk_indices.data(), topk_values.data(), false, &gpu_work);
           if (status != OVVS_STATUS_SUCCESS) return status;
           for (int64_t t = 0; t < kr; ++t) {
             const int64_t selected = topk_indices[static_cast<size_t>(t)];
@@ -987,18 +1062,28 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
             }
           }
         }
+        saturating_add(call_stats.shortlist_select_validate_ns,
+                       elapsed_ns(shortlist_started, SearchClock::now()));
+        const auto refine_gather_started = SearchClock::now();
         status = prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim,
-                                  candidates.data(), kr,
-                                 gathered.data());
+                                  candidates.data(), kr, gathered.data(), &gpu_work);
+        saturating_add(call_stats.refine_gather_ns,
+                       elapsed_ns(refine_gather_started, SearchClock::now()));
         if (status != OVVS_STATUS_SUCCESS) return status;
         const float* query = queries + q * dim;
+        const auto refine_distance_started = SearchClock::now();
         status = prim_pairwise(*rd(res), ix->ds.metric, query, 1, gathered.data(), kr, dim,
-                               refined_scores.data(), 2.f);
+                               refined_scores.data(), 2.f, &gpu_work);
+        saturating_add(call_stats.refine_distance_ns,
+                       elapsed_ns(refine_distance_started, SearchClock::now()));
         if (status != OVVS_STATUS_SUCCESS) return status;
         const int64_t kk = std::min(k, kr);
+        const auto refine_topk_started = SearchClock::now();
         status = prim_topk(*rd(res), refined_scores.data(), 1, kr, kk,
                            final_indices.data(), final_values.data(),
-                           metric_largest(ix->ds.metric));
+                           metric_largest(ix->ds.metric), &gpu_work);
+        saturating_add(call_stats.refine_topk_ns,
+                       elapsed_ns(refine_topk_started, SearchClock::now()));
         if (status != OVVS_STATUS_SUCCESS) return status;
         for (int64_t t = 0; t < kk; ++t) {
           const int64_t selected = final_indices[static_cast<size_t>(t)];
@@ -1015,8 +1100,29 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
 
     std::memcpy(neighbors, staged_neighbors.data(), staged_neighbors.size() * sizeof(int64_t));
     std::memcpy(distances, staged_distances.data(), staged_distances.size() * sizeof(float));
-    record_ivf_pq_search_layout(*rd(res), direct_rows, id_copy_bytes_avoided,
-                                selected_id_resolutions, filtered_copy_bytes);
+    call_stats.total_wall_ns = elapsed_ns(search_started, SearchClock::now());
+    int64_t named_ns = 0;
+    saturating_add(named_ns, call_stats.coarse_pairwise_ns);
+    saturating_add(named_ns, call_stats.coarse_topk_ns);
+    saturating_add(named_ns, call_stats.lut_build_ns);
+    saturating_add(named_ns, call_stats.adc_scan_select_ns);
+    saturating_add(named_ns, call_stats.shortlist_select_validate_ns);
+    saturating_add(named_ns, call_stats.refine_gather_ns);
+    saturating_add(named_ns, call_stats.refine_distance_ns);
+    saturating_add(named_ns, call_stats.refine_topk_ns);
+    call_stats.planning_ns =
+        call_stats.total_wall_ns > named_ns ? call_stats.total_wall_ns - named_ns : 0;
+    call_stats.gpu_allocation_calls = gpu_work.allocation_calls;
+    call_stats.gpu_allocation_bytes = gpu_work.allocation_bytes;
+    call_stats.gpu_h2d_calls = gpu_work.h2d_calls;
+    call_stats.gpu_h2d_bytes = gpu_work.h2d_bytes;
+    call_stats.gpu_d2h_calls = gpu_work.d2h_calls;
+    call_stats.gpu_d2h_bytes = gpu_work.d2h_bytes;
+    call_stats.gpu_kernel_launches = gpu_work.kernel_launches;
+    call_stats.gpu_wait_calls = gpu_work.wait_calls;
+    record_ivf_pq_search_stats(*rd(res), call_stats, direct_rows,
+                               id_copy_bytes_avoided, selected_id_resolutions,
+                               filtered_copy_bytes);
     return OVVS_STATUS_SUCCESS;
   } catch (const std::length_error&) {
     return OVVS_STATUS_SHAPE_MISMATCH;

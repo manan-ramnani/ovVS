@@ -424,6 +424,10 @@ def ovvs_resource_metadata(module: Any, resources: Any) -> dict[str, Any]:
     except Exception:
         metadata["cagra_transfer_stats"] = None
     try:
+        metadata["ivfpq_search_stats"] = resources.ivfpq_search_stats()
+    except Exception:
+        metadata["ivfpq_search_stats"] = None
+    try:
         fn = module._lib.ovvsResourcesSku
         fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32]
         buf = ctypes.create_string_buffer(256)
@@ -680,37 +684,55 @@ def query_batches(queries: Any, batch_size: int) -> Iterable[Any]:
         yield queries[start : start + batch_size]
 
 
-def measure_search(search_batch: Callable[[Any], tuple[Any, Any]], queries: Any, batch_size: int,
-                   warmups: int, repeats: int) -> tuple[dict[str, Any], Any, Any]:
+def measure_search(
+    search_batch: Callable[[Any], tuple[Any, Any]],
+    queries: Any,
+    batch_size: int,
+    warmups: int,
+    repeats: int,
+    phase_callback: Callable[[str, str], None] | None = None,
+) -> tuple[dict[str, Any], Any, Any]:
     import numpy as np
 
-    for _ in range(warmups):
-        for batch in query_batches(queries, batch_size):
-            search_batch(batch)
+    if phase_callback is not None:
+        phase_callback("warmup", "before")
+    try:
+        for _ in range(warmups):
+            for batch in query_batches(queries, batch_size):
+                search_batch(batch)
+    finally:
+        if phase_callback is not None:
+            phase_callback("warmup", "after")
     pass_ms: list[float] = []
     qps: list[float] = []
     batch_ms: list[float] = []
     per_query_ms: list[float] = []
     final_ids: list[Any] = []
     final_distances: list[Any] = []
-    for repeat in range(repeats):
-        ids_parts: list[Any] = []
-        distance_parts: list[Any] = []
-        pass_started = time.perf_counter_ns()
-        for batch in query_batches(queries, batch_size):
-            batch_started = time.perf_counter_ns()
-            ids, distances = search_batch(batch)
-            elapsed = (time.perf_counter_ns() - batch_started) / 1_000_000
-            batch_ms.append(elapsed)
-            per_query_ms.append(elapsed / max(len(batch), 1))
+    if phase_callback is not None:
+        phase_callback("timed", "before")
+    try:
+        for repeat in range(repeats):
+            ids_parts: list[Any] = []
+            distance_parts: list[Any] = []
+            pass_started = time.perf_counter_ns()
+            for batch in query_batches(queries, batch_size):
+                batch_started = time.perf_counter_ns()
+                ids, distances = search_batch(batch)
+                elapsed = (time.perf_counter_ns() - batch_started) / 1_000_000
+                batch_ms.append(elapsed)
+                per_query_ms.append(elapsed / max(len(batch), 1))
+                if repeat == repeats - 1:
+                    ids_parts.append(np.asarray(ids))
+                    distance_parts.append(np.asarray(distances))
+            elapsed = (time.perf_counter_ns() - pass_started) / 1_000_000
+            pass_ms.append(elapsed)
+            qps.append(len(queries) * 1_000 / max(elapsed, 1e-12))
             if repeat == repeats - 1:
-                ids_parts.append(np.asarray(ids))
-                distance_parts.append(np.asarray(distances))
-        elapsed = (time.perf_counter_ns() - pass_started) / 1_000_000
-        pass_ms.append(elapsed)
-        qps.append(len(queries) * 1_000 / max(elapsed, 1e-12))
-        if repeat == repeats - 1:
-            final_ids, final_distances = ids_parts, distance_parts
+                final_ids, final_distances = ids_parts, distance_parts
+    finally:
+        if phase_callback is not None:
+            phase_callback("timed", "after")
     measurement = {
         "warmup_passes": warmups,
         "measured_passes": repeats,

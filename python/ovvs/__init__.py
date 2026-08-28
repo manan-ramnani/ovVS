@@ -5,8 +5,48 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-from ctypes import POINTER, c_char_p, c_float, c_int32, c_int64, c_uint8, c_void_p
+from ctypes import POINTER, c_char_p, c_float, c_int32, c_int64, c_uint32, c_uint8, c_void_p
 from pathlib import Path
+
+
+OVVS_IVF_PQ_SEARCH_STATS_ABI_V1 = 1
+_IVFPQ_SEARCH_STATS_COUNTERS = (
+    "successful_calls",
+    "blocks",
+    "queries",
+    "tasks",
+    "candidate_rows",
+    "selected_rows",
+    "total_wall_ns",
+    "coarse_pairwise_ns",
+    "coarse_topk_ns",
+    "planning_ns",
+    "lut_build_ns",
+    "adc_scan_select_ns",
+    "shortlist_select_validate_ns",
+    "refine_gather_ns",
+    "refine_distance_ns",
+    "refine_topk_ns",
+    "gpu_allocation_calls",
+    "gpu_allocation_bytes",
+    "gpu_h2d_calls",
+    "gpu_h2d_bytes",
+    "gpu_d2h_calls",
+    "gpu_d2h_bytes",
+    "gpu_kernel_launches",
+    "gpu_wait_calls",
+)
+
+
+class _IvfPqSearchStatsV1(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", c_uint32),
+        ("struct_size", c_uint32),
+        *((name, c_int64) for name in _IVFPQ_SEARCH_STATS_COUNTERS),
+    ]
+
+
+assert ctypes.sizeof(_IvfPqSearchStatsV1) == 200
 
 
 def _load():
@@ -180,6 +220,16 @@ else:
         POINTER(c_int64),
         POINTER(c_int64),
     ]
+try:
+    _resources_ivfpq_search_stats_v1 = _lib.ovvsResourcesIvfPqSearchStatsV1
+except AttributeError:
+    _resources_ivfpq_search_stats_v1 = None
+else:
+    _resources_ivfpq_search_stats_v1.argtypes = [
+        c_void_p,
+        POINTER(_IvfPqSearchStatsV1),
+    ]
+    _resources_ivfpq_search_stats_v1.restype = c_int32
 _lib.ovvsGemmEx.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -384,6 +434,27 @@ class Resources:
             "direct_walks": int(direct_walks.value),
             "index_upload_calls": int(upload_calls.value),
             "index_upload_bytes": int(upload_bytes.value),
+        }
+
+    def ivfpq_search_stats(self) -> dict[str, int] | None:
+        """Return a coherent cumulative IVF-PQ search telemetry snapshot when supported."""
+        if _resources_ivfpq_search_stats_v1 is None:
+            return None
+        stats = _IvfPqSearchStatsV1()
+        rc = _resources_ivfpq_search_stats_v1(self._h, ctypes.byref(stats))
+        if rc != 0:
+            return None
+        if (
+            int(stats.abi_version) != OVVS_IVF_PQ_SEARCH_STATS_ABI_V1
+            or int(stats.struct_size) != ctypes.sizeof(_IvfPqSearchStatsV1)
+        ):
+            raise RuntimeError(
+                "ovvsResourcesIvfPqSearchStatsV1 returned an incompatible version or size"
+            )
+        return {
+            "abi_version": int(stats.abi_version),
+            "struct_size": int(stats.struct_size),
+            **{name: int(getattr(stats, name)) for name in _IVFPQ_SEARCH_STATS_COUNTERS},
         }
 
     def gemm(self, a, b, m, n, k, trans_b=1, compute_dtype=0):

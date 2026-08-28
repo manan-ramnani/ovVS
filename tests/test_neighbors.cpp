@@ -2,6 +2,7 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -155,6 +156,81 @@ static IvfPqStatsSnapshot ivfpq_stats(ovvsResources_t resources) {
           data->ivfpq_unfiltered_id_copy_bytes_avoided,
           data->ivfpq_selected_id_resolutions,
           data->ivfpq_filtered_code_copy_bytes};
+}
+
+static ovvsIvfPqSearchStatsV1 ivfpq_search_stats_v1(
+    ovvsResources_t resources) {
+  ovvsIvfPqSearchStatsV1 stats{};
+  expect_status(ovvsResourcesIvfPqSearchStatsV1(resources, &stats),
+                "IVF-PQ V1 search telemetry");
+  expect(stats.abi_version == OVVS_IVF_PQ_SEARCH_STATS_ABI_V1,
+         "IVF-PQ search telemetry ABI version");
+  expect(stats.struct_size == sizeof(ovvsIvfPqSearchStatsV1),
+         "IVF-PQ search telemetry structure size");
+  return stats;
+}
+
+static std::array<int64_t, 24> ivfpq_search_counters(
+    const ovvsIvfPqSearchStatsV1& stats) {
+  return {
+      stats.successful_calls,
+      stats.blocks,
+      stats.queries,
+      stats.tasks,
+      stats.candidate_rows,
+      stats.selected_rows,
+      stats.total_wall_ns,
+      stats.coarse_pairwise_ns,
+      stats.coarse_topk_ns,
+      stats.planning_ns,
+      stats.lut_build_ns,
+      stats.adc_scan_select_ns,
+      stats.shortlist_select_validate_ns,
+      stats.refine_gather_ns,
+      stats.refine_distance_ns,
+      stats.refine_topk_ns,
+      stats.gpu_allocation_calls,
+      stats.gpu_allocation_bytes,
+      stats.gpu_h2d_calls,
+      stats.gpu_h2d_bytes,
+      stats.gpu_d2h_calls,
+      stats.gpu_d2h_bytes,
+      stats.gpu_kernel_launches,
+      stats.gpu_wait_calls,
+  };
+}
+
+static void expect_ivfpq_search_stats_zero(
+    const ovvsIvfPqSearchStatsV1& stats, const std::string& label) {
+  const auto counters = ivfpq_search_counters(stats);
+  expect(std::all_of(counters.begin(), counters.end(),
+                     [](int64_t value) { return value == 0; }),
+         label + " counters must all be zero");
+}
+
+static void expect_ivfpq_search_stats_equal(
+    const ovvsIvfPqSearchStatsV1& actual,
+    const ovvsIvfPqSearchStatsV1& expected, const std::string& label) {
+  expect(actual.abi_version == expected.abi_version &&
+             actual.struct_size == expected.struct_size &&
+             ivfpq_search_counters(actual) == ivfpq_search_counters(expected),
+         label);
+}
+
+static void expect_ivfpq_search_stats_nonnegative(
+    const ovvsIvfPqSearchStatsV1& stats, const std::string& label) {
+  const auto counters = ivfpq_search_counters(stats);
+  expect(std::all_of(counters.begin(), counters.end(),
+                     [](int64_t value) { return value >= 0; }),
+         label + " counters must all be nonnegative");
+}
+
+static int64_t ivfpq_named_stage_ns(
+    const ovvsIvfPqSearchStatsV1& stats) {
+  return stats.coarse_pairwise_ns + stats.coarse_topk_ns + stats.planning_ns +
+         stats.lut_build_ns + stats.adc_scan_select_ns +
+         stats.shortlist_select_validate_ns + stats.refine_gather_ns +
+         stats.refine_distance_ns + stats.refine_topk_ns;
 }
 
 struct PqAdcStatsSnapshot {
@@ -691,6 +767,262 @@ OVVS_TEST(ivf_pq_recall) {
   expect_status(ovvsIvfPqExtend(res.r, loaded, extra.data(), 4), "pqext");
   ovvsIvfPqDestroy(loaded);
   ovvsIvfPqDestroy(ix);
+}
+
+OVVS_TEST(ivf_pq_search_telemetry_v1_cpu_atomicity_and_blocks) {
+  Res builder;
+  expect_status(ovvsResourcesSetPolicy(builder.r, OVVS_POLICY_FORCE_CPU),
+                "telemetry fixture CPU build policy");
+  constexpr int64_t n = 65;
+  constexpr int64_t dim = 8;
+  constexpr int64_t nq = 33;
+  constexpr int32_t nlist = 65;
+  auto data = make_data(n, dim, 230);
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(builder.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, 4, 4, &index),
+                "telemetry fixture build");
+
+  /* Find a one-row list through public behavior so the 33-query call below is
+     deterministically split only by the 32-query block limit. */
+  Res probe;
+  expect_status(ovvsResourcesSetPolicy(probe.r, OVVS_POLICY_FORCE_CPU),
+                "telemetry singleton probe policy");
+  int64_t singleton_id = -1;
+  for (int64_t row = 0; row < n; ++row) {
+    int64_t id = -1;
+    float distance = -1.f;
+    const auto before = ivfpq_search_stats_v1(probe.r);
+    expect_status(ovvsIvfPqSearch(probe.r, index, data.data() + row * dim, 1,
+                                  1, 1, 1, nullptr, &id, &distance),
+                  "telemetry singleton probe search");
+    const auto after = ivfpq_search_stats_v1(probe.r);
+    if (after.candidate_rows == before.candidate_rows + 1 && id == row &&
+        std::fabs(distance) < 1e-6f) {
+      singleton_id = row;
+      break;
+    }
+  }
+  expect(singleton_id >= 0,
+         "telemetry fixture must contain an in-range singleton list");
+
+  Res res;
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "telemetry CPU policy");
+  const auto initial = ivfpq_search_stats_v1(res.r);
+  expect(initial.abi_version == 1u && initial.struct_size == 200u,
+         "initial IVF-PQ telemetry must expose the frozen V1/200-byte ABI");
+  expect_ivfpq_search_stats_zero(initial, "initial IVF-PQ telemetry");
+
+  std::vector<float> queries(static_cast<size_t>(nq * dim));
+  for (int64_t query = 0; query < nq; ++query) {
+    std::memcpy(queries.data() + static_cast<size_t>(query * dim),
+                data.data() + static_cast<size_t>(singleton_id * dim),
+                static_cast<size_t>(dim) * sizeof(float));
+  }
+  std::vector<int64_t> ids(static_cast<size_t>(nq), -1);
+  std::vector<float> distances(static_cast<size_t>(nq), -1.f);
+  expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, 1, 1, 1,
+                                nullptr, ids.data(), distances.data()),
+                "telemetry 32+1 CPU search");
+  expect(std::all_of(ids.begin(), ids.end(), [&](int64_t id) {
+           return id == singleton_id;
+         }) &&
+             std::all_of(distances.begin(), distances.end(), [](float value) {
+               return std::fabs(value) < 1e-6f;
+             }),
+         "telemetry 32+1 fixture must preserve singleton results");
+
+  const auto success = ivfpq_search_stats_v1(res.r);
+  expect_ivfpq_search_stats_nonnegative(success,
+                                        "successful CPU IVF-PQ telemetry");
+  expect(success.successful_calls == 1 && success.queries == nq,
+         "one successful CPU search must record its complete query batch");
+  expect(success.blocks == 2,
+         "33 singleton queries must execute as one 32-query block plus one tail block");
+  expect(success.tasks == nq && success.candidate_rows == nq &&
+             success.selected_rows == nq,
+         "singleton telemetry must record one task, candidate, and refinement row per query");
+  expect(success.blocks > 0 && success.blocks <= success.queries &&
+             success.tasks >= success.blocks &&
+             success.selected_rows > 0 &&
+             success.selected_rows <= success.candidate_rows,
+         "CPU IVF-PQ structural counters must be logically bounded");
+  expect(ivfpq_named_stage_ns(success) <= success.total_wall_ns,
+         "non-overlapping IVF-PQ stage time must not exceed complete-call wall time");
+  expect(success.gpu_allocation_calls == 0 &&
+             success.gpu_allocation_bytes == 0 && success.gpu_h2d_calls == 0 &&
+             success.gpu_h2d_bytes == 0 && success.gpu_d2h_calls == 0 &&
+             success.gpu_d2h_bytes == 0 && success.gpu_kernel_launches == 0 &&
+             success.gpu_wait_calls == 0,
+         "FORCE_CPU IVF-PQ search must publish no GPU work");
+
+  expect(ovvsIvfPqSearch(res.r, index, nullptr, nq, 1, 1, 1, nullptr,
+                         ids.data(), distances.data()) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "invalid IVF-PQ search must fail");
+  const auto after_failure = ivfpq_search_stats_v1(res.r);
+  expect_ivfpq_search_stats_equal(
+      after_failure, success,
+      "failed IVF-PQ search must not change cumulative V1 telemetry");
+
+  ovvsIvfPqDestroy(index);
+}
+
+OVVS_TEST(ivf_pq_search_telemetry_v1_gpu_parity_and_atomicity) {
+  Res cpu;
+  Res gpu;
+  require_ivfpq_test_gpu(gpu.r);
+  constexpr int64_t n = 65;
+  constexpr int64_t dim = 8;
+  constexpr int64_t nq = 5;
+  constexpr int64_t k = 5;
+  constexpr int32_t nlist = 7;
+  auto data = make_data(n, dim, 231);
+  auto queries = make_data(nq, dim, 232);
+
+  expect_status(ovvsResourcesSetPolicy(cpu.r, OVVS_POLICY_FORCE_CPU),
+                "GPU telemetry fixture CPU policy");
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(cpu.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, 4, 4, &index),
+                "GPU telemetry fixture build");
+  expect_status(ovvsResourcesSetPolicy(gpu.r, OVVS_POLICY_FORCE_GPU),
+                "GPU telemetry policy");
+  expect_ivfpq_search_stats_zero(ivfpq_search_stats_v1(gpu.r),
+                                 "initial GPU IVF-PQ telemetry");
+
+  std::vector<int64_t> cpu_ids(static_cast<size_t>(nq * k), -1);
+  std::vector<int64_t> gpu_ids(static_cast<size_t>(nq * k), -1);
+  std::vector<float> cpu_distances(static_cast<size_t>(nq * k), -1.f);
+  std::vector<float> gpu_distances(static_cast<size_t>(nq * k), -1.f);
+  expect_status(ovvsIvfPqSearch(cpu.r, index, queries.data(), nq, k, nlist,
+                                16, nullptr, cpu_ids.data(),
+                                cpu_distances.data()),
+                "GPU telemetry CPU reference search");
+  expect_status(ovvsIvfPqSearch(gpu.r, index, queries.data(), nq, k, nlist,
+                                16, nullptr, gpu_ids.data(),
+                                gpu_distances.data()),
+                "GPU telemetry FORCE_GPU search");
+  expect_ivfpq_results_equal(gpu_ids, gpu_distances, cpu_ids, cpu_distances,
+                             "GPU telemetry result parity");
+
+  const auto success = ivfpq_search_stats_v1(gpu.r);
+  expect_ivfpq_search_stats_nonnegative(success,
+                                        "successful GPU IVF-PQ telemetry");
+  expect(success.successful_calls == 1 && success.queries == nq &&
+             success.blocks > 0 && success.tasks > 0 &&
+             success.candidate_rows > 0 && success.selected_rows > 0 &&
+             success.selected_rows <= success.candidate_rows,
+         "successful GPU telemetry must describe the complete search");
+  expect(ivfpq_named_stage_ns(success) <= success.total_wall_ns,
+         "GPU IVF-PQ stage time must not exceed complete-call wall time");
+  expect(success.gpu_allocation_calls > 0 &&
+             success.gpu_allocation_bytes > 0 &&
+             success.gpu_kernel_launches > 0 && success.gpu_wait_calls > 0,
+         "FORCE_GPU telemetry must observe allocations, launches, and waits");
+  ovvsDevice last = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(gpu.r, &last),
+                "GPU telemetry last device");
+  expect(last == OVVS_DEVICE_GPU,
+         "successful FORCE_GPU telemetry search must retain GPU attribution");
+
+  const int64_t id_canary = INT64_C(0x123456789abcdef);
+  const float distance_canary = -9123.5f;
+  std::fill(gpu_ids.begin(), gpu_ids.end(), id_canary);
+  std::fill(gpu_distances.begin(), gpu_distances.end(), distance_canary);
+  expect(ovvsIvfPqSearch(gpu.r, index, queries.data(), nq, k, nlist, 129,
+                         nullptr, gpu_ids.data(), gpu_distances.data()) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "unsupported forced-GPU refinement width must fail closed");
+  expect(std::all_of(gpu_ids.begin(), gpu_ids.end(), [&](int64_t value) {
+           return value == id_canary;
+         }) &&
+             std::all_of(gpu_distances.begin(), gpu_distances.end(),
+                         [&](float value) { return value == distance_canary; }),
+         "failed forced-GPU search must preserve caller outputs");
+  expect_ivfpq_search_stats_equal(
+      ivfpq_search_stats_v1(gpu.r), success,
+      "failed forced-GPU search must publish no partial V1 telemetry");
+
+  ovvsIvfPqDestroy(index);
+}
+
+OVVS_TEST(ivf_pq_search_telemetry_v1_resource_isolation) {
+  Res resource_a;
+  Res resource_b;
+  expect_status(ovvsResourcesSetPolicy(resource_a.r, OVVS_POLICY_FORCE_CPU),
+                "isolated telemetry resource A policy");
+  expect_status(ovvsResourcesSetPolicy(resource_b.r, OVVS_POLICY_FORCE_CPU),
+                "isolated telemetry resource B policy");
+  constexpr int64_t n = 64;
+  constexpr int64_t dim = 8;
+  constexpr int64_t k = 4;
+  constexpr int64_t nq_a = 2;
+  constexpr int64_t nq_b = 3;
+  constexpr int32_t nlist = 8;
+  auto data = make_data(n, dim, 233);
+  auto queries_a = make_data(nq_a, dim, 234);
+  auto queries_b = make_data(nq_b, dim, 235);
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(resource_a.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, 4, 4, &index),
+                "isolated telemetry fixture build");
+  expect_ivfpq_search_stats_zero(ivfpq_search_stats_v1(resource_a.r),
+                                 "initial resource A telemetry");
+  expect_ivfpq_search_stats_zero(ivfpq_search_stats_v1(resource_b.r),
+                                 "initial resource B telemetry");
+
+  std::vector<int64_t> ids_a(static_cast<size_t>(nq_a * k), -1);
+  std::vector<int64_t> ids_b(static_cast<size_t>(nq_b * k), -1);
+  std::vector<float> distances_a(static_cast<size_t>(nq_a * k), -1.f);
+  std::vector<float> distances_b(static_cast<size_t>(nq_b * k), -1.f);
+  ovvsStatus status_a = OVVS_STATUS_ERROR;
+  ovvsStatus status_b = OVVS_STATUS_ERROR;
+  std::latch start(2);
+  std::thread thread_a([&] {
+    start.arrive_and_wait();
+    status_a = ovvsIvfPqSearch(resource_a.r, index, queries_a.data(), nq_a, k,
+                                nlist, 16, nullptr, ids_a.data(),
+                                distances_a.data());
+  });
+  std::thread thread_b([&] {
+    start.arrive_and_wait();
+    status_b = ovvsIvfPqSearch(resource_b.r, index, queries_b.data(), nq_b, k,
+                                nlist, 16, nullptr, ids_b.data(),
+                                distances_b.data());
+  });
+  thread_a.join();
+  thread_b.join();
+  expect_status(status_a, "concurrent telemetry resource A search");
+  expect_status(status_b, "concurrent telemetry resource B search");
+
+  const auto after_a = ivfpq_search_stats_v1(resource_a.r);
+  const auto after_b = ivfpq_search_stats_v1(resource_b.r);
+  expect(after_a.successful_calls == 1 && after_a.queries == nq_a,
+         "resource A telemetry must contain only resource A queries");
+  expect(after_b.successful_calls == 1 && after_b.queries == nq_b,
+         "resource B telemetry must contain only resource B queries");
+  expect_ivfpq_search_stats_nonnegative(after_a,
+                                        "isolated resource A telemetry");
+  expect_ivfpq_search_stats_nonnegative(after_b,
+                                        "isolated resource B telemetry");
+
+  int64_t extra_ids[k] = {};
+  float extra_distances[k] = {};
+  expect_status(ovvsIvfPqSearch(resource_a.r, index, queries_a.data(), 1, k,
+                                nlist, 16, nullptr, extra_ids,
+                                extra_distances),
+                "resource A cumulative telemetry search");
+  const auto cumulative_a = ivfpq_search_stats_v1(resource_a.r);
+  expect(cumulative_a.successful_calls == 2 &&
+             cumulative_a.queries == nq_a + 1,
+         "resource A telemetry must accumulate its second search");
+  expect_ivfpq_search_stats_equal(
+      ivfpq_search_stats_v1(resource_b.r), after_b,
+      "resource A search must not mutate resource B telemetry");
+
+  ovvsIvfPqDestroy(index);
 }
 
 OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {

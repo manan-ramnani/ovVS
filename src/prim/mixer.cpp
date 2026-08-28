@@ -88,8 +88,9 @@ ovvsStatus prim_gemm_compute(ResourcesData& r, const float* a, const float* b, f
   return OVVS_STATUS_SUCCESS;
 }
 
-ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-                     int64_t k, bool trans_b) {
+ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c,
+                     int64_t m, int64_t n, int64_t k, bool trans_b,
+                     GpuWorkStats* stats) {
   r.last_compute_dtype = OVVS_DTYPE_F32;
   const ovvsDevice d = choose_device(r, "gemm", m * n * k);
   if (d == OVVS_DEVICE_NPU) {
@@ -100,7 +101,7 @@ ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c,
     if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
   }
   if (d == OVVS_DEVICE_GPU || (d == OVVS_DEVICE_NPU && r.policy != OVVS_POLICY_FORCE_CPU)) {
-    if (gpu_gemm(r, a, b, c, m, n, k, trans_b)) {
+    if (gpu_gemm(r, a, b, c, m, n, k, trans_b, stats)) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;
     }
@@ -116,7 +117,8 @@ ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c,
 }
 
 ovvsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
-                     int64_t* indices, float* values, bool largest) {
+                     int64_t* indices, float* values, bool largest,
+                     GpuWorkStats* stats) {
   const ovvsDevice d = choose_device(r, "topk", rows * cols);
   if (d == OVVS_DEVICE_NPU) {
     if (npu_topk(r, scores, rows, cols, k, indices, values, largest)) {
@@ -126,7 +128,7 @@ ovvsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_
     if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
   }
   if (d == OVVS_DEVICE_GPU || (d == OVVS_DEVICE_NPU && r.policy != OVVS_POLICY_FORCE_CPU)) {
-    if (gpu_topk(r, scores, rows, cols, k, indices, values, largest)) {
+    if (gpu_topk(r, scores, rows, cols, k, indices, values, largest, stats)) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;
     }
@@ -141,7 +143,8 @@ ovvsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_
 }
 
 ovvsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
-                            const int64_t* idx, int64_t nidx, float* out) {
+                            const int64_t* idx, int64_t nidx, float* out,
+                            GpuWorkStats* stats) {
   const ovvsDevice d = choose_device(r, "gather", nidx * dim);
   if (d == OVVS_DEVICE_NPU) {
     if (npu_gather_rows(r, src, src_rows, dim, idx, nidx, out)) {
@@ -151,7 +154,7 @@ ovvsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows
     if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
   }
   if (d == OVVS_DEVICE_GPU || (d == OVVS_DEVICE_NPU && r.policy != OVVS_POLICY_FORCE_CPU)) {
-    if (gpu_gather_rows(r, src, src_rows, dim, idx, nidx, out)) {
+    if (gpu_gather_rows(r, src, src_rows, dim, idx, nidx, out, stats)) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;
     }
@@ -166,13 +169,14 @@ ovvsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows
 }
 
 ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx,
-                         const float* y, int64_t ny, int64_t dim, float* out, float metric_arg) {
+                         const float* y, int64_t ny, int64_t dim, float* out,
+                         float metric_arg, GpuWorkStats* stats) {
   if (metric == OVVS_METRIC_L2_EXPANDED || metric == OVVS_METRIC_INNER_PRODUCT ||
       metric == OVVS_METRIC_COSINE_EXPANDED) {
     std::vector<float> xnorm(static_cast<size_t>(nx)), ynorm(static_cast<size_t>(ny));
     for (int64_t i = 0; i < nx; ++i) xnorm[static_cast<size_t>(i)] = nrm2sq(x + i * dim, dim);
     for (int64_t j = 0; j < ny; ++j) ynorm[static_cast<size_t>(j)] = nrm2sq(y + j * dim, dim);
-    const ovvsStatus gs = prim_gemm(r, x, y, out, nx, ny, dim, true);
+    const ovvsStatus gs = prim_gemm(r, x, y, out, nx, ny, dim, true, stats);
     if (gs != OVVS_STATUS_SUCCESS) return gs;
     for (int64_t i = 0; i < nx; ++i) {
       for (int64_t j = 0; j < ny; ++j) {
@@ -199,7 +203,7 @@ ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, in
     if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
   }
   if (d == OVVS_DEVICE_GPU || (d == OVVS_DEVICE_NPU && r.policy != OVVS_POLICY_FORCE_CPU)) {
-    if (gpu_pairwise(r, metric, x, nx, y, ny, dim, out, metric_arg)) {
+    if (gpu_pairwise(r, metric, x, nx, y, ny, dim, out, metric_arg, stats)) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;
     }
@@ -405,7 +409,8 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
                                   const uint8_t* packed_codes, int64_t packed_rows,
                                   const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
                                   int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
-                                  int32_t* packed_positions, int32_t* counts) {
+                                  int32_t* packed_positions, int32_t* counts,
+                                  GpuWorkStats* stats) {
   /* No SKU/shape table promotes this fused path yet. FORCE_CPU, FORCE_NPU,
      NPU_IF_FASTER, AUTO, GPU_IF_FASTER, and HETERO keep the existing ADC/select
      route until matched end-to-end evidence names the GPU as winner. */
@@ -414,7 +419,7 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
   const ovvsStatus status = gpu_ivfpq_scan_select(
       r, tasks, task_count, luts, lut_elements, packed_ids, packed_codes,
       packed_rows, allow_bitset, allow_bitset_bytes, nq, pq_m, ks, krefine,
-      packed_positions, counts);
+      packed_positions, counts, stats);
   if (status == OVVS_STATUS_SUCCESS) {
     r.last_device = OVVS_DEVICE_GPU;
     return OVVS_STATUS_SUCCESS;

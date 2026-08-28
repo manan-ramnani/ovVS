@@ -56,7 +56,7 @@ struct ThreadUsmScratch {
 };
 
 template <typename T>
-static T* usm_scratch(size_t n) {
+static T* usm_scratch(size_t n, GpuWorkStats* stats = nullptr) {
   /* A search can run on multiple resources concurrently. Keep each worker's
      reusable scratch independent; every caller waits before returning it. The
      queue/context holder drains and frees the thread's high-water allocation. */
@@ -68,22 +68,33 @@ static T* usm_scratch(size_t n) {
       scratch.ptr = nullptr;
       scratch.capacity = 0;
     }
+    if (stats) stats->allocation(n, sizeof(T));
     scratch.ptr = sycl::malloc_shared<T>(n, q);
     scratch.capacity = scratch.ptr ? n : 0;
   }
   return scratch.ptr;
 }
 
-static float* usm_f(size_t n) { return usm_scratch<float>(n); }
-static int64_t* usm_i64(size_t n) { return usm_scratch<int64_t>(n); }
-static sycl::half* usm_h(size_t n) { return usm_scratch<sycl::half>(n); }
-static std::int8_t* usm_i8(size_t n) { return usm_scratch<std::int8_t>(n); }
+static float* usm_f(size_t n, GpuWorkStats* stats = nullptr) {
+  return usm_scratch<float>(n, stats);
+}
+static int64_t* usm_i64(size_t n, GpuWorkStats* stats = nullptr) {
+  return usm_scratch<int64_t>(n, stats);
+}
+static sycl::half* usm_h(size_t n, GpuWorkStats* stats = nullptr) {
+  return usm_scratch<sycl::half>(n, stats);
+}
+static std::int8_t* usm_i8(size_t n, GpuWorkStats* stats = nullptr) {
+  return usm_scratch<std::int8_t>(n, stats);
+}
 
 template <typename T>
 class ScopedDeviceUsm {
  public:
-  ScopedDeviceUsm(sycl::queue& q, size_t count) : q_(&q) {
+  ScopedDeviceUsm(sycl::queue& q, size_t count, GpuWorkStats* stats = nullptr)
+      : q_(&q), stats_(stats) {
     if (count != 0) {
+      if (stats_) stats_->allocation(count, sizeof(T));
       ptr_ = sycl::malloc_device<T>(count, q);
       if (!ptr_) throw std::bad_alloc();
     }
@@ -95,6 +106,7 @@ class ScopedDeviceUsm {
   ~ScopedDeviceUsm() noexcept {
     if (!ptr_) return;
     try {
+      if (stats_) stats_->wait();
       q_->wait_and_throw();
     } catch (...) {
       /* Waiting still drains submitted work before storage is released. */
@@ -110,6 +122,7 @@ class ScopedDeviceUsm {
  private:
   sycl::queue* q_ = nullptr;
   T* ptr_ = nullptr;
+  GpuWorkStats* stats_ = nullptr;
 };
 
 static bool gpu_pointer_accessible(sycl::queue& q, const void* ptr) {
@@ -249,8 +262,9 @@ bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n) {
 }
 
 #if defined(OVVS_WITH_SYCL)
-static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
-                          bool trans_b) {
+static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m,
+                          int64_t n, int64_t k, bool trans_b,
+                          GpuWorkStats* stats = nullptr) {
   auto& q = gpu_queue();
   const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
   const size_t bsz = trans_b ? N * K : K * N;
@@ -261,7 +275,7 @@ static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, i
   if (!a_usm) scratch_n += M * K;
   if (!b_usm) scratch_n += bsz;
   if (!c_usm) scratch_n += M * N;
-  float* scratch = scratch_n ? usm_f(scratch_n) : nullptr;
+  float* scratch = scratch_n ? usm_f(scratch_n, stats) : nullptr;
   if (scratch_n && !scratch) return false;
   float* sp = scratch;
   float* A = a_usm ? const_cast<float*>(a) : (std::memcpy(sp, a, M * K * sizeof(float)), sp);
@@ -270,6 +284,7 @@ static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, i
   if (!b_usm) sp += bsz;
   float* C = c_usm ? c : sp;
   const bool tb = trans_b;
+  if (stats) stats->kernel();
   q.parallel_for(sycl::range<2>(M, N), [=](sycl::id<2> id) {
     const size_t i = id[0];
     const size_t j = id[1];
@@ -281,14 +296,16 @@ static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, i
     }
     C[i * N + j] = s;
   });
+  if (stats) stats->wait();
   q.wait_and_throw();
   if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
   return true;
 }
 
 #if defined(OVVS_WITH_MKL)
-static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, int64_t n, int64_t k,
-                         bool trans_b) {
+static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m,
+                         int64_t n, int64_t k, bool trans_b,
+                         GpuWorkStats* stats = nullptr) {
   auto& q = gpu_queue();
   const size_t M = static_cast<size_t>(m), N = static_cast<size_t>(n), K = static_cast<size_t>(k);
   const size_t bsz = trans_b ? N * K : K * N;
@@ -299,7 +316,7 @@ static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, in
   if (!a_usm) scratch_n += M * K;
   if (!b_usm) scratch_n += bsz;
   if (!c_usm) scratch_n += M * N;
-  float* scratch = scratch_n ? usm_f(scratch_n) : nullptr;
+  float* scratch = scratch_n ? usm_f(scratch_n, stats) : nullptr;
   if (scratch_n && !scratch) return false;
   float* sp = scratch;
   float* A = a_usm ? const_cast<float*>(a) : (std::memcpy(sp, a, M * K * sizeof(float)), sp);
@@ -312,7 +329,9 @@ static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, in
   const std::int64_t lda = static_cast<std::int64_t>(K);
   const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
   const std::int64_t ldc = static_cast<std::int64_t>(N);
+  if (stats) stats->kernel();
   oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, 1.f, A, lda, B, ldb, 0.f, C, ldc);
+  if (stats) stats->wait();
   q.wait_and_throw();
   if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
   return true;
@@ -379,40 +398,49 @@ static bool gemm_mkl_i8(const float* a, const float* b, float* c, int64_t m, int
 
 enum class GpuGemmKind { Unset, Mkl, Sycl };
 static GpuGemmKind g_gpu_gemm = GpuGemmKind::Unset;
+static std::once_flag g_gpu_gemm_once;
 
-static void pick_gpu_gemm() {
-  if (g_gpu_gemm != GpuGemmKind::Unset) return;
-  g_gpu_gemm = GpuGemmKind::Sycl;
-#if defined(OVVS_WITH_MKL)
-  try {
-    const int64_t m = 64, n = 128, k = 32;
-    std::vector<float> A(static_cast<size_t>(m * k), 0.1f), B(static_cast<size_t>(n * k), 0.2f);
-    std::vector<float> Cm(static_cast<size_t>(m * n), 0.f), Cs(static_cast<size_t>(m * n), 0.f);
-    const auto t0 = std::chrono::steady_clock::now();
-    const bool mok = gemm_mkl_usm(A.data(), B.data(), Cm.data(), m, n, k, true);
-    const auto t1 = std::chrono::steady_clock::now();
-    const bool sok = gemm_sycl_usm(A.data(), B.data(), Cs.data(), m, n, k, true);
-    const auto t2 = std::chrono::steady_clock::now();
-    if (mok && sok) {
-      bool close = true;
-      for (size_t i = 0; i < Cm.size(); ++i) {
-        if (std::fabs(Cm[i] - Cs[i]) > 2e-2f) {
-          close = false;
-          break;
-        }
-      }
-      const double mkl_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-      const double sycl_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-      g_gpu_gemm = (close && mkl_ms <= sycl_ms) ? GpuGemmKind::Mkl : GpuGemmKind::Sycl;
-      if (!close) g_gpu_gemm = GpuGemmKind::Sycl;
-    } else if (mok) {
-      g_gpu_gemm = GpuGemmKind::Mkl;
-    }
-    (void)sok;
-  } catch (...) {
+static void pick_gpu_gemm(GpuWorkStats* stats = nullptr) {
+  std::call_once(g_gpu_gemm_once, [stats] {
     g_gpu_gemm = GpuGemmKind::Sycl;
-  }
+#if defined(OVVS_WITH_MKL)
+    try {
+      const int64_t m = 64, n = 128, k = 32;
+      std::vector<float> A(static_cast<size_t>(m * k), 0.1f);
+      std::vector<float> B(static_cast<size_t>(n * k), 0.2f);
+      std::vector<float> Cm(static_cast<size_t>(m * n), 0.f);
+      std::vector<float> Cs(static_cast<size_t>(m * n), 0.f);
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool mok =
+          gemm_mkl_usm(A.data(), B.data(), Cm.data(), m, n, k, true, stats);
+      const auto t1 = std::chrono::steady_clock::now();
+      const bool sok =
+          gemm_sycl_usm(A.data(), B.data(), Cs.data(), m, n, k, true, stats);
+      const auto t2 = std::chrono::steady_clock::now();
+      if (mok && sok) {
+        bool close = true;
+        for (size_t i = 0; i < Cm.size(); ++i) {
+          if (std::fabs(Cm[i] - Cs[i]) > 2e-2f) {
+            close = false;
+            break;
+          }
+        }
+        const double mkl_ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double sycl_ms =
+            std::chrono::duration<double, std::milli>(t2 - t1).count();
+        g_gpu_gemm =
+            (close && mkl_ms <= sycl_ms) ? GpuGemmKind::Mkl : GpuGemmKind::Sycl;
+        if (!close) g_gpu_gemm = GpuGemmKind::Sycl;
+      } else if (mok) {
+        g_gpu_gemm = GpuGemmKind::Mkl;
+      }
+      (void)sok;
+    } catch (...) {
+      g_gpu_gemm = GpuGemmKind::Sycl;
+    }
 #endif
+  });
 }
 #endif
 
@@ -485,19 +513,19 @@ bool gpu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const
 }
 
 bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-              int64_t k, bool trans_b) {
+              int64_t k, bool trans_b, GpuWorkStats* stats) {
 #if defined(OVVS_WITH_SYCL)
   try {
-    pick_gpu_gemm();
+    pick_gpu_gemm(stats);
 #if defined(OVVS_WITH_MKL)
     if (g_gpu_gemm == GpuGemmKind::Mkl) {
-      if (gemm_mkl_usm(a, b, c, m, n, k, trans_b)) {
+      if (gemm_mkl_usm(a, b, c, m, n, k, trans_b, stats)) {
         r.last_compute_dtype = OVVS_DTYPE_F32;
         return true;
       }
     }
 #endif
-    if (gemm_sycl_usm(a, b, c, m, n, k, trans_b)) {
+    if (gemm_sycl_usm(a, b, c, m, n, k, trans_b, stats)) {
       r.last_compute_dtype = OVVS_DTYPE_F32;
       return true;
     }
@@ -510,7 +538,7 @@ bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_
 }
 
 bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
-              int64_t* indices, float* values, bool largest) {
+              int64_t* indices, float* values, bool largest, GpuWorkStats* stats) {
 #if defined(OVVS_WITH_SYCL)
   /* Subgroup-friendly per-row partial select on USM shared; correctness first. */
   try {
@@ -519,13 +547,14 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
     const size_t C = static_cast<size_t>(cols);
     const size_t KK = static_cast<size_t>(std::min(k, cols));
     const bool s_usm = ovvs_usm_is_shared(scores);
-    float* S = s_usm ? const_cast<float*>(scores) : usm_f(R * C + R * KK);
-    int64_t* I = usm_i64(R * KK);
+    float* S = s_usm ? const_cast<float*>(scores) : usm_f(R * C + R * KK, stats);
+    int64_t* I = usm_i64(R * KK, stats);
     if (!S || !I) throw std::bad_alloc();
-    float* V = s_usm ? usm_f(R * KK) : (S + R * C);
+    float* V = s_usm ? usm_f(R * KK, stats) : (S + R * C);
     if (!s_usm) std::memcpy(S, scores, R * C * sizeof(float));
     if (!V) throw std::bad_alloc();
     const bool lg = largest;
+    if (stats) stats->kernel();
     q.parallel_for(sycl::range<1>(R), [=](sycl::id<1> rid) {
       const size_t row = rid[0];
       for (size_t t = 0; t < KK; ++t) {
@@ -551,6 +580,7 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
         V[row * KK + t] = best_v;
       }
     });
+    if (stats) stats->wait();
     q.wait_and_throw();
     std::memcpy(indices, I, R * KK * sizeof(int64_t));
     std::memcpy(values, V, R * KK * sizeof(float));
@@ -567,7 +597,8 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
                                  const uint8_t* packed_codes, int64_t packed_rows,
                                  const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
                                  int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
-                                 int32_t* packed_positions, int32_t* counts) {
+                                 int32_t* packed_positions, int32_t* counts,
+                                 GpuWorkStats* stats) {
   (void)r;
 #if defined(OVVS_WITH_SYCL)
   constexpr size_t kWorkGroupSize = 128;
@@ -667,34 +698,41 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
     }
     if (cursor != task_count) return OVVS_STATUS_INVALID_ARGUMENT;
 
-    ScopedDeviceUsm<IvfPqScanTask> device_tasks(q, static_cast<size_t>(task_count));
-    ScopedDeviceUsm<float> device_luts(q, static_cast<size_t>(lut_elements));
-    ScopedDeviceUsm<uint8_t> device_allow(q, static_cast<size_t>(allow_bitset_bytes));
-    ScopedDeviceUsm<int32_t> device_query_offsets(q, static_cast<size_t>(nq) + 1);
+    ScopedDeviceUsm<IvfPqScanTask> device_tasks(q, static_cast<size_t>(task_count), stats);
+    ScopedDeviceUsm<float> device_luts(q, static_cast<size_t>(lut_elements), stats);
+    ScopedDeviceUsm<uint8_t> device_allow(q, static_cast<size_t>(allow_bitset_bytes), stats);
+    ScopedDeviceUsm<int32_t> device_query_offsets(q, static_cast<size_t>(nq) + 1, stats);
     ScopedDeviceUsm<float> list_scores(q,
                                        static_cast<size_t>(task_count) *
-                                           static_cast<size_t>(krefine));
+                                           static_cast<size_t>(krefine),
+                                       stats);
     ScopedDeviceUsm<int32_t> list_ordinals(q,
                                            static_cast<size_t>(task_count) *
-                                               static_cast<size_t>(krefine));
+                                               static_cast<size_t>(krefine),
+                                           stats);
     ScopedDeviceUsm<int32_t> list_positions(q,
                                             static_cast<size_t>(task_count) *
-                                                static_cast<size_t>(krefine));
-    ScopedDeviceUsm<int32_t> device_positions(q, output_slots);
-    ScopedDeviceUsm<int32_t> device_counts(q, static_cast<size_t>(nq));
-    ScopedDeviceUsm<int32_t> invalid_input(q, 1);
+                                                static_cast<size_t>(krefine),
+                                            stats);
+    ScopedDeviceUsm<int32_t> device_positions(q, output_slots, stats);
+    ScopedDeviceUsm<int32_t> device_counts(q, static_cast<size_t>(nq), stats);
+    ScopedDeviceUsm<int32_t> invalid_input(q, 1, stats);
 
     std::vector<sycl::event> input_events;
     input_events.reserve(5);
+    if (stats) stats->h2d(static_cast<size_t>(task_count), sizeof(IvfPqScanTask));
     input_events.push_back(q.memcpy(device_tasks.get(), tasks,
                                     static_cast<size_t>(task_count) *
                                         sizeof(IvfPqScanTask)));
+    if (stats) stats->h2d(static_cast<size_t>(lut_elements), sizeof(float));
     input_events.push_back(q.memcpy(device_luts.get(), luts,
                                     static_cast<size_t>(lut_elements) * sizeof(float)));
+    if (stats) stats->h2d(static_cast<size_t>(nq) + 1, sizeof(int32_t));
     input_events.push_back(q.memcpy(device_query_offsets.get(), query_task_offsets.data(),
                                     (static_cast<size_t>(nq) + 1) * sizeof(int32_t)));
     input_events.push_back(q.memset(invalid_input.get(), 0, sizeof(int32_t)));
     if (allow_bitset) {
+      if (stats) stats->h2d(static_cast<size_t>(allow_bitset_bytes));
       input_events.push_back(q.memcpy(device_allow.get(), allow_bitset,
                                       static_cast<size_t>(allow_bitset_bytes)));
     }
@@ -713,6 +751,7 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
     const int32_t K = krefine;
     const int64_t valid_id_rows = packed_rows;
 
+    if (stats) stats->kernel();
     const sycl::event scan_event = q.submit([&](sycl::handler& h) {
       h.depends_on(input_events);
       sycl::local_accessor<float, 1> local_lut(sycl::range<1>(lut_per_task), h);
@@ -847,6 +886,7 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
     const int32_t* const query_offsets = device_query_offsets.get();
     int32_t* const output_positions = device_positions.get();
     int32_t* const output_counts = device_counts.get();
+    if (stats) stats->kernel();
     const sycl::event merge_event = q.submit([&](sycl::handler& h) {
       h.depends_on(scan_event);
       sycl::local_accessor<float, 1> local_scores(sycl::range<1>(kSortCapacity), h);
@@ -936,21 +976,27 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
     std::vector<int32_t> staged_positions(output_slots, -1);
     std::vector<int32_t> staged_counts(static_cast<size_t>(nq), 0);
     int32_t invalid_value = 0;
+    if (stats) stats->d2h(output_slots, sizeof(int32_t));
     sycl::event positions_copy = q.submit([&](sycl::handler& h) {
       h.depends_on(merge_event);
       h.memcpy(staged_positions.data(), output_positions, output_slots * sizeof(int32_t));
     });
+    if (stats) stats->d2h(static_cast<size_t>(nq), sizeof(int32_t));
     sycl::event counts_copy = q.submit([&](sycl::handler& h) {
       h.depends_on(merge_event);
       h.memcpy(staged_counts.data(), output_counts,
                static_cast<size_t>(nq) * sizeof(int32_t));
     });
+    if (stats) stats->d2h(1, sizeof(int32_t));
     sycl::event invalid_copy = q.submit([&](sycl::handler& h) {
       h.depends_on(merge_event);
       h.memcpy(&invalid_value, invalid, sizeof(int32_t));
     });
+    if (stats) stats->wait();
     positions_copy.wait_and_throw();
+    if (stats) stats->wait();
     counts_copy.wait_and_throw();
+    if (stats) stats->wait();
     invalid_copy.wait_and_throw();
     if (invalid_value != 0) return OVVS_STATUS_INVALID_ARGUMENT;
 
@@ -994,12 +1040,14 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
   (void)krefine;
   (void)packed_positions;
   (void)counts;
+  (void)stats;
   return OVVS_STATUS_DEVICE_UNAVAILABLE;
 #endif
 }
 
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
-                     const int64_t* idx, int64_t nidx, float* out) {
+                     const int64_t* idx, int64_t nidx, float* out,
+                     GpuWorkStats* stats) {
 #if defined(OVVS_WITH_SYCL)
   try {
     auto& q = gpu_queue();
@@ -1007,10 +1055,10 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
     const size_t N = static_cast<size_t>(nidx);
     const size_t SR = static_cast<size_t>(src_rows);
     const bool src_usm = ovvs_usm_is_shared(src);
-    float* S = src_usm ? const_cast<float*>(src) : usm_f(SR * D + N * D);
-    int64_t* I = usm_i64(N);
+    float* S = src_usm ? const_cast<float*>(src) : usm_f(SR * D + N * D, stats);
+    int64_t* I = usm_i64(N, stats);
     if (!S || !I) throw std::bad_alloc();
-    float* O = src_usm ? usm_f(N * D) : (S + SR * D);
+    float* O = src_usm ? usm_f(N * D, stats) : (S + SR * D);
     if (!O) throw std::bad_alloc();
     if (!src_usm) std::memcpy(S, src, SR * D * sizeof(float));
     if (ovvs_usm_is_shared(idx)) {
@@ -1018,12 +1066,14 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
     } else {
       std::memcpy(I, idx, N * sizeof(int64_t));
     }
+    if (stats) stats->kernel();
     q.parallel_for(sycl::range<2>(N, D), [=](sycl::id<2> id) {
       const size_t i = id[0];
       const size_t j = id[1];
       const int64_t row = I[i];
       O[i * D + j] = (row >= 0 && static_cast<size_t>(row) < SR) ? S[static_cast<size_t>(row) * D + j] : 0.f;
     });
+    if (stats) stats->wait();
     q.wait_and_throw();
     std::memcpy(out, O, N * D * sizeof(float));
     return true;
@@ -2330,7 +2380,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 }
 
 bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
-                  int64_t ny, int64_t dim, float* out, float metric_arg) {
+                  int64_t ny, int64_t dim, float* out, float metric_arg,
+                  GpuWorkStats* stats) {
 #if defined(OVVS_WITH_SYCL)
   if (metric == OVVS_METRIC_L2_EXPANDED || metric == OVVS_METRIC_INNER_PRODUCT ||
       metric == OVVS_METRIC_COSINE_EXPANDED) {
@@ -2346,7 +2397,7 @@ bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
     if (!x_usm) need += NX * D;
     if (!y_usm) need += NY * D;
     if (!o_usm) need += NX * NY;
-    float* sc = need ? usm_f(need) : nullptr;
+    float* sc = need ? usm_f(need, stats) : nullptr;
     if (need && !sc) throw std::bad_alloc();
     float* sp = sc;
     float* X = x_usm ? const_cast<float*>(x) : (std::memcpy(sp, x, NX * D * sizeof(float)), sp);
@@ -2356,6 +2407,7 @@ bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
     float* O = o_usm ? out : sp;
     const int met = static_cast<int>(metric);
     const float p = metric_arg > 0.f ? metric_arg : 2.f;
+    if (stats) stats->kernel();
     q.parallel_for(sycl::range<2>(NX, NY), [=](sycl::id<2> id) {
       const size_t i = id[0];
       const size_t j = id[1];
@@ -2373,6 +2425,7 @@ bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
         O[i * NY + j] = sycl::pow(s, 1.f / p);
       }
     });
+    if (stats) stats->wait();
     q.wait_and_throw();
     if (!ovvs_usm_is_shared(out)) std::memcpy(out, O, NX * NY * sizeof(float));
     (void)r;
@@ -2390,6 +2443,7 @@ bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
   (void)dim;
   (void)out;
   (void)metric_arg;
+  (void)stats;
   return false;
 #endif
 }

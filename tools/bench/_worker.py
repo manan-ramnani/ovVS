@@ -333,6 +333,152 @@ def _cagra_transfer_snapshot(module: Any, resources: Any) -> Any:
         return None
 
 
+_IVFPQ_SEARCH_STATS_COUNTERS = (
+    "successful_calls",
+    "blocks",
+    "queries",
+    "tasks",
+    "candidate_rows",
+    "selected_rows",
+    "total_wall_ns",
+    "coarse_pairwise_ns",
+    "coarse_topk_ns",
+    "planning_ns",
+    "lut_build_ns",
+    "adc_scan_select_ns",
+    "shortlist_select_validate_ns",
+    "refine_gather_ns",
+    "refine_distance_ns",
+    "refine_topk_ns",
+    "gpu_allocation_calls",
+    "gpu_allocation_bytes",
+    "gpu_h2d_calls",
+    "gpu_h2d_bytes",
+    "gpu_d2h_calls",
+    "gpu_d2h_bytes",
+    "gpu_kernel_launches",
+    "gpu_wait_calls",
+)
+
+_IVFPQ_SEARCH_STAGE_COUNTERS = (
+    "coarse_pairwise_ns",
+    "coarse_topk_ns",
+    "planning_ns",
+    "lut_build_ns",
+    "adc_scan_select_ns",
+    "shortlist_select_validate_ns",
+    "refine_gather_ns",
+    "refine_distance_ns",
+    "refine_topk_ns",
+)
+
+
+def _ivfpq_search_stats_evidence(
+    before: Any,
+    after: Any,
+    scope: str = "unspecified",
+) -> dict[str, Any]:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {
+            "status": "unavailable",
+            "scope": scope,
+            "before": before,
+            "after": after,
+            "reason": "IVF-PQ search telemetry is unavailable",
+        }
+    for snapshot, label in ((before, "before"), (after, "after")):
+        if snapshot.get("abi_version") != 1 or snapshot.get("struct_size") != 200:
+            return {
+                "status": "invalid",
+                "scope": scope,
+                "before": before,
+                "after": after,
+                "reason": f"IVF-PQ {label} telemetry has an incompatible ABI version or size",
+            }
+        if not all(type(snapshot.get(key)) is int for key in _IVFPQ_SEARCH_STATS_COUNTERS):
+            return {
+                "status": "invalid",
+                "scope": scope,
+                "before": before,
+                "after": after,
+                "reason": f"IVF-PQ {label} telemetry is incomplete",
+            }
+        if any(snapshot[key] < 0 for key in _IVFPQ_SEARCH_STATS_COUNTERS):
+            return {
+                "status": "invalid",
+                "scope": scope,
+                "before": before,
+                "after": after,
+                "reason": f"IVF-PQ {label} telemetry contains a negative cumulative counter",
+            }
+    delta = {key: after[key] - before[key] for key in _IVFPQ_SEARCH_STATS_COUNTERS}
+    if any(value < 0 for value in delta.values()):
+        return {
+            "status": "invalid",
+            "scope": scope,
+            "before": before,
+            "after": after,
+            "delta": delta,
+            "reason": "IVF-PQ search telemetry moved backwards",
+        }
+    return {
+        "status": "success",
+        "scope": scope,
+        "before": before,
+        "after": after,
+        "delta": delta,
+    }
+
+
+def _ivfpq_search_stats_snapshot(module: Any, resources: Any) -> Any:
+    try:
+        return ovvs_resource_metadata(module, resources).get("ivfpq_search_stats")
+    except Exception:
+        return None
+
+
+def _ivfpq_search_stats_scopes(
+    snapshots: dict[str, dict[str, Any]],
+    timed_expected_calls: int,
+    timed_expected_queries: int,
+) -> dict[str, Any]:
+    scopes = {
+        scope: _ivfpq_search_stats_evidence(
+            boundaries.get("before"),
+            boundaries.get("after"),
+            scope,
+        )
+        for scope, boundaries in snapshots.items()
+    }
+    timed = scopes["timed"]
+    issues: list[str] = []
+    if timed["status"] == "success":
+        delta = timed["delta"]
+        if (
+            delta["successful_calls"] != timed_expected_calls
+            or delta["queries"] != timed_expected_queries
+        ):
+            issues.append(
+                "timed IVF-PQ telemetry does not match the measured repeat and query counts"
+            )
+        if delta["selected_rows"] > delta["candidate_rows"]:
+            issues.append("timed IVF-PQ telemetry selected more rows than it scanned")
+        if delta["total_wall_ns"] != sum(
+            delta[key] for key in _IVFPQ_SEARCH_STAGE_COUNTERS
+        ):
+            issues.append(
+                "timed IVF-PQ telemetry stage times do not sum to complete-call wall time"
+            )
+    if issues:
+        timed["status"] = "invalid"
+        timed["expected"] = {
+            "successful_calls": timed_expected_calls,
+            "queries": timed_expected_queries,
+        }
+        timed["reason"] = "; ".join(issues)
+    return scopes
+
+
 def _build_record(status: str, policy: str, elapsed_ms: float, last_device: dict[str, Any],
                   before: dict[str, Any], after: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
     reported_devices = (
@@ -466,6 +612,27 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 if lane["algorithm"] == "cagra"
                 else None
             )
+            ivfpq_stats_snapshots = (
+                {scope: {} for scope in ("warmup", "timed", "energy", "complete_point")}
+                if lane["algorithm"] == "ivf-pq"
+                else None
+            )
+            if ivfpq_stats_snapshots is not None:
+                ivfpq_stats_snapshots["complete_point"]["before"] = (
+                    _ivfpq_search_stats_snapshot(module, resources)
+                )
+            timed_batch_count = (
+                (len(queries) + point["query_batch_size"] - 1)
+                // point["query_batch_size"]
+            )
+            timed_expected_calls = spec["profile"]["repeats"] * timed_batch_count
+            timed_expected_queries = spec["profile"]["repeats"] * len(queries)
+
+            def capture_ivfpq_stats(phase: str, boundary: str) -> None:
+                if ivfpq_stats_snapshots is not None:
+                    ivfpq_stats_snapshots[phase][boundary] = (
+                        _ivfpq_search_stats_snapshot(module, resources)
+                    )
 
             def search(batch: Any):
                 nonlocal attribution_failures, search_calls
@@ -478,13 +645,23 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 return result
 
             try:
-                measured, ids, distances = measure_search(
-                    search,
-                    queries,
-                    point["query_batch_size"],
-                    spec["profile"]["warmups"],
-                    spec["profile"]["repeats"],
-                )
+                if ivfpq_stats_snapshots is not None:
+                    measured, ids, distances = measure_search(
+                        search,
+                        queries,
+                        point["query_batch_size"],
+                        spec["profile"]["warmups"],
+                        spec["profile"]["repeats"],
+                        phase_callback=capture_ivfpq_stats,
+                    )
+                else:
+                    measured, ids, distances = measure_search(
+                        search,
+                        queries,
+                        point["query_batch_size"],
+                        spec["profile"]["warmups"],
+                        spec["profile"]["repeats"],
+                    )
                 validation = validate_neighbors(
                     ids, distances, spec["dataset"]["nq"], spec["profile"]["k"], spec["dataset"]["n"]
                 )
@@ -497,7 +674,14 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 status = "success" if validation["status"] == "success" else "failed"
                 if contract["status"] == "mismatch_or_unattributed" and policy in ("cpu", "npu", "gpu"):
                     status = "failed"
-                energy = _energy(spec, resources.energy_uj, search_once, len(queries))
+                if ivfpq_stats_snapshots is not None:
+                    capture_ivfpq_stats("energy", "before")
+                    try:
+                        energy = _energy(spec, resources.energy_uj, search_once, len(queries))
+                    finally:
+                        capture_ivfpq_stats("energy", "after")
+                else:
+                    energy = _energy(spec, resources.energy_uj, search_once, len(queries))
                 transfer = (
                     _cagra_transfer_evidence(
                         transfer_before,
@@ -524,6 +708,25 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 }
                 if transfer is not None:
                     point_result["cagra_transfer"] = transfer
+                if ivfpq_stats_snapshots is not None:
+                    capture_ivfpq_stats("complete_point", "after")
+                    scopes = _ivfpq_search_stats_scopes(
+                        ivfpq_stats_snapshots,
+                        timed_expected_calls,
+                        timed_expected_queries,
+                    )
+                    point_result["ivfpq_search_stats"] = scopes["timed"]
+                    point_result["ivfpq_search_stats_scopes"] = scopes
+                    if scopes["timed"]["status"] == "invalid":
+                        point_result["status"] = "failed"
+                        point_result["reason"] = "; ".join(
+                            reason
+                            for reason in (
+                                point_result.get("reason"),
+                                scopes["timed"].get("reason"),
+                            )
+                            if reason
+                        )
                 points.append(point_result)
             except Exception as exc:
                 failed_point = {
@@ -537,6 +740,15 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                         transfer_before,
                         _cagra_transfer_snapshot(module, resources),
                     )
+                if ivfpq_stats_snapshots is not None:
+                    capture_ivfpq_stats("complete_point", "after")
+                    scopes = _ivfpq_search_stats_scopes(
+                        ivfpq_stats_snapshots,
+                        timed_expected_calls,
+                        timed_expected_queries,
+                    )
+                    failed_point["ivfpq_search_stats"] = scopes["timed"]
+                    failed_point["ivfpq_search_stats_scopes"] = scopes
                 points.append(failed_point)
         if all(point["status"] == "success" for point in points):
             lane_status = "success"

@@ -147,6 +147,47 @@ struct IvfPqScanTask {
   int64_t query_dense_offset = 0;
 };
 
+/* Call-local accounting for GPU work explicitly issued by ovVS. OpenVINO owns
+   its internal transfers and submissions, so those deliberately remain opaque. */
+struct GpuWorkStats {
+  int64_t allocation_calls = 0;
+  int64_t allocation_bytes = 0;
+  int64_t h2d_calls = 0;
+  int64_t h2d_bytes = 0;
+  int64_t d2h_calls = 0;
+  int64_t d2h_bytes = 0;
+  int64_t kernel_launches = 0;
+  int64_t wait_calls = 0;
+
+  static void add(int64_t& value, uint64_t delta) noexcept {
+    const uint64_t room = static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - value);
+    value = delta > room ? std::numeric_limits<int64_t>::max()
+                         : value + static_cast<int64_t>(delta);
+  }
+
+  static uint64_t bytes(size_t count, size_t element_size) noexcept {
+    if (element_size != 0 && count > std::numeric_limits<size_t>::max() / element_size) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(count * element_size);
+  }
+
+  void allocation(size_t count, size_t element_size) noexcept {
+    add(allocation_calls, 1);
+    add(allocation_bytes, bytes(count, element_size));
+  }
+  void h2d(size_t count, size_t element_size = 1) noexcept {
+    add(h2d_calls, 1);
+    add(h2d_bytes, bytes(count, element_size));
+  }
+  void d2h(size_t count, size_t element_size = 1) noexcept {
+    add(d2h_calls, 1);
+    add(d2h_bytes, bytes(count, element_size));
+  }
+  void kernel() noexcept { add(kernel_launches, 1); }
+  void wait() noexcept { add(wait_calls, 1); }
+};
+
 struct ResourcesData {
   ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
@@ -179,6 +220,7 @@ struct ResourcesData {
   int64_t ivfpq_unfiltered_id_copy_bytes_avoided = 0;
   int64_t ivfpq_selected_id_resolutions = 0;
   int64_t ivfpq_filtered_code_copy_bytes = 0;
+  ovvsIvfPqSearchStatsV1 ivfpq_search_stats{};
   std::mutex pq_adc_stats_mutex;
   int64_t pq_adc_calls = 0;
   int64_t pq_adc_logical_tasks = 0;
@@ -269,13 +311,14 @@ bool npu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
 bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out);
 bool gpu_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-              int64_t k, bool trans_b);
+              int64_t k, bool trans_b, GpuWorkStats* stats = nullptr);
 bool gpu_gemm_compute(ResourcesData& r, ovvsDType compute, const float* a, const float* b, float* c,
                       int64_t m, int64_t n, int64_t k, bool trans_b);
 bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
-              int64_t* indices, float* values, bool largest);
+              int64_t* indices, float* values, bool largest, GpuWorkStats* stats = nullptr);
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
-                     const int64_t* idx, int64_t nidx, float* out);
+                     const int64_t* idx, int64_t nidx, float* out,
+                     GpuWorkStats* stats = nullptr);
 bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n);
 ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
                                int64_t dim, ovvsMetric metric, int32_t degree,
@@ -285,7 +328,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances);
 bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
-                  int64_t ny, int64_t dim, float* out, float metric_arg);
+                  int64_t ny, int64_t dim, float* out, float metric_arg,
+                  GpuWorkStats* stats = nullptr);
 bool npu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg);
 bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_count,
@@ -296,7 +340,8 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
                                  const uint8_t* packed_codes, int64_t packed_rows,
                                  const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
                                  int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
-                                 int32_t* packed_positions, int32_t* counts);
+                                 int32_t* packed_positions, int32_t* counts,
+                                 GpuWorkStats* stats = nullptr);
 int32_t sycl_enabled();
 bool sycl_gpu_available();
 bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components);
@@ -313,16 +358,20 @@ void cpu_pairwise(ovvsMetric metric, const float* x, int64_t nx, const float* y,
 
 ovvsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elems);
 
-ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c, int64_t m, int64_t n,
-                     int64_t k, bool trans_b);
+ovvsStatus prim_gemm(ResourcesData& r, const float* a, const float* b, float* c,
+                     int64_t m, int64_t n, int64_t k, bool trans_b,
+                     GpuWorkStats* stats = nullptr);
 ovvsStatus prim_gemm_compute(ResourcesData& r, const float* a, const float* b, float* c, int64_t m,
                              int64_t n, int64_t k, bool trans_b, ovvsDType compute);
 ovvsStatus prim_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols, int64_t k,
-                     int64_t* indices, float* values, bool largest);
+                     int64_t* indices, float* values, bool largest,
+                     GpuWorkStats* stats = nullptr);
 ovvsStatus prim_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
-                            const int64_t* idx, int64_t nidx, float* out);
+                            const int64_t* idx, int64_t nidx, float* out,
+                            GpuWorkStats* stats = nullptr);
 ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx,
-                         const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
+                         const float* y, int64_t ny, int64_t dim, float* out,
+                         float metric_arg, GpuWorkStats* stats = nullptr);
 ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
                        const uint8_t* codes, int64_t ncodes, float* out);
 /* Private C++ test seams; not part of the installed C ABI. */
@@ -339,7 +388,8 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
                                   const uint8_t* packed_codes, int64_t packed_rows,
                                   const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
                                   int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
-                                  int32_t* packed_positions, int32_t* counts);
+                                  int32_t* packed_positions, int32_t* counts,
+                                  GpuWorkStats* stats = nullptr);
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph);

@@ -73,6 +73,40 @@ typedef struct ovvsBinaryQuantizerImpl* ovvsBinaryQuantizer_t;
 typedef struct ovvsSpectralEmbedImpl* ovvsSpectralEmbed_t;
 typedef struct ovvsBatcherImpl* ovvsBatcher_t;
 
+#define OVVS_IVF_PQ_SEARCH_STATS_ABI_V1 1u
+
+/* Resource-local cumulative telemetry for successful IVF-PQ searches. V1 is an immutable
+   200-byte ABI; use a new structure and symbol for future fields. Counters saturate at
+   INT64_MAX. */
+typedef struct ovvsIvfPqSearchStatsV1 {
+  uint32_t abi_version;
+  uint32_t struct_size;
+  int64_t successful_calls;
+  int64_t blocks;
+  int64_t queries;
+  int64_t tasks;
+  int64_t candidate_rows;
+  int64_t selected_rows;
+  int64_t total_wall_ns;
+  int64_t coarse_pairwise_ns;
+  int64_t coarse_topk_ns;
+  int64_t planning_ns;
+  int64_t lut_build_ns;
+  int64_t adc_scan_select_ns;
+  int64_t shortlist_select_validate_ns;
+  int64_t refine_gather_ns;
+  int64_t refine_distance_ns;
+  int64_t refine_topk_ns;
+  int64_t gpu_allocation_calls;
+  int64_t gpu_allocation_bytes;
+  int64_t gpu_h2d_calls;
+  int64_t gpu_h2d_bytes;
+  int64_t gpu_d2h_calls;
+  int64_t gpu_d2h_bytes;
+  int64_t gpu_kernel_launches;
+  int64_t gpu_wait_calls;
+} ovvsIvfPqSearchStatsV1;
+
 /* Concurrent searches may share an immutable index when each worker has a distinct
    Resources object. Do not mutate, serialize, or destroy an index concurrently. */
 
@@ -98,6 +132,8 @@ OVVS_API ovvsStatus ovvsResourcesCagraTransferStats(ovvsResources_t res, int64_t
                                                     int64_t* direct_walks,
                                                     int64_t* upload_calls,
                                                     int64_t* upload_bytes);
+OVVS_API ovvsStatus ovvsResourcesIvfPqSearchStatsV1(ovvsResources_t res,
+                                                    ovvsIvfPqSearchStatsV1* stats);
 OVVS_API ovvsStatus ovvsResourcesSetNpuBusy(ovvsResources_t res, int32_t busy);
 OVVS_API int32_t ovvsSyclEnabled(void);
 /* Package energy in microjoules from Linux RAPL sysfs, Windows EMI (intelppm RAPL),

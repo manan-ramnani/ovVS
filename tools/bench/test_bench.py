@@ -13,7 +13,12 @@ import numpy as np
 import bench
 import _common
 import _worker
-from _worker import _cagra_transfer_evidence, exception_point_status, process_peak_rss
+from _worker import (
+    _cagra_transfer_evidence,
+    _ivfpq_search_stats_evidence,
+    exception_point_status,
+    process_peak_rss,
+)
 from _common import (
     ALGORITHM_ORDER,
     CAGRA_RECALL_GATE_POINTS,
@@ -521,6 +526,90 @@ class PureHelperTests(unittest.TestCase):
         module = SimpleNamespace(_lib=SimpleNamespace(), sycl_enabled=lambda: True)
         self.assertEqual(ovvs_resource_metadata(module, resources)["cagra_transfer_stats"], counters)
 
+    def test_resource_metadata_ivfpq_stats_is_optional_for_older_bindings(self) -> None:
+        resources = SimpleNamespace(_h=None, cagra_transfer_stats=lambda: None)
+        module = SimpleNamespace(_lib=SimpleNamespace(), sycl_enabled=lambda: True)
+        self.assertIsNone(ovvs_resource_metadata(module, resources)["ivfpq_search_stats"])
+
+    def test_ivfpq_stats_delta_is_complete_and_nonnegative(self) -> None:
+        before = {
+            "abi_version": 1,
+            "struct_size": 200,
+            **{key: 0 for key in _worker._IVFPQ_SEARCH_STATS_COUNTERS},
+        }
+        after = dict(before)
+        after.update(successful_calls=3, blocks=6, queries=96, total_wall_ns=1234)
+        evidence = _ivfpq_search_stats_evidence(before, after)
+        self.assertEqual(evidence["status"], "success")
+        self.assertEqual(evidence["delta"]["successful_calls"], 3)
+        self.assertEqual(evidence["delta"]["queries"], 96)
+        self.assertTrue(all(value >= 0 for value in evidence["delta"].values()))
+
+    def test_ivfpq_phase_stats_rejects_backwards_counters(self) -> None:
+        before = {
+            "abi_version": 1,
+            "struct_size": 200,
+            **{key: 5 for key in _worker._IVFPQ_SEARCH_STATS_COUNTERS},
+        }
+        after = dict(before)
+        after["gpu_wait_calls"] = 4
+        evidence = _ivfpq_search_stats_evidence(before, after, "timed")
+        self.assertEqual(evidence["status"], "invalid")
+        self.assertEqual(evidence["scope"], "timed")
+        self.assertEqual(evidence["delta"]["gpu_wait_calls"], -1)
+        self.assertIn("moved backwards", evidence["reason"])
+
+    def test_ivfpq_timed_scope_rejects_wrong_call_and_query_counts(self) -> None:
+        snapshot = {
+            "abi_version": 1,
+            "struct_size": 200,
+            **{key: 0 for key in _worker._IVFPQ_SEARCH_STATS_COUNTERS},
+        }
+        snapshots = {
+            scope: {"before": dict(snapshot), "after": dict(snapshot)}
+            for scope in ("warmup", "timed", "energy", "complete_point")
+        }
+        scopes = _worker._ivfpq_search_stats_scopes(
+            snapshots,
+            timed_expected_calls=5,
+            timed_expected_queries=160,
+        )
+        self.assertEqual(scopes["timed"]["status"], "invalid")
+        self.assertEqual(
+            scopes["timed"]["expected"],
+            {"successful_calls": 5, "queries": 160},
+        )
+        self.assertIn("repeat and query counts", scopes["timed"]["reason"])
+
+    def test_ivfpq_timed_scope_rejects_impossible_rows_and_stage_sum(self) -> None:
+        before = {
+            "abi_version": 1,
+            "struct_size": 200,
+            **{key: 0 for key in _worker._IVFPQ_SEARCH_STATS_COUNTERS},
+        }
+        after = dict(before)
+        after.update(
+            successful_calls=1,
+            queries=1,
+            candidate_rows=1,
+            selected_rows=2,
+            total_wall_ns=10,
+        )
+        snapshots = {
+            scope: {"before": dict(before), "after": dict(after)}
+            for scope in ("warmup", "timed", "energy", "complete_point")
+        }
+
+        scopes = _worker._ivfpq_search_stats_scopes(
+            snapshots,
+            timed_expected_calls=1,
+            timed_expected_queries=1,
+        )
+
+        self.assertEqual(scopes["timed"]["status"], "invalid")
+        self.assertIn("selected more rows", scopes["timed"]["reason"])
+        self.assertIn("do not sum", scopes["timed"]["reason"])
+
 
 class CliAndLaneSemanticsTests(unittest.TestCase):
     def test_no_arg_profile_is_bounded(self) -> None:
@@ -1012,6 +1101,8 @@ class OvvsBuildPolicyTests(unittest.TestCase):
             self.policies: list[int] = []
             self.closed = False
             self.walks = 0
+            self.ivfpq_calls = 0
+            self.ivfpq_queries = 0
 
         def set_policy(self, value: int) -> None:
             self.policies.append(value)
@@ -1030,6 +1121,20 @@ class OvvsBuildPolicyTests(unittest.TestCase):
                 "index_upload_bytes": 0,
             }
 
+        def ivfpq_search_stats(self) -> dict[str, int]:
+            return {
+                "abi_version": 1,
+                "struct_size": 200,
+                **{
+                    key: (
+                        self.ivfpq_calls
+                        if key == "successful_calls"
+                        else self.ivfpq_queries if key == "queries" else 0
+                    )
+                    for key in _worker._IVFPQ_SEARCH_STATS_COUNTERS
+                },
+            }
+
         def close(self) -> None:
             self.closed = True
 
@@ -1041,6 +1146,8 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         def search(self, batch, **kwargs):
             if self.resources is not None:
                 self.resources.walks += 1
+                self.resources.ivfpq_calls += 1
+                self.resources.ivfpq_queries += len(batch)
             return np.asarray([[0]], dtype=np.int64), np.asarray([[0.0]], dtype=np.float32)
 
         def close(self) -> None:
@@ -1224,6 +1331,245 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         self.assertEqual(point["status"], "failed")
         self.assertEqual(point["cagra_transfer"]["delta"]["walks"], 1)
         self.assertEqual(point["cagra_transfer"]["delta"]["direct_walks"], 1)
+
+    def test_ivfpq_timed_delta_excludes_warmup_and_energy_searches(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex(resources)
+        spec = self.spec()
+        spec["profile"].update(krefine=1, warmups=1, repeats=2)
+        spec["energy"] = True
+        queries = np.zeros((1, 2), dtype=np.float32)
+
+        def metadata(_module, current_resources):
+            return {
+                "gpu_available": 1,
+                "npu_available": 1,
+                "npu_compile_fails": 0,
+                "npu_fallbacks": 0,
+                "ivfpq_search_stats": current_resources.ivfpq_search_stats(),
+            }
+
+        def measure(
+            search,
+            _queries,
+            _batch_size,
+            warmups,
+            repeats,
+            phase_callback=None,
+        ):
+            phase_callback("warmup", "before")
+            for _ in range(warmups):
+                search(queries)
+            phase_callback("warmup", "after")
+            phase_callback("timed", "before")
+            for _ in range(repeats):
+                ids, distances = search(queries)
+            phase_callback("timed", "after")
+            return {
+                "pass_latency_ms": {"summary": {"count": repeats}},
+                "qps": {"summary": {"median": 1.0}},
+            }, ids, distances
+
+        def energy(_spec, _reader, search_once, _nq):
+            search_once()
+            return {"status": "success", "microjoules_per_query": 1.0}
+
+        lane = {
+            "id": "ovvs.ivf-pq.gpu",
+            "implementation": "ovvs",
+            "algorithm": "ivf-pq",
+            "policy_key": "gpu",
+            "policy": "FORCE_GPU",
+        }
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), queries)),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(
+                _worker,
+                "point_parameters",
+                return_value=[{"nprobe": 1, "query_batch_size": 1}],
+            ),
+            patch.object(_worker, "measure_search", side_effect=measure),
+            patch.object(_worker, "_energy", side_effect=energy),
+            patch.object(_worker, "ovvs_resource_metadata", side_effect=metadata),
+        ):
+            result = _worker.run_ovvs(spec, lane)
+
+        telemetry = result["points"][0]["ivfpq_search_stats"]
+        self.assertEqual(telemetry["status"], "success")
+        self.assertEqual(telemetry["scope"], "timed")
+        self.assertEqual(telemetry["before"]["successful_calls"], 1)
+        self.assertEqual(telemetry["after"]["successful_calls"], 3)
+        self.assertEqual(telemetry["delta"]["successful_calls"], 2)
+        scopes = result["points"][0]["ivfpq_search_stats_scopes"]
+        self.assertEqual(scopes["warmup"]["delta"]["successful_calls"], 1)
+        self.assertEqual(scopes["timed"]["delta"]["successful_calls"], 2)
+        self.assertEqual(scopes["energy"]["delta"]["successful_calls"], 1)
+        self.assertEqual(scopes["complete_point"]["delta"]["successful_calls"], 4)
+        self.assertEqual(
+            result["points"][0]["device_attribution"],
+            {"search_calls": 4, "successful_observations": 4, "failures": 0},
+        )
+
+    def test_ivfpq_missing_telemetry_keeps_all_scopes_explicit(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex(resources)
+        spec = self.spec()
+        spec["profile"].update(krefine=1, warmups=0, repeats=1)
+        queries = np.zeros((1, 2), dtype=np.float32)
+
+        def metadata(_module, _resources):
+            return {
+                "gpu_available": 1,
+                "npu_available": 1,
+                "npu_compile_fails": 0,
+                "npu_fallbacks": 0,
+                "ivfpq_search_stats": None,
+            }
+
+        lane = {
+            "id": "ovvs.ivf-pq.gpu",
+            "implementation": "ovvs",
+            "algorithm": "ivf-pq",
+            "policy_key": "gpu",
+            "policy": "FORCE_GPU",
+        }
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), queries)),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(
+                _worker,
+                "point_parameters",
+                return_value=[{"nprobe": 1, "query_batch_size": 1}],
+            ),
+            patch.object(_worker, "ovvs_resource_metadata", side_effect=metadata),
+        ):
+            result = _worker.run_ovvs(spec, lane)
+
+        point = result["points"][0]
+        self.assertEqual(point["status"], "success")
+        self.assertEqual(point["ivfpq_search_stats"]["status"], "unavailable")
+        self.assertEqual(
+            set(point["ivfpq_search_stats_scopes"]),
+            {"warmup", "timed", "energy", "complete_point"},
+        )
+        self.assertTrue(
+            all(
+                evidence["status"] == "unavailable"
+                for evidence in point["ivfpq_search_stats_scopes"].values()
+            )
+        )
+
+    def test_ivfpq_present_invalid_timed_telemetry_fails_point(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex(resources)
+        spec = self.spec()
+        spec["profile"].update(krefine=1, warmups=0, repeats=1)
+        queries = np.zeros((1, 2), dtype=np.float32)
+
+        def metadata(_module, current_resources):
+            stats = current_resources.ivfpq_search_stats()
+            # A nonzero total with zero named stages is a present but invalid
+            # complete-call record; it must not be silently treated as evidence.
+            stats["total_wall_ns"] = current_resources.ivfpq_calls
+            return {
+                "gpu_available": 1,
+                "npu_available": 1,
+                "npu_compile_fails": 0,
+                "npu_fallbacks": 0,
+                "ivfpq_search_stats": stats,
+            }
+
+        lane = {
+            "id": "ovvs.ivf-pq.gpu",
+            "implementation": "ovvs",
+            "algorithm": "ivf-pq",
+            "policy_key": "gpu",
+            "policy": "FORCE_GPU",
+        }
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), queries)),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(
+                _worker,
+                "point_parameters",
+                return_value=[{"nprobe": 1, "query_batch_size": 1}],
+            ),
+            patch.object(_worker, "ovvs_resource_metadata", side_effect=metadata),
+        ):
+            result = _worker.run_ovvs(spec, lane)
+
+        point = result["points"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(point["status"], "failed")
+        self.assertEqual(point["ivfpq_search_stats"]["status"], "invalid")
+        self.assertIn("do not sum", point["reason"])
+
+    def test_ivfpq_failed_point_preserves_completed_phase_evidence(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex(resources)
+        spec = self.spec()
+        spec["profile"].update(krefine=1, warmups=0, repeats=1)
+        queries = np.zeros((1, 2), dtype=np.float32)
+
+        def metadata(_module, current_resources):
+            return {
+                "gpu_available": 1,
+                "npu_available": 1,
+                "npu_compile_fails": 0,
+                "npu_fallbacks": 0,
+                "ivfpq_search_stats": current_resources.ivfpq_search_stats(),
+            }
+
+        def fail_after_timed_search(
+            search,
+            _queries,
+            _batch_size,
+            _warmups,
+            _repeats,
+            phase_callback=None,
+        ):
+            phase_callback("warmup", "before")
+            phase_callback("warmup", "after")
+            phase_callback("timed", "before")
+            search(queries)
+            phase_callback("timed", "after")
+            raise RuntimeError("search failed after one timed call")
+
+        lane = {
+            "id": "ovvs.ivf-pq.gpu",
+            "implementation": "ovvs",
+            "algorithm": "ivf-pq",
+            "policy_key": "gpu",
+            "policy": "FORCE_GPU",
+        }
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), queries)),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(
+                _worker,
+                "point_parameters",
+                return_value=[{"nprobe": 1, "query_batch_size": 1}],
+            ),
+            patch.object(_worker, "measure_search", side_effect=fail_after_timed_search),
+            patch.object(_worker, "ovvs_resource_metadata", side_effect=metadata),
+        ):
+            result = _worker.run_ovvs(spec, lane)
+
+        point = result["points"][0]
+        self.assertEqual(point["status"], "failed")
+        self.assertIn("failed after one timed call", point["reason"])
+        self.assertEqual(point["ivfpq_search_stats"]["status"], "success")
+        self.assertEqual(point["ivfpq_search_stats"]["delta"]["successful_calls"], 1)
+        scopes = point["ivfpq_search_stats_scopes"]
+        self.assertEqual(scopes["warmup"]["delta"]["successful_calls"], 0)
+        self.assertEqual(scopes["timed"]["delta"]["successful_calls"], 1)
+        self.assertEqual(scopes["energy"]["status"], "unavailable")
+        self.assertEqual(scopes["complete_point"]["delta"]["successful_calls"], 1)
 
 
 if __name__ == "__main__":
