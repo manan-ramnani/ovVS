@@ -10,6 +10,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <random>
@@ -130,6 +131,11 @@ struct ResourcesData {
   std::string cache_dir;
   int32_t npu_compile_fails = 0;
   int32_t npu_fallbacks = 0;
+  std::mutex cagra_transfer_mutex;
+  int64_t cagra_walk_calls = 0;
+  int64_t cagra_direct_index_calls = 0;
+  int64_t cagra_index_upload_calls = 0;
+  int64_t cagra_index_upload_bytes = 0;
   bool npu_busy = false;
   ovvsDevice large_gemm_winner = OVVS_DEVICE_AUTO;
   int64_t large_gemm_flops = 100000LL * 32LL * 768LL;

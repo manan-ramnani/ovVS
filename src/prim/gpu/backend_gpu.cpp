@@ -1018,6 +1018,17 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const bool out_d_direct = gpu_pointer_accessible(q, distances);
     const bool bitset_direct = bitset && gpu_pointer_accessible(q, bitset);
     const size_t bitset_bytes = (N + 7u) / 8u;
+    const size_t dataset_bytes = ds_count * sizeof(float);
+    const size_t graph_bytes = graph_count * sizeof(int32_t);
+    size_t index_upload_bytes = 0;
+    if (!ds_direct) {
+      index_upload_bytes = dataset_bytes;
+    }
+    if (!graph_direct) {
+      if (index_upload_bytes > std::numeric_limits<size_t>::max() - graph_bytes) return false;
+      index_upload_bytes += graph_bytes;
+    }
+    if (index_upload_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) return false;
 
     ScopedDeviceUsm<float> ds_copy(q, ds_direct ? 0u : ds_count);
     ScopedDeviceUsm<int32_t> graph_copy(q, graph_direct ? 0u : graph_count);
@@ -1033,8 +1044,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     float* OUTD = out_d_direct ? distances : out_d_copy.get();
     const uint8_t* BS = !bitset ? nullptr : (bitset_direct ? bitset : bitset_copy.get());
 
-    if (!ds_direct) q.memcpy(ds_copy.get(), dataset, ds_count * sizeof(float));
-    if (!graph_direct) q.memcpy(graph_copy.get(), graph, graph_count * sizeof(int32_t));
+    if (!ds_direct) q.memcpy(ds_copy.get(), dataset, dataset_bytes);
+    if (!graph_direct) q.memcpy(graph_copy.get(), graph, graph_bytes);
     if (!query_direct) q.memcpy(query_copy.get(), queries, query_count * sizeof(float));
     if (bitset && !bitset_direct) q.memcpy(bitset_copy.get(), bitset, bitset_bytes);
     q.wait_and_throw();
@@ -1233,7 +1244,23 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     if (!out_i_direct) q.memcpy(neighbors, out_i_copy.get(), output_count * sizeof(int64_t));
     if (!out_d_direct) q.memcpy(distances, out_d_copy.get(), output_count * sizeof(float));
     q.wait_and_throw();
-    (void)r;
+    {
+      const auto saturating_add = [](int64_t current, int64_t delta) {
+        return delta > std::numeric_limits<int64_t>::max() - current
+                   ? std::numeric_limits<int64_t>::max()
+                   : current + delta;
+      };
+      std::lock_guard<std::mutex> lock(r.cagra_transfer_mutex);
+      if (ds_direct && graph_direct) {
+        r.cagra_direct_index_calls = saturating_add(r.cagra_direct_index_calls, 1);
+      }
+      if (index_upload_bytes != 0) {
+        r.cagra_index_upload_calls = saturating_add(r.cagra_index_upload_calls, 1);
+        r.cagra_index_upload_bytes = saturating_add(
+            r.cagra_index_upload_bytes, static_cast<int64_t>(index_upload_bytes));
+      }
+      r.cagra_walk_calls = saturating_add(r.cagra_walk_calls, 1);
+    }
     return true;
   } catch (...) {
     return false;

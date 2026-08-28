@@ -390,6 +390,10 @@ def ovvs_resource_metadata(module: Any, resources: Any) -> dict[str, Any]:
         "sycl_enabled": bool(module.sycl_enabled()),
     }
     try:
+        metadata["cagra_transfer_stats"] = resources.cagra_transfer_stats()
+    except Exception:
+        metadata["cagra_transfer_stats"] = None
+    try:
         fn = module._lib.ovvsResourcesSku
         fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32]
         buf = ctypes.create_string_buffer(256)
@@ -850,6 +854,42 @@ def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: 
             contract = point.get("policy_contract", {})
             if contract.get("conforming") is False and lane.get("policy_key") in ("cpu", "npu", "gpu"):
                 issues.append(f"{lane_id}: policy contract {contract.get('status')}")
+            if (
+                full_profile
+                and lane.get("implementation") == "ovvs"
+                and lane.get("algorithm") == "cagra"
+                and lane.get("policy_key") == "gpu"
+            ):
+                transfer = point.get("cagra_transfer", {})
+                if transfer.get("status") != "success":
+                    issues.append(
+                        f"{lane_id}: full-profile FORCE_GPU CAGRA point has no transfer-counter evidence"
+                    )
+                    continue
+                delta = transfer.get("delta", {})
+                walks = delta.get("walks")
+                direct_walks = delta.get("direct_walks")
+                upload_calls = delta.get("index_upload_calls")
+                upload_bytes = delta.get("index_upload_bytes")
+                if not all(
+                    type(value) is int
+                    for value in (walks, direct_walks, upload_calls, upload_bytes)
+                ):
+                    issues.append(
+                        f"{lane_id}: full-profile FORCE_GPU CAGRA point has incomplete transfer-counter evidence"
+                    )
+                    continue
+                if walks <= 0:
+                    issues.append(f"{lane_id}: FORCE_GPU CAGRA point recorded no GPU walk")
+                if direct_walks != walks:
+                    issues.append(
+                        f"{lane_id}: FORCE_GPU CAGRA direct-walk delta {direct_walks} != walk delta {walks}"
+                    )
+                if upload_calls != 0 or upload_bytes != 0:
+                    issues.append(
+                        f"{lane_id}: FORCE_GPU CAGRA uploaded the index during search "
+                        f"(calls={upload_calls}, bytes={upload_bytes})"
+                    )
     return issues
 
 
@@ -866,6 +906,17 @@ def format_number(value: Any, digits: int = 3) -> str:
         return markdown_escape(value)
 
 
+def format_cagra_transfer(point: dict[str, Any]) -> str | None:
+    transfer = point.get("cagra_transfer", {})
+    if transfer.get("status") != "success":
+        return None
+    delta = transfer.get("delta", {})
+    keys = ("walks", "direct_walks", "index_upload_calls", "index_upload_bytes")
+    if not all(isinstance(delta.get(key), int) for key in keys):
+        return None
+    return "/".join(str(delta[key]) for key in keys)
+
+
 def render_markdown(artifact: dict[str, Any]) -> str:
     dataset = artifact["dataset"]
     lines = [
@@ -878,8 +929,8 @@ def render_markdown(artifact: dict[str, Any]) -> str:
         "- Timings exclude build and warmups. Package energy is whole-package, not isolated device energy.",
         "- Build and search policies are independent; each `last_device` value is final-primitive evidence only. HETERO equals AUTO today.",
         "",
-        "| Lane | Status | Build policy | Build ms | Build last primitive | Build NPU fallbacks Δ | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Search last primitive | Reason |",
-        "|---|---:|---|---:|---|---:|---|---:|---:|---:|---:|---:|---|---|",
+        "| Lane | Status | Build policy | Build ms | Build last primitive | Build NPU fallbacks Δ | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Search last primitive | CAGRA transfer Δ Wcalls/Dcalls/Ucalls/Ubytes | Reason |",
+        "|---|---:|---|---:|---|---:|---|---:|---:|---:|---:|---:|---|---|---|",
     ]
     for lane in artifact["lanes"]:
         build = lane.get("build", {})
@@ -906,6 +957,7 @@ def render_markdown(artifact: dict[str, Any]) -> str:
                 format_number(measurement.get("batch_latency_ms", {}).get("summary", {}).get("p99")),
                 format_number(point.get("energy", {}).get("microjoules_per_query"), 1),
                 ",".join(devices) if devices else None,
+                format_cagra_transfer(point),
                 point.get("reason") or lane.get("reason"),
             ]
             lines.append("| " + " | ".join(markdown_escape(cell) for cell in cells) + " |")

@@ -192,6 +192,58 @@ def _resource_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str,
     return deltas
 
 
+def _cagra_transfer_evidence(before: Any, after: Any) -> dict[str, Any]:
+    keys = ("walks", "direct_walks", "index_upload_calls", "index_upload_bytes")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {
+            "status": "unavailable",
+            "before": before,
+            "after": after,
+            "reason": "CAGRA transfer counters are unavailable",
+        }
+    if not all(type(before.get(key)) is int and type(after.get(key)) is int for key in keys):
+        return {
+            "status": "unavailable",
+            "before": before,
+            "after": after,
+            "reason": "CAGRA transfer counters are incomplete",
+        }
+    delta = {key: after[key] - before[key] for key in keys}
+    if any(value < 0 for value in delta.values()):
+        return {
+            "status": "unavailable",
+            "before": before,
+            "after": after,
+            "delta": delta,
+            "reason": "CAGRA transfer counters moved backwards",
+        }
+    walks = delta["walks"]
+    conforming = (
+        walks > 0
+        and delta["direct_walks"] == walks
+        and delta["index_upload_calls"] == 0
+        and delta["index_upload_bytes"] == 0
+    )
+    return {
+        "status": "success",
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "contract": {
+            "status": "direct_zero_upload" if conforming else "mismatch_or_upload",
+            "conforming": conforming,
+        },
+        "scope": "warmups_timed_repeats_and_energy_passes",
+    }
+
+
+def _cagra_transfer_snapshot(module: Any, resources: Any) -> Any:
+    try:
+        return ovvs_resource_metadata(module, resources).get("cagra_transfer_stats")
+    except Exception:
+        return None
+
+
 def _build_record(status: str, policy: str, elapsed_ms: float, last_device: dict[str, Any],
                   before: dict[str, Any], after: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
     reported_devices = (
@@ -309,6 +361,11 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 point["krefine"] = spec["profile"]["krefine"]
             raw_search = _ovvs_search(index, lane["algorithm"], point, spec["profile"]["k"])
             observed: list[int] = []
+            transfer_before = (
+                _cagra_transfer_snapshot(module, resources)
+                if lane["algorithm"] == "cagra"
+                else None
+            )
 
             def search(batch: Any):
                 result = raw_search(batch)
@@ -338,27 +395,42 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 status = "success" if validation["status"] == "success" else "failed"
                 if contract["status"] == "mismatch_or_unattributed" and policy in ("cpu", "npu", "gpu"):
                     status = "failed"
-                points.append(
-                    {
-                        "status": status,
-                        "parameters": point,
-                        "measurement": measured,
-                        "recall": recall_result(ids.tolist(), truth, spec["profile"]["k"]),
-                        "validation": validation,
-                        "energy": _energy(spec, resources.energy_uj, search_once, len(queries)),
-                        "policy_contract": contract,
-                        "reason": "; ".join(validation["issues"]) or (contract.get("reason") if status == "failed" else None),
-                    }
+                energy = _energy(spec, resources.energy_uj, search_once, len(queries))
+                transfer = (
+                    _cagra_transfer_evidence(
+                        transfer_before,
+                        _cagra_transfer_snapshot(module, resources),
+                    )
+                    if lane["algorithm"] == "cagra"
+                    else None
                 )
+                point_result = {
+                    "status": status,
+                    "parameters": point,
+                    "measurement": measured,
+                    "recall": recall_result(ids.tolist(), truth, spec["profile"]["k"]),
+                    "validation": validation,
+                    "energy": energy,
+                    "policy_contract": contract,
+                    "reason": "; ".join(validation["issues"])
+                    or (contract.get("reason") if status == "failed" else None),
+                }
+                if transfer is not None:
+                    point_result["cagra_transfer"] = transfer
+                points.append(point_result)
             except Exception as exc:
-                points.append(
-                    {
-                        "status": exception_point_status(exc),
-                        "parameters": point,
-                        "reason": str(exc),
-                        "error_type": type(exc).__name__,
-                    }
-                )
+                failed_point = {
+                    "status": exception_point_status(exc),
+                    "parameters": point,
+                    "reason": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+                if lane["algorithm"] == "cagra":
+                    failed_point["cagra_transfer"] = _cagra_transfer_evidence(
+                        transfer_before,
+                        _cagra_transfer_snapshot(module, resources),
+                    )
+                points.append(failed_point)
         if all(point["status"] == "success" for point in points):
             lane_status = "success"
         elif points and all(point["status"] == "unavailable" for point in points):

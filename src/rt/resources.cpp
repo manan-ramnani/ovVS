@@ -74,6 +74,21 @@ ovvsStatus ovvsResourcesLastComputeDtype(ovvsResources_t res, ovvsDType* dtype) 
   return OVVS_STATUS_SUCCESS;
 }
 
+ovvsStatus ovvsResourcesCagraTransferStats(ovvsResources_t res, int64_t* walks,
+                                           int64_t* direct_walks, int64_t* upload_calls,
+                                           int64_t* upload_bytes) {
+  if (!res || !walks || !direct_walks || !upload_calls || !upload_bytes) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  auto* resources = rd(res);
+  std::lock_guard<std::mutex> lock(resources->cagra_transfer_mutex);
+  *walks = resources->cagra_walk_calls;
+  *direct_walks = resources->cagra_direct_index_calls;
+  *upload_calls = resources->cagra_index_upload_calls;
+  *upload_bytes = resources->cagra_index_upload_bytes;
+  return OVVS_STATUS_SUCCESS;
+}
+
 ovvsStatus ovvsResourcesSetNpuBusy(ovvsResources_t res, int32_t busy) {
   if (!res) return OVVS_STATUS_INVALID_ARGUMENT;
   rd(res)->npu_busy = busy != 0;

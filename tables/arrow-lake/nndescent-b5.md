@@ -11,4 +11,4 @@ The kernel uses two device graph buffers plus a dataset copy only when the input
 
 This table validates the first scale/correctness checkpoint only. It is not SIFT1M evidence, not a comparison with cuVS, and not the downstream CAGRA/hnswlib quality gate. Peak RSS was not measured. The B1 harness now requests one independent AUTO construction policy for all search lanes and keeps CAGRA above 4,096 rows opt-in until a full measured build completes. AUTO CAGRA can use the GPU initializer but finishes with CPU prune; full FORCE_GPU CAGRA build remains unavailable until T13.3.
 
-Checkpoint verification: 63/63 native tests and 6/6 CTest lanes passed; after build/search policy separation, the Python benchmark/fetcher suites pass 25/25 and 6/6. GPU scale lanes use explicit CTest SKIP on device absence.
+Checkpoint verification: 63/63 native tests and 6/6 CTest lanes passed; after build/search policy and CAGRA-transfer evidence landed, the Python benchmark/fetcher suites pass 31/31 and 6/6. GPU scale lanes use explicit CTest SKIP on device absence.

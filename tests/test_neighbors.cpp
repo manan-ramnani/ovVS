@@ -1188,7 +1188,26 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
   std::vector<int64_t> got(static_cast<size_t>(nq * k)), truth(static_cast<size_t>(nq * k));
   std::vector<float> gd(static_cast<size_t>(nq * k)), td(static_cast<size_t>(nq * k));
-  expect_status(ovvsCagraSearch(res.r, ix, q.data(), nq, k, 32, 80, nullptr, got.data(), gd.data()), "s");
+  int64_t walks_before = 0, direct_before = 0, uploads_before = 0, bytes_before = 0;
+  expect_status(ovvsResourcesCagraTransferStats(res.r, &walks_before, &direct_before,
+                                                &uploads_before, &bytes_before),
+                "CAGRA transfer stats before searches");
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    expect_status(ovvsCagraSearch(res.r, ix, q.data(), nq, k, 32, 80, nullptr, got.data(),
+                                  gd.data()),
+                  "s");
+  }
+  int64_t walks_after = 0, direct_after = 0, uploads_after = 0, bytes_after = 0;
+  expect_status(ovvsResourcesCagraTransferStats(res.r, &walks_after, &direct_after,
+                                                &uploads_after, &bytes_after),
+                "CAGRA transfer stats after searches");
+  expect(walks_after - walks_before == 2, "two GPU searches must record two CAGRA walks");
+  expect(direct_after - direct_before == 2,
+         "shared-USM dataset and graph must record two direct-index walks");
+  expect(uploads_after - uploads_before == 0,
+         "shared-USM CAGRA index must not record index uploads");
+  expect(bytes_after - bytes_before == 0,
+         "shared-USM CAGRA index must not record index-upload bytes");
   ovvsResourcesLastDevice(res.r, &last);
   expect(last == OVVS_DEVICE_GPU, "sycl n>4096 last_device");
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());

@@ -87,6 +87,14 @@ OVVS_API ovvsStatus ovvsResourcesNpuCompileFails(ovvsResources_t res, int32_t* c
 OVVS_API ovvsStatus ovvsResourcesNpuFallbacks(ovvsResources_t res, int32_t* count);
 OVVS_API ovvsStatus ovvsResourcesLastDevice(ovvsResources_t res, ovvsDevice* device);
 OVVS_API ovvsStatus ovvsResourcesLastComputeDtype(ovvsResources_t res, ovvsDType* dtype);
+/* Resource-local cumulative counters for completed GPU CAGRA walk calls. One call may contain a
+   query batch. A direct call requires both index buffers to be GPU-accessible. Upload calls count
+   invocations that upload either the dataset or graph; upload bytes sum only those index buffers,
+   excluding query, output, and bitset transfers. Counters saturate at INT64_MAX. */
+OVVS_API ovvsStatus ovvsResourcesCagraTransferStats(ovvsResources_t res, int64_t* walks,
+                                                    int64_t* direct_walks,
+                                                    int64_t* upload_calls,
+                                                    int64_t* upload_bytes);
 OVVS_API ovvsStatus ovvsResourcesSetNpuBusy(ovvsResources_t res, int32_t busy);
 OVVS_API int32_t ovvsSyclEnabled(void);
 /* Package energy in microjoules from Linux RAPL sysfs, Windows EMI (intelppm RAPL),

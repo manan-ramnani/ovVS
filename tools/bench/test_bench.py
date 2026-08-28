@@ -10,7 +10,7 @@ import numpy as np
 
 import bench
 import _worker
-from _worker import exception_point_status
+from _worker import _cagra_transfer_evidence, exception_point_status
 from _common import (
     ALGORITHM_ORDER,
     POLICY_ORDER,
@@ -20,6 +20,7 @@ from _common import (
     duplicate_safe_recall,
     enumerate_lanes,
     measure_energy,
+    ovvs_resource_metadata,
     parse_selection,
     percentile,
     point_failure_reason,
@@ -51,6 +52,23 @@ def successful_lane(lane_id: str = "faiss-cpu.brute") -> dict:
             }
         ],
     }
+
+
+def successful_gpu_cagra_lane(transfer: dict | None) -> dict:
+    lane = successful_lane("ovvs.cagra.gpu")
+    lane.update(implementation="ovvs", algorithm="cagra", policy_key="gpu", policy="FORCE_GPU")
+    lane["build"] = {
+        "status": "success",
+        "policy": "AUTO",
+        "requested_policy": "AUTO",
+        "requested_policy_key": "auto",
+        "elapsed_ms": 1.0,
+        "last_device": {"status": "reported", "code": 1, "label": "CPU"},
+        "policy_contract": {"status": "not_forced", "conforming": None},
+    }
+    if transfer is not None:
+        lane["points"][0]["cagra_transfer"] = transfer
+    return lane
 
 
 class PureHelperTests(unittest.TestCase):
@@ -115,6 +133,50 @@ class PureHelperTests(unittest.TestCase):
         exc.status = 7
         self.assertEqual(exception_point_status(exc), "unavailable")
         self.assertEqual(exception_point_status(RuntimeError("numeric corruption")), "failed")
+
+    def test_cagra_transfer_zero_upload_evidence_completes_force_gpu_point(self) -> None:
+        transfer = _cagra_transfer_evidence(
+            {"walks": 4, "direct_walks": 4, "index_upload_calls": 0, "index_upload_bytes": 0},
+            {"walks": 11, "direct_walks": 11, "index_upload_calls": 0, "index_upload_bytes": 0},
+        )
+        self.assertTrue(transfer["contract"]["conforming"])
+        self.assertEqual(transfer["delta"]["walks"], 7)
+        issues = completion_issues(
+            "sift1m",
+            {"status": "success"},
+            {"status": "success", "exact": True},
+            [successful_gpu_cagra_lane(transfer)],
+        )
+        self.assertEqual(issues, [])
+
+    def test_cagra_transfer_upload_keeps_force_gpu_point_incomplete(self) -> None:
+        transfer = _cagra_transfer_evidence(
+            {"walks": 1, "direct_walks": 1, "index_upload_calls": 0, "index_upload_bytes": 0},
+            {"walks": 4, "direct_walks": 3, "index_upload_calls": 1, "index_upload_bytes": 4096},
+        )
+        issues = completion_issues(
+            "sift1m",
+            {"status": "success"},
+            {"status": "success", "exact": True},
+            [successful_gpu_cagra_lane(transfer)],
+        )
+        self.assertTrue(any("uploaded the index" in issue for issue in issues))
+        self.assertTrue(any("direct-walk delta" in issue for issue in issues))
+
+    def test_cagra_transfer_missing_evidence_keeps_force_gpu_point_incomplete(self) -> None:
+        issues = completion_issues(
+            "sift1m",
+            {"status": "success"},
+            {"status": "success", "exact": True},
+            [successful_gpu_cagra_lane(None)],
+        )
+        self.assertTrue(any("no transfer-counter evidence" in issue for issue in issues))
+
+    def test_resource_metadata_includes_cagra_transfer_counters(self) -> None:
+        counters = {"walks": 3, "direct_walks": 2, "index_upload_calls": 1, "index_upload_bytes": 64}
+        resources = SimpleNamespace(_h=None, cagra_transfer_stats=lambda: counters)
+        module = SimpleNamespace(_lib=SimpleNamespace(), sycl_enabled=lambda: True)
+        self.assertEqual(ovvs_resource_metadata(module, resources)["cagra_transfer_stats"], counters)
 
 
 class CliAndLaneSemanticsTests(unittest.TestCase):
@@ -353,6 +415,7 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         def __init__(self) -> None:
             self.policies: list[int] = []
             self.closed = False
+            self.walks = 0
 
         def set_policy(self, value: int) -> None:
             self.policies.append(value)
@@ -360,12 +423,29 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         def last_device(self) -> int:
             return 3
 
+        def energy_uj(self):
+            return None
+
+        def cagra_transfer_stats(self) -> dict[str, int]:
+            return {
+                "walks": self.walks,
+                "direct_walks": self.walks,
+                "index_upload_calls": 0,
+                "index_upload_bytes": 0,
+            }
+
         def close(self) -> None:
             self.closed = True
 
     class FakeIndex:
-        def __init__(self) -> None:
+        def __init__(self, resources=None) -> None:
             self.closed = False
+            self.resources = resources
+
+        def search(self, batch, **kwargs):
+            if self.resources is not None:
+                self.resources.walks += 1
+            return np.asarray([[0]], dtype=np.int64), np.asarray([[0.0]], dtype=np.float32)
 
         def close(self) -> None:
             self.closed = True
@@ -455,6 +535,95 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         self.assertEqual(result["build"]["fallback_telemetry"]["npu_fallbacks"]["delta"], 1)
         self.assertEqual(result["points"], [])
         self.assertTrue(resources.closed)
+
+    def test_cagra_point_delta_includes_measurement_and_energy_searches(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex(resources)
+        spec = self.spec()
+        spec["profile"].update(warmups=1, repeats=2)
+        queries = np.zeros((1, 2), dtype=np.float32)
+
+        def metadata(_module, current_resources):
+            return {
+                "gpu_available": 1,
+                "npu_available": 1,
+                "npu_compile_fails": 0,
+                "npu_fallbacks": 0,
+                "cagra_transfer_stats": current_resources.cagra_transfer_stats(),
+            }
+
+        def measure(search, _queries, _batch_size, _warmups, _repeats):
+            search(queries)
+            ids, distances = search(queries)
+            return {
+                "pass_latency_ms": {"summary": {"count": 2}},
+                "qps": {"summary": {"median": 1.0}},
+            }, ids, distances
+
+        def energy(_spec, _reader, search_once, _nq):
+            search_once()
+            return {"status": "success", "microjoules_per_query": 1.0}
+
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), queries)),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(
+                _worker,
+                "point_parameters",
+                return_value=[{"itopk_size": 32, "search_width": 1, "query_batch_size": 1}],
+            ),
+            patch.object(_worker, "measure_search", side_effect=measure),
+            patch.object(_worker, "_energy", side_effect=energy),
+            patch.object(_worker, "ovvs_resource_metadata", side_effect=metadata),
+        ):
+            result = _worker.run_ovvs(spec, self.lane("gpu"))
+
+        transfer = result["points"][0]["cagra_transfer"]
+        self.assertEqual(transfer["scope"], "warmups_timed_repeats_and_energy_passes")
+        self.assertEqual(transfer["delta"]["walks"], 3)
+        self.assertEqual(transfer["delta"]["direct_walks"], 3)
+        self.assertEqual(transfer["delta"]["index_upload_calls"], 0)
+        self.assertEqual(transfer["delta"]["index_upload_bytes"], 0)
+
+    def test_failed_cagra_point_preserves_partial_transfer_delta(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex(resources)
+        spec = self.spec()
+        spec["profile"].update(warmups=1, repeats=2)
+        queries = np.zeros((1, 2), dtype=np.float32)
+
+        def metadata(_module, current_resources):
+            return {
+                "gpu_available": 1,
+                "npu_available": 1,
+                "npu_compile_fails": 0,
+                "npu_fallbacks": 0,
+                "cagra_transfer_stats": current_resources.cagra_transfer_stats(),
+            }
+
+        def fail_after_one_search(search, _queries, _batch_size, _warmups, _repeats):
+            search(queries)
+            raise RuntimeError("search failed after transfer")
+
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), queries)),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(
+                _worker,
+                "point_parameters",
+                return_value=[{"itopk_size": 32, "search_width": 1, "query_batch_size": 1}],
+            ),
+            patch.object(_worker, "measure_search", side_effect=fail_after_one_search),
+            patch.object(_worker, "ovvs_resource_metadata", side_effect=metadata),
+        ):
+            result = _worker.run_ovvs(spec, self.lane("gpu"))
+
+        point = result["points"][0]
+        self.assertEqual(point["status"], "failed")
+        self.assertEqual(point["cagra_transfer"]["delta"]["walks"], 1)
+        self.assertEqual(point["cagra_transfer"]["delta"]["direct_walks"], 1)
 
 
 if __name__ == "__main__":

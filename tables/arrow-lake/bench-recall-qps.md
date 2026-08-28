@@ -17,7 +17,7 @@ Final bounded rerun after the B2 regression fixes: `bench.py --profile smoke --a
 | hnswlib | ef=64, batch=32 | 1.000000 | 49162.7 | 0.648 |
 | hnswlib | ef=64, batch=1 | 1.000000 | 39662.9 | 0.021 |
 
-The recall checkpoint holds at this scale, but ovVS remains roughly 10× slower at the lower-effort batch point and much farther behind at higher effort or batch size one. Dataset/graph transfer per search and leader-serial selection/sort remain open; this is not the SIFT1M gate.
+The recall checkpoint holds at this scale, but ovVS remains roughly 10× slower at the lower-effort batch point and much farther behind at higher effort or batch size one. Later resource-local counters showed direct shared-USM index access and zero explicit dataset/graph uploads for every point in this bounded run; SIFT1M transfer evidence and leader-serial selection/sort remain open. This is not the SIFT1M gate.
 
 ## Legacy pre-B2 comparison
 

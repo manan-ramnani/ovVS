@@ -168,6 +168,18 @@ _lib.ovvsResourcesSetPolicy.argtypes = [c_void_p, c_int32]
 _lib.ovvsResourcesLastDevice.argtypes = [c_void_p, POINTER(c_int32)]
 _lib.ovvsResourcesLastComputeDtype.argtypes = [c_void_p, POINTER(c_int32)]
 _lib.ovvsResourcesEnergyUj.argtypes = [c_void_p, POINTER(c_int64)]
+try:
+    _resources_cagra_transfer_stats = _lib.ovvsResourcesCagraTransferStats
+except AttributeError:
+    _resources_cagra_transfer_stats = None
+else:
+    _resources_cagra_transfer_stats.argtypes = [
+        c_void_p,
+        POINTER(c_int64),
+        POINTER(c_int64),
+        POINTER(c_int64),
+        POINTER(c_int64),
+    ]
 _lib.ovvsGemmEx.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -349,6 +361,30 @@ class Resources:
         if rc != 0:
             return None
         return int(uj.value)
+
+    def cagra_transfer_stats(self) -> dict[str, int] | None:
+        """Return cumulative CAGRA walk and index-transfer counters when supported."""
+        if _resources_cagra_transfer_stats is None:
+            return None
+        walks = c_int64()
+        direct_walks = c_int64()
+        upload_calls = c_int64()
+        upload_bytes = c_int64()
+        rc = _resources_cagra_transfer_stats(
+            self._h,
+            ctypes.byref(walks),
+            ctypes.byref(direct_walks),
+            ctypes.byref(upload_calls),
+            ctypes.byref(upload_bytes),
+        )
+        if rc != 0:
+            return None
+        return {
+            "walks": int(walks.value),
+            "direct_walks": int(direct_walks.value),
+            "index_upload_calls": int(upload_calls.value),
+            "index_upload_bytes": int(upload_bytes.value),
+        }
 
     def gemm(self, a, b, m, n, k, trans_b=1, compute_dtype=0):
         cbuf = (c_float * (m * n))()
