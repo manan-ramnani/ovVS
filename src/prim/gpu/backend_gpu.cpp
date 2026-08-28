@@ -136,14 +136,14 @@ static size_t next_power_of_two(size_t value) {
 
 static void pack_f16(sycl::queue& q, const float* src, sycl::half* dst, size_t n) {
   if (ovvs_usm_is_shared(src)) {
-    q.parallel_for(n, [=](sycl::id<1> i) { dst[i] = static_cast<sycl::half>(src[i]); }).wait();
+    q.parallel_for(n, [=](sycl::id<1> i) { dst[i] = static_cast<sycl::half>(src[i]); }).wait_and_throw();
     return;
   }
   sycl::buffer<float, 1> b(const_cast<float*>(src), sycl::range<1>(n));
   q.submit([&](sycl::handler& h) {
      auto a = b.get_access<sycl::access::mode::read>(h);
      h.parallel_for(n, [=](sycl::id<1> i) { dst[i] = static_cast<sycl::half>(a[i]); });
-   }).wait();
+   }).wait_and_throw();
 }
 
 static void pack_i8(sycl::queue& q, const float* src, std::int8_t* dst, size_t n, float scale) {
@@ -154,7 +154,7 @@ static void pack_i8(sycl::queue& q, const float* src, std::int8_t* dst, size_t n
        if (v > 127.f) v = 127.f;
        if (v < -127.f) v = -127.f;
        dst[i] = static_cast<std::int8_t>(v);
-     }).wait();
+     }).wait_and_throw();
     return;
   }
   sycl::buffer<float, 1> b(const_cast<float*>(src), sycl::range<1>(n));
@@ -166,7 +166,7 @@ static void pack_i8(sycl::queue& q, const float* src, std::int8_t* dst, size_t n
        if (v < -127.f) v = -127.f;
        dst[i] = static_cast<std::int8_t>(v);
      });
-   }).wait();
+   }).wait_and_throw();
 }
 #endif
 
@@ -281,7 +281,7 @@ static bool gemm_sycl_usm(const float* a, const float* b, float* c, int64_t m, i
     }
     C[i * N + j] = s;
   });
-  q.wait();
+  q.wait_and_throw();
   if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
   return true;
 }
@@ -313,7 +313,7 @@ static bool gemm_mkl_usm(const float* a, const float* b, float* c, int64_t m, in
   const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
   const std::int64_t ldc = static_cast<std::int64_t>(N);
   oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, 1.f, A, lda, B, ldb, 0.f, C, ldc);
-  q.wait();
+  q.wait_and_throw();
   if (!c_usm) std::memcpy(c, C, M * N * sizeof(float));
   return true;
 }
@@ -336,7 +336,7 @@ static bool gemm_mkl_f16(const float* a, const float* b, float* c, int64_t m, in
   const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
   const std::int64_t ldc = static_cast<std::int64_t>(N);
   oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, 1.f, A, lda, B, ldb, 0.f, C, ldc);
-  q.wait();
+  q.wait_and_throw();
   if (!ovvs_usm_is_shared(c)) std::memcpy(c, C, M * N * sizeof(float));
   return true;
 }
@@ -371,7 +371,7 @@ static bool gemm_mkl_i8(const float* a, const float* b, float* c, int64_t m, int
   const std::int64_t ldb = trans_b ? static_cast<std::int64_t>(K) : static_cast<std::int64_t>(N);
   const std::int64_t ldc = static_cast<std::int64_t>(N);
   oneapi::mkl::blas::row_major::gemm(q, transA, transB, m, n, k, alpha, A, lda, B, ldb, 0.f, C, ldc);
-  q.wait();
+  q.wait_and_throw();
   if (!ovvs_usm_is_shared(c)) std::memcpy(c, C, M * N * sizeof(float));
   return true;
 }
@@ -445,7 +445,7 @@ static bool gemm_sycl_f16(const float* a, const float* b, float* c, int64_t m, i
     }
     C[i * N + j] = static_cast<float>(s);
   });
-  q.wait();
+  q.wait_and_throw();
   if (!ovvs_usm_is_shared(c)) {
     std::memcpy(c, C, M * N * sizeof(float));
     ovvs_usm_free(C);
@@ -551,7 +551,7 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
         V[row * KK + t] = best_v;
       }
     });
-    q.wait();
+    q.wait_and_throw();
     std::memcpy(indices, I, R * KK * sizeof(int64_t));
     std::memcpy(values, V, R * KK * sizeof(float));
     return true;
@@ -1024,7 +1024,7 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
       const int64_t row = I[i];
       O[i * D + j] = (row >= 0 && static_cast<size_t>(row) < SR) ? S[static_cast<size_t>(row) * D + j] : 0.f;
     });
-    q.wait();
+    q.wait_and_throw();
     std::memcpy(out, O, N * D * sizeof(float));
     return true;
   } catch (...) {
@@ -2373,7 +2373,7 @@ bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
         O[i * NY + j] = sycl::pow(s, 1.f / p);
       }
     });
-    q.wait();
+    q.wait_and_throw();
     if (!ovvs_usm_is_shared(out)) std::memcpy(out, O, NX * NY * sizeof(float));
     (void)r;
     return true;

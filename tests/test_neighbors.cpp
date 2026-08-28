@@ -1359,6 +1359,88 @@ OVVS_TEST(ivf_pq_fused_gpu_krefine_ties_and_atomicity) {
   ovvsIvfPqDestroy(index);
 }
 
+OVVS_TEST(ivf_pq_fused_gpu_cross_list_equal_score_merge) {
+  Res res;
+  require_ivfpq_test_gpu(res.r);
+  constexpr int64_t n = 2;
+  constexpr int64_t dim = 2;
+  constexpr int32_t nlist = 2;
+  constexpr int32_t pq_m = 1;
+  constexpr int32_t pq_nbits = 4;
+  const std::vector<float> data = {-1.f, 0.f, 1.f, 0.f};
+  const float midpoint[dim] = {0.f, 0.f};
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "cross-list tie IVF-PQ CPU build policy");
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, pq_m,
+                               pq_nbits, &index),
+                "cross-list tie IVF-PQ build");
+
+  /* Establish through the public search path and layout telemetry that each
+     exact point probes a distinct singleton list. The midpoint search below
+     therefore creates two non-empty scan tasks without inspecting the private
+     index or its serialized layout. */
+  std::vector<int64_t> singleton_ids(static_cast<size_t>(n), -1);
+  std::vector<float> singleton_distances(static_cast<size_t>(n), -1.f);
+  const IvfPqStatsSnapshot before_singletons = ivfpq_stats(res.r);
+  expect_status(ovvsIvfPqSearch(res.r, index, data.data(), n, 1, 1, 1,
+                                nullptr, singleton_ids.data(),
+                                singleton_distances.data()),
+                "cross-list singleton verification search");
+  const IvfPqStatsSnapshot after_singletons = ivfpq_stats(res.r);
+  expect(singleton_ids[0] == 0 && singleton_ids[1] == 1 &&
+             singleton_distances[0] == 0.f && singleton_distances[1] == 0.f,
+         "cross-list fixture points must self-match in separate probes");
+  expect(after_singletons.unfiltered_direct_rows ==
+             before_singletons.unfiltered_direct_rows + n,
+         "cross-list fixture must scan one singleton row per probe");
+
+  auto search_midpoint = [&](ovvsPolicy policy, int64_t k, int32_t krefine,
+                             const char* label) {
+    expect_status(ovvsResourcesSetPolicy(res.r, policy), label);
+    std::pair<std::vector<int64_t>, std::vector<float>> result{
+        std::vector<int64_t>(static_cast<size_t>(k), -1),
+        std::vector<float>(static_cast<size_t>(k), -1.f)};
+    expect_status(ovvsIvfPqSearch(res.r, index, midpoint, 1, k, nlist,
+                                  krefine, nullptr, result.first.data(),
+                                  result.second.data()),
+                  label);
+    return result;
+  };
+
+  const auto cpu_winner = search_midpoint(
+      OVVS_POLICY_FORCE_CPU, 1, 1, "cross-list equal-score CPU winner");
+  const auto gpu_winner = search_midpoint(
+      OVVS_POLICY_FORCE_GPU, 1, 1, "cross-list equal-score GPU winner");
+  const auto gpu_winner_repeat = search_midpoint(
+      OVVS_POLICY_FORCE_GPU, 1, 1,
+      "cross-list equal-score repeated GPU winner");
+  expect_ivfpq_results_equal(gpu_winner.first, gpu_winner.second,
+                             cpu_winner.first, cpu_winner.second,
+                             "cross-list equal-score winner");
+  expect_ivfpq_results_equal(gpu_winner_repeat.first,
+                             gpu_winner_repeat.second, gpu_winner.first,
+                             gpu_winner.second,
+                             "cross-list equal-score deterministic winner");
+  expect(cpu_winner.second[0] == 1.f,
+         "cross-list midpoint winner must retain the exact tied distance");
+
+  const auto cpu_order = search_midpoint(
+      OVVS_POLICY_FORCE_CPU, 2, 2, "cross-list equal-score CPU order");
+  const auto gpu_order = search_midpoint(
+      OVVS_POLICY_FORCE_GPU, 2, 2, "cross-list equal-score GPU order");
+  expect_ivfpq_results_equal(gpu_order.first, gpu_order.second,
+                             cpu_order.first, cpu_order.second,
+                             "cross-list equal-score merge order");
+  expect(cpu_order.first[0] != cpu_order.first[1] &&
+             cpu_order.second[0] == 1.f && cpu_order.second[1] == 1.f,
+         "cross-list merge must retain both equal-score singleton candidates");
+
+  ovvsIvfPqDestroy(index);
+}
+
 OVVS_TEST(ivf_pq_fused_gpu_persistence_extend_and_concurrency) {
   Res res;
   require_ivfpq_test_gpu(res.r);

@@ -129,6 +129,7 @@ if(OVVS_BUILD_TESTS)
     --exclude cagra_sycl_walk_n_over_4096
     --exclude ivf_pq_fused_gpu_parity_filters_tail_and_blocks
     --exclude ivf_pq_fused_gpu_krefine_ties_and_atomicity
+    --exclude ivf_pq_fused_gpu_cross_list_equal_score_merge
     --exclude ivf_pq_fused_gpu_persistence_extend_and_concurrency)
   set_tests_properties(cpu PROPERTIES
     LABELS "cpu"
@@ -158,6 +159,7 @@ if(OVVS_BUILD_TESTS)
     COMMAND ovvs_tests
       --filter ivf_pq_fused_gpu_parity_filters_tail_and_blocks
       --filter ivf_pq_fused_gpu_krefine_ties_and_atomicity
+      --filter ivf_pq_fused_gpu_cross_list_equal_score_merge
       --filter ivf_pq_fused_gpu_persistence_extend_and_concurrency)
   set_tests_properties(ivf_pq_fused_gpu_scan_select PROPERTIES
     LABELS "gpu;ivf-pq"
