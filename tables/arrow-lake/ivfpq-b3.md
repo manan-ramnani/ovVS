@@ -2,7 +2,7 @@
 
 Status: **correctness guarded; persistent storage and synchronous fixed-bucket batching complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
 
-Local development artifacts are `out/bench/ivfpq-b3-baseline-smoke.json`, `out/bench/ivfpq-b3-guarded-smoke.json`, and three `ivfpq-b3-packed-smoke*.json` runs with sibling Markdown files. They are overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
+The current clean-code artifacts are `out/bench/ivfpq-b3-batched-sift-postcommit-r1.json` through `r3.json`, with sibling Markdown files. Earlier baseline, guarded, and packed artifacts remain local negative history. Every run is overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
 
 ## Numeric defect and correction
 
@@ -62,16 +62,16 @@ The NPU backend splits lists into fixed buckets `{128,256,512,1024,2048}` and pa
 
 Native telemetry proves the grouping rather than inferring it from `last_device`: a six-task fixture covering 1,152 real rows and 384 intra-bucket padded rows executed as exactly three NPU requests using capacities 2/4/1 for buckets 128/256/512. It submitted 1,792 capacity rows: 1,152 valid, 384 intra-bucket padding, and 256 inactive-slot padding, with zero CPU fallback. The test mutates LUTs between passes, checks an independent scalar oracle within 0.02, validates output canaries, and confirms invalid codes and forced-policy failures publish nothing. A second live fixture alternates bucket classes and splits a 2,049-row task; seven chunks and 2,823 valid rows execute in four requests covering buckets 128/256/512/2,048, with 3,840 capacity rows and exact dense output order. Bucket 1,024 remains planner-covered but lacks equivalent retained live execution evidence. These are primitive correctness and routing facts, not an end-to-end speed claim.
 
-Three independent pre-commit development runs (`git.dirty=true` at base `3c5f65d`, no recorded DLL hash) on a SIFT prefix (`n=2,000`, `dim=128`, `nq=32`, `k=10`, `nlist=32`, `pq_m=8`, `krefine=32`, one warmup, five measured passes) produced:
+Three sequential clean-code runs at commit `aa716eb` (`git.dirty=false`) on a SIFT prefix (`n=2,000`, `dim=128`, `nq=32`, `k=10`, `nlist=32`, `pq_m=8`, `krefine=32`, one warmup, five measured passes) produced:
 
 | Search policy | nprobe 2 QPS, three-run median (range) | nprobe 8 QPS, three-run median (range) | Recall@10 at nprobe 2/8 | Peak process RSS range |
 |---|---:|---:|---:|---:|
-| AUTO | 62,573.3 (58,436.8–64,961.4) | 23,491.4 (23,054.8–24,013.2) | 0.6375 / 0.946875 | 140.9–141.0 MiB |
-| FORCE_CPU | 85,538.6 (83,703.9–85,883.0) | 32,533.6 (32,424.8–32,709.8) | 0.6375 / 0.946875 | 140.9–141.3 MiB |
+| AUTO | 58,801.9 (58,575.9–62,293.2) | 23,071.4 (22,709.5–23,338.9) | 0.6375 / 0.946875 | 141.3–141.6 MiB |
+| FORCE_CPU | 83,095.3 (75,757.6–85,015.9) | 32,228.8 (32,154.3–32,817.1) | 0.6375 / 0.946875 | 141.4–141.8 MiB |
 
-AUTO was 1.38× slower than FORCE_CPU at `nprobe=8`, versus 9.14× at the prior checkpoint. The ratio between checkpoint medians is 6.75× while recall stayed exact, but this is not a simultaneous isolated A/B and includes control-path/allocation changes as well as batching. Wide-range SIFT LUTs still fail the 65,504 bound, so FORCE_NPU remained explicitly unavailable in all three runs and AUTO attributed the final primitive to CPU. Per-LUT scaling remains unimplemented.
+AUTO was 1.41×/1.40× slower than FORCE_CPU at `nprobe=2/8`; the `nprobe=8` ratio was 9.14× at the pre-batching checkpoint. AUTO's median ratio between checkpoints is 4.55×/6.63× while recall stayed exact, but this is not a simultaneous isolated A/B and includes control-path/allocation changes as well as batching. Wide-range SIFT LUTs still fail the 65,504 bound, so FORCE_NPU remained explicitly unavailable in all three runs and AUTO attributed the final primitive to CPU. Per-LUT scaling remains unimplemented.
 
-Raw FAISS in the same current runs had median-of-run-median QPS 129,659.6/118,474.6 at `nprobe=2/8`, but recall was only 0.553125/0.6375 and timing varied widely. ovVS used `krefine=32`; FAISS was unrefined. This is retained as an unmatched competitor observation, not evidence that ovVS wins or loses at equal quality. The run artifacts are `out/bench/ivfpq-b3-batched-sift-smoke-r1.json` through `r3.json`; all remain partial because forced NPU is unavailable and package energy was disabled.
+Raw FAISS in the same clean runs had median-of-run-median QPS 143,626.6/149,045.2 at `nprobe=2/8`, with ranges 111,265.6–407,124.7 and 128,876.4–299,345.2. Recall was only 0.553125/0.6375; ovVS used `krefine=32` while FAISS was unrefined. This is retained as a high-variance unmatched competitor observation, not evidence that ovVS wins or loses at equal quality. All three artifacts remain partial because forced NPU is unavailable and package energy was disabled.
 
 ## Software-only direction probes
 
