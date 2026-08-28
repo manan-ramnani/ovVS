@@ -51,9 +51,13 @@ IVF-PQ / RaBitQ
   ADC                 → NPU Gather+ReduceSum tiles (this is the NPU search win)
   refine              → CPU
 
-CAGRA / Vamana / NN-Descent walk
-  graph walk          → iGPU SYCL (this is the iGPU search win; NPU cannot pointer-chase)
+CAGRA search
+  graph walk          → iGPU SYCL v0 (one work-item/query; T13.4/B2 is open)
   candidate scoring inside the walk → fused in the SYCL kernel
+
+Vamana / NN-Descent
+  current build/walk  → host control path
+  accelerated kernels→ iGPU SYCL after B21 / B5 respectively
 
 k-means
   assign              → CPU oneMKL GEMM

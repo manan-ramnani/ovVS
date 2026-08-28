@@ -12,6 +12,12 @@ build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.23"]
+bench = [
+  "numpy>=1.23",
+  "h5py>=3.8",
+  "faiss-cpu>=1.9",
+  "hnswlib>=0.8",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

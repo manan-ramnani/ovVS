@@ -41,7 +41,7 @@ Priority: P0 = objective is blocked without it; P1 = v1.0 quality; P2 = v1.1 / p
 
 | ID | Item | Plan | Notes |
 |---|---|---|---|
-| B1 | SIFT1M / 1e5×768 recall–QPS harness vs FAISS-CPU and hnswlib; AUTO + FORCE_*; µJ/query | T22.1–T22.2, §8–§9 | `tools/bench/bench.py` is a 2k slice. `data/sift-128-euclidean.hdf5` is in-tree. Every later kernel change needs this number. |
+| B1 | SIFT1M / 1e5×768 recall–QPS harness vs FAISS-CPU and hnswlib; AUTO + FORCE_*; µJ/query | T22.1–T22.2, §8–§9 | **PARTIAL:** strict CLI/JSON harness and bounded smoke validation are complete. SIFT1M is locally fetchable with a pinned hash, not committed. Full SIFT1M and a real 100K×768 corpus report remain open; CAGRA-at-SIFT1M is blocked by B5. |
 | B2 | CAGRA search kernel T13.4: one **work-group** per query, SLM itopk, bounded hashmap (not `Seen[nq×n]`), graph-aware seeds, subgroup distance | T13.4, then T13.5–T13.6 | Current `gpu_cagra_walk` is `parallel_for(nq)` one WI/query, hash seeds `(s*9973+qi*13)%n`, scalar L2, linear heap. FORCE_GPU can be honest and still lose to hnswlib. Gate: SIFT1M recall within 2% of hnswlib at similar M/ef **before** chasing QPS. |
 | B3 | IVF-PQ search rewrite: persistent list codes, ADC tables batched over `nq×nprobe`, iGPU variable-length scan; padded-list NPU bakeoff | T10.2–T10.4, T9.3 | `prim_pq_adc` on NPU is real. `ovvsIvfPqSearch` rebuilds residual + tables + packed codes **on the host per query per list**. That is why FAISS is ~6× faster on 2k points. |
 | B4 | IVF-RaBitQ packed binary/INT GEMM (or SHAVE popcount), not scalar `rabitq_ip` | T11 | Plan: this is the NPU-native ANN, not a consolation prize. |
@@ -98,9 +98,9 @@ Priority: P0 = objective is blocked without it; P1 = v1.0 quality; P2 = v1.1 / p
 
 ## Critical path (do in this order)
 
-1. **B1** harness (so B2–B5 have a number).
-2. **B2** CAGRA T13.4 kernel. Gate: SIFT1M recall vs hnswlib within 2% at similar M/ef.
-3. **B5** NN-Descent iGPU (CAGRA init at scale).
+1. **B1** harness core, then retain the full workload reports as an open gate.
+2. **B2** CAGRA T13.4 kernel at bounded scale.
+3. **B5** NN-Descent iGPU (CAGRA init at scale), then close B2's SIFT1M recall gate vs hnswlib within 2% at similar M/ef.
 4. **B3** then **B4** (IVF-PQ rewrite, then RaBitQ binary GEMM).
 5. **B6** HETERO overlap; **B7** NPU L0 home experiment (does not flip Arrow Lake AUTO GEMM unless a table says so).
 6. **B8** Lunar Lake bakeoff when that SKU exists.
@@ -123,6 +123,14 @@ Nothing from the 2026-08-28 assessment is closed as v1.0 “Accelerated.” Alre
 ---
 
 ## Entries
+
+### 2026-08-28 — B1 benchmark harness checkpoint
+
+`tools/bench/bench.py` now runs isolated, timeout-bounded ovVS, FAISS-CPU, and hnswlib lanes; uses one exact oracle; validates IDs, duplicates, and finite distances; records warm/repeated latency, QPS, build time, final primitive attribution, and package energy; and writes versioned JSON plus generated Markdown. Required full profiles fail closed on incomplete evidence unless `--allow-partial` is explicit. Benchmark dependencies and a checksum/schema-validated HTTPS SIFT fetcher are included.
+
+Bounded Arrow Lake smoke validation completed for every algorithm on FORCE_CPU and for brute-force across AUTO, FORCE_CPU, FORCE_NPU, FORCE_GPU, and HETERO. The harness exposed a real negative result: FORCE_NPU brute returned non-finite distances and is recorded as failed; it is not filtered or treated as a timing result. These runs validate the harness, not SIFT1M performance.
+
+B1 remains partial. No full SIFT1M or real 100K×768 report is published, the synthetic embedding profile is explicitly provisional, and CAGRA construction above 4,096 rows remains resource-gated by B5.
 
 ### 2026-08-28 — Deep assessment vs cuVS-equivalent objective
 

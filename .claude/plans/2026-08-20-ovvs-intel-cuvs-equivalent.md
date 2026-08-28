@@ -379,7 +379,7 @@ Porting CUDA CAGRA blindly will lose. Redesign for subgroup-16 and DRAM.
 
 1. **Initial graph**
    - IVF-PQ path: reuse ovVS IVF-PQ (NPU coarse + iGPU/NPU ADC), batched queries of the dataset against itself in chunks.
-   - NN-Descent path: iGPU kernels (see §7 phase 11).
+   - NN-Descent path: iGPU kernels (see §7 phase 12).
    - Iterative CAGRA-search path: after search kernel exists.
 2. **Optimize/prune** on iGPU: each vertex’s `I` neighbors → reverse edges → prune to degree `G`. Sort and unique in SLM if `I` fits, else global.
 3. Graph stored as `uint32[N, G]` in USM, optionally degree-padded.
@@ -841,7 +841,7 @@ If week 2 bakeoff shows NPU GEMM never beating iGPU on that SKU, **keep the NPU 
 
 Filled in as installs finish. Placeholder until toolchain logs land:
 
-- **SYCL/oneAPI toolkit:** elevated offline installer `intel-oneapi-base-toolkit-2025.1.3.8_offline.exe` exit 0. `icpx`/`icx` 2025.1.1 at `C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin\`. On Windows Ninja, **`icx` for both C and CXX** (`icpx` is GNU-like; CMake then passes `/nologo /EHsc` and the compiler test fails). `build-icpx` with `-DOVVS_WITH_SYCL=ON -DOVVS_WITH_OPENVINO=ON` links `sycl8.dll` and passes 45/45 plus C++/C consumers, including `cagra_sycl_walk_n_over_4096`. `intel/llvm` nightly `clang++ -fsycl` remains a fallback (`build-sycl`).
+- **SYCL/oneAPI toolkit:** elevated offline installer `intel-oneapi-base-toolkit-2025.1.3.8_offline.exe` exit 0. `icpx`/`icx` 2025.1.1 at `C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin\`. On Windows Ninja, **`icx` for both C and CXX** (`icpx` is GNU-like; CMake then passes `/nologo /EHsc` and the compiler test fails). `build-icpx` with `-DOVVS_WITH_SYCL=ON -DOVVS_WITH_OPENVINO=ON` links `sycl8.dll` and passes the configured native suite plus C++/C consumers, including `cagra_sycl_walk_n_over_4096`. `intel/llvm` nightly `clang++ -fsycl` remains a fallback (`build-sycl`).
 - **SYCL fused CAGRA walk (enabled, v0 quality):** `intel/llvm` nightly `sycl_windows.tar.gz` (`nightly-2026-08-18`, clang 24 / DPC++ 7.2.0) extracts without admin. `clang++ -fsycl` compiles ovVS with `-DOVVS_WITH_SYCL=ON`. Probe reports `sycl_built: true`. `cagra_force_gpu_last_device` passes (`last_device=GPU`). OpenVINO GPU remains fallback in the same TU if the SYCL kernel throws. Nightly lives at `C:\Users\manan\intel\sycl-nightly` (not committed). Kernel quality is the following bullet / backlog B2 — not T13.4.
 - **SHAVE on NPU silicon:** ActShave **does** run. OpenVINO NPU ADC (Gather+ReduceSum) profiling on this 265K: `lut`/`Gather`/`Result` exec_type `Shave`, `ReduceSum` exec_type `DPU`. Compiler-in-driver embeds Intel prebuilt ELF32 `.text` (`gather.3720xx.elf`, …) into a graph ELF64 (`.text.KernelText`, `.text.ActKernelInvocations`). Level Zero `ZE_GRAPH_FORMAT_NATIVE` is that graph blob; a raw SHAVE ELF32 is `invalid_native_binary`. VCL still rejects ELF-as-IR (`invalid_ir`). `ze_activation_kernel_desc_t` is compile-time extra kernel data, not an unsigned loader. MoviTools is artifactory-only (`ENABLE_SHAVE_BINARIES_BUILD`). Probe: `shave_silicon_load: compiler_actshave`, `shave_unsigned_inject: unsupported_no_inject_api`. Park only “custom unsigned SHAVE C compiled with moviCompile and registered as VPU.SW.Kernel”.
 - **Persistent CAGRA grid:** batched `prim_graph_walk` only; Level Zero resident kernel not required.

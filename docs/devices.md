@@ -15,7 +15,7 @@ ovVS picks a device per primitive (`gemm`, `topk`, `gather`, pairwise). Algorith
 
 `ovvsResourcesSetNpuBusy(1)` is mixer v2: AUTO skips NPU (LLM or another graph occupying the NPU) and still completes on GPU/CPU.
 
-Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>/gemm_large.json` when that file is found (`OVVS_TABLES` or `../../tables` from the binary). On Arrow Lake 265K that is GPU, then NPU, then CPU.
+Large GEMM (`flops >= 1e5×32×768` by default) uses the winner in `tables/<sku>/gemm_large.json` when that file is found (`OVVS_TABLES` or `../../tables` from the binary). On Arrow Lake 265K the measured order is CPU oneMKL, then NPU, then iGPU; AUTO therefore selects CPU.
 
 `ovvsResourcesEnergyUj` returns package microjoules. On Windows the path is the inbox **Intel Processor** driver (`intelppm.sys` / `cpu.inf`) Energy Metering Interface (EMI v2, OEM `Microsoft` / model `PPM`) on the ACPI processor device, channel `RAPL_Package0_PKG`. Units are picowatt-hours → µJ via ×0.0036. Fallback is PDH `\Energy Meter(RAPL_Package0_PKG)\Energy` (same EMI channels), then Intel Power Gadget if installed. Linux uses RAPL sysfs. `GetSystemPowerStatus` is not a package counter. Intel IPF (`ipf_cpu`, PCI `8086:AD03`) and PMT (`IntcPMT`, PCI `8086:AD0D`) are present on this SKU but are DTT/telemetry, not the RAPL EMI publisher. Power Gadget is not required.
 

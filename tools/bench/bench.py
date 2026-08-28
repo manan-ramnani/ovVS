@@ -1,196 +1,325 @@
 #!/usr/bin/env python3
-"""Recall-QPS: ovVS brute / IVF vs FAISS-CPU, CAGRA vs hnswlib when packages exist."""
+"""Isolated recall/QPS harness for ovVS, FAISS-CPU, and hnswlib.
+
+No arguments run a bounded smoke profile. Full profiles are strict: absent
+datasets, exact truth, comparators, device lanes, and resource-gated lanes stay
+visible and make the command non-zero unless ``--allow-partial`` is explicit.
+"""
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import platform
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from typing import Any, Sequence
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "python"))
+from _common import (
+    ALGORITHM_ORDER,
+    LANE_STATUSES,
+    POLICY_LABELS,
+    POLICY_ORDER,
+    PROFILE_DEFAULTS,
+    ROOT,
+    SCHEMA_VERSION,
+    WORKER_PREFIX,
+    completion_issues,
+    default_output_path,
+    enumerate_lanes,
+    package_version,
+    parse_selection,
+    prepare_dataset,
+    resolved_profile,
+    utc_now,
+    write_artifacts,
+)
 
 
-def load_ovvs():
-    if "OVVS_LIBRARY" not in os.environ:
-        for cand in (
-            ROOT / "build-icpx" / "bin" / "ovvs.dll",
-            ROOT / "build-sycl" / "bin" / "ovvs.dll",
-            ROOT / "build" / "bin" / "ovvs.dll",
-        ):
-            if cand.exists():
-                os.environ["OVVS_LIBRARY"] = str(cand)
-                break
-    import ovvs as m
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Isolated ovVS recall/QPS matrix; no arguments run the bounded smoke profile.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--profile", choices=tuple(PROFILE_DEFAULTS), default="smoke")
+    parser.add_argument("--algorithms", default="all", help="comma-separated: brute,ivf-flat,ivf-pq,cagra")
+    parser.add_argument("--policies", default="all", help="comma-separated: auto,cpu,npu,gpu,hetero")
+    parser.add_argument("--sift", default=str(ROOT / "data" / "sift-128-euclidean.hdf5"))
+    parser.add_argument("--base", help="embedding-100k custom base .npy (at least 100000 x 768)")
+    parser.add_argument("--queries", help="embedding-100k custom queries .npy (at least 32 x 768)")
+    parser.add_argument("--library", help="explicit libovvs/ovvs.dll path forwarded to every lane")
+    parser.add_argument("--output", help="JSON artifact path; a Markdown sibling is also written")
+    parser.add_argument("--warmups", type=int, help="override warmup passes")
+    parser.add_argument("--repeats", type=int, help="override measured passes (minimum 2)")
+    parser.add_argument("--timeout-seconds", type=float, help="per-oracle/per-lane timeout")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--no-energy", action="store_true")
+    parser.add_argument(
+        "--allow-unscalable-cagra",
+        action="store_true",
+        help="opt in to current host CAGRA build above n=4096 under the lane timeout",
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="return zero for incomplete full-profile evidence; statuses and completion remain unchanged",
+    )
+    parser.add_argument("--list-profiles", action="store_true")
+    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--_spec", help=argparse.SUPPRESS)
+    parser.add_argument("--_lane", help=argparse.SUPPRESS)
+    return parser
 
-    return m
 
-
-def energy_uj_per_query(res, fn, nq, min_s=0.15):
-    """Package RAPL µJ / query. Repeats `fn` until min_s so short searches are measurable."""
-    e0 = res.energy_uj() if res is not None else None
-    if e0 is None:
+def _tail(value: str | bytes | None, limit: int = 4_000) -> str | None:
+    if not value:
         return None
-    n = 0
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < min_s:
-        fn()
-        n += 1
-    e1 = res.energy_uj()
-    if e1 is None or n <= 0:
-        return None
-    return (e1 - e0) / float(n * max(nq, 1))
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    return value[-limit:]
 
 
-def fmt_ujq(ujq):
-    return "na" if ujq is None else f"{ujq:.1f}"
-
-
-def recall_at_k(got, truth, nq, k):
-    hit = 0
-    for q in range(nq):
-        tset = set(int(truth[q * k + j]) for j in range(k))
-        for i in range(k):
-            if int(got[q * k + i]) in tset:
-                hit += 1
-    return hit / float(nq * k)
-
-
-def main() -> int:
+def run_child(spec_path: Path, lane_id: str, timeout_seconds: float) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--_worker",
+        "--_spec",
+        str(spec_path),
+        "--_lane",
+        lane_id,
+    ]
+    started = time.perf_counter()
     try:
-        import numpy as np
-    except ImportError:
-        print("numpy missing; bench skipped")
-        return 0
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "id": lane_id,
+            "status": "timeout",
+            "reason": f"lane exceeded {timeout_seconds:g} seconds and its process was terminated",
+            "timeout_seconds": timeout_seconds,
+            "elapsed_ms": (time.perf_counter() - started) * 1_000,
+            "stdout_tail": _tail(exc.stdout),
+            "stderr_tail": _tail(exc.stderr),
+        }
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(WORKER_PREFIX):
+            try:
+                payload = json.loads(line[len(WORKER_PREFIX) :])
+            except json.JSONDecodeError:
+                payload = None
+            break
+    if payload is None:
+        return {
+            "id": lane_id,
+            "status": "failed",
+            "reason": f"worker exited {completed.returncode} without a result (native crash is possible)",
+            "returncode": completed.returncode,
+            "elapsed_ms": (time.perf_counter() - started) * 1_000,
+            "stdout_tail": _tail(completed.stdout),
+            "stderr_tail": _tail(completed.stderr),
+        }
+    payload["worker_returncode"] = completed.returncode
+    if completed.stderr:
+        payload["stderr_tail"] = _tail(completed.stderr)
+    if payload.get("status") not in LANE_STATUSES:
+        payload["status"] = "failed"
+        payload["reason"] = "worker emitted an unsupported status"
+    return payload
 
-    rng = np.random.default_rng(0)
-    n, dim, nq, k = 800, 32, 32, 10
-    data = rng.standard_normal((n, dim), dtype=np.float32)
-    queries = rng.standard_normal((nq, dim), dtype=np.float32)
-    sift = ROOT / "data" / "sift-128-euclidean.hdf5"
-    if sift.exists():
+
+def git_metadata() -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for key, command in (
+        ("commit", ["git", "rev-parse", "HEAD"]),
+        ("branch", ["git", "branch", "--show-current"]),
+        ("short_status", ["git", "status", "--short"]),
+    ):
         try:
-            import h5py  # type: ignore
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=5, check=False)
+            values[key] = result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            values[key] = None
+    values["dirty"] = bool(values.pop("short_status", ""))
+    return values
 
-            with h5py.File(sift, "r") as h:
-                data = np.asarray(h["train"][:2000], dtype=np.float32)
-                queries = np.asarray(h["test"][:32], dtype=np.float32)
-            n, dim = int(data.shape[0]), int(data.shape[1])
-            nq = int(queries.shape[0])
-            print(f"using SIFT hdf5 n={n} dim={dim} nq={nq}")
-        except Exception as e:
-            print(f"SIFT hdf5 present but unused: {e}; generated 800x32 stand-in")
-    else:
-        print("SIFT hdf5 absent; generated stand-in n=800 dim=32 nq=32")
 
-    lib = load_ovvs()
-    policies = [("cpu", 6), ("npu", 4), ("gpu", 5)]
-    nb = None
-    for name, pol in policies:
-        res_p = lib.Resources()
-        res_p.set_policy(pol)
+def _artifact(
+    args: argparse.Namespace,
+    profile: dict[str, Any],
+    algorithms: list[str],
+    policies: list[str],
+    dataset: dict[str, Any],
+    ground_truth: dict[str, Any],
+    lanes: list[dict[str, Any]],
+    started_at: str,
+) -> dict[str, Any]:
+    issues = completion_issues(args.profile, dataset, ground_truth, lanes)
+    if args.profile == "embedding-100k" and dataset.get("kind") == "synthetic":
+        issues.append(
+            "embedding-100k uses the provisional synthetic workload; this exercises the B1 harness but "
+            "does not satisfy the real 768-d corpus requirement in B20"
+        )
+    artifact_dataset = json.loads(json.dumps(dataset))
+    if artifact_dataset.get("kind") == "synthetic":
+        artifact_dataset.pop("base_path", None)
+        artifact_dataset.pop("query_path", None)
+        artifact_dataset["runtime_storage"] = "ephemeral_files_deleted_after_run"
+    counts = {status: sum(lane.get("status") == status for lane in lanes) for status in sorted(LANE_STATUSES)}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "profile": {"name": args.profile, "settings": profile},
+        "selection": {"algorithms": algorithms, "policies": [POLICY_LABELS[value] for value in policies]},
+        "dataset": artifact_dataset,
+        "ground_truth": ground_truth,
+        "lanes": lanes,
+        "completion": {
+            "status": "complete" if not issues else "partial",
+            "issues": issues,
+            "lane_counts": counts,
+            "full_profile_strict": args.profile != "smoke" and not args.allow_partial,
+        },
+        "metadata": {
+            "command": [str(Path(__file__).resolve()), *sys.argv[1:]],
+            "python": sys.version,
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "git": git_metadata(),
+            "dependencies": {
+                "numpy": package_version("numpy"),
+                "h5py": package_version("h5py"),
+                "faiss-cpu": package_version("faiss-cpu"),
+                "hnswlib": package_version("hnswlib"),
+            },
+            "caveats": [
+                "Package energy covers the package, iGPU, and uncore; it is not isolated device energy.",
+                "ovVS last_device reports the final primitive, not a per-stage route trace.",
+                "HETERO currently equals AUTO (backlog B6).",
+                "IVF-PQ FORCE_GPU may run ADC on NPU and is not a provable pure-GPU lane.",
+                "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
+            ],
+        },
+    }
+
+
+def orchestrate(args: argparse.Namespace) -> int:
+    try:
+        algorithms = parse_selection(args.algorithms, ALGORITHM_ORDER, "algorithm")
+        policies = parse_selection(args.policies, POLICY_ORDER, "policy")
+        profile = resolved_profile(args.profile, args.warmups, args.repeats, args.timeout_seconds)
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+    started_at = utc_now()
+    full_profile = args.profile != "smoke"
+    with tempfile.TemporaryDirectory(prefix="ovvs-bench-") as temporary:
+        directory = Path(temporary)
+        dataset = prepare_dataset(args, profile, directory)
+        lanes = enumerate_lanes(
+            algorithms,
+            policies,
+            int(dataset.get("n", profile["expected_n"])),
+            full_profile,
+            args.allow_unscalable_cagra,
+        )
+        spec = {
+            "schema_version": SCHEMA_VERSION,
+            "profile": profile,
+            "profile_name": args.profile,
+            "dataset": dataset,
+            "truth_path": str(directory / "exact-ground-truth.npy"),
+            "lanes": [lane.as_dict() for lane in lanes],
+            "library": args.library,
+            "energy": not args.no_energy,
+            "seed": args.seed,
+        }
+        spec_path = directory / "run-spec.json"
+        spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+        if dataset.get("status") == "success":
+            print("[ground-truth] starting exact oracle", file=sys.stderr, flush=True)
+            ground_truth = run_child(spec_path, "__ground_truth__", profile["timeout_seconds"])
+        else:
+            ground_truth = {
+                "status": "unavailable",
+                "reason": f"dataset unavailable: {dataset.get('reason', 'unknown reason')}",
+            }
+        results: list[dict[str, Any]] = []
+        for lane in lanes:
+            definition = lane.as_dict()
+            if dataset.get("status") != "success":
+                result = {
+                    **definition,
+                    "status": "skipped",
+                    "reason": f"dataset unavailable: {dataset.get('reason', 'unknown reason')}",
+                    "expected_skip": False,
+                }
+            elif lane.skip_reason:
+                result = {**definition, "status": "skipped", "reason": lane.skip_reason}
+            else:
+                print(f"[{lane.id}] starting", file=sys.stderr, flush=True)
+                result = run_child(spec_path, lane.id, profile["timeout_seconds"])
+                for key, value in definition.items():
+                    result.setdefault(key, value)
+            results.append(result)
+            print(f"[{lane.id}] {result['status']}", file=sys.stderr, flush=True)
+        artifact = _artifact(args, profile, algorithms, policies, dataset, ground_truth, results, started_at)
+        output = Path(args.output) if args.output else default_output_path(args.profile, started_at)
         try:
-            idx_p = lib.neighbors.brute_force.build(data, dim=dim, resources=res_p)
-            t0 = time.perf_counter()
-            nbp, _ = idx_p.search(queries, k=k)
-            t1 = time.perf_counter()
-            ujq = energy_uj_per_query(res_p, lambda: idx_p.search(queries, k=k), nq)
-            print(
-                f"ovvs brute policy={name} n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f} last_device={res_p.last_device()} uj/q={fmt_ujq(ujq)}"
-            )
-            if name == "cpu":
-                nb = nbp
-        except Exception as e:
-            print(f"ovvs brute policy={name} failed: {e}")
-    res = lib.Resources()
-    res.set_policy(6)  # FORCE_CPU for comparable FAISS/hnswlib host bench
-    if nb is None:
-        idx = lib.neighbors.brute_force.build(data, dim=dim, resources=res)
-        t0 = time.perf_counter()
-        nb, _ = idx.search(queries, k=k)
-        t1 = time.perf_counter()
-        print(f"ovvs brute n={n} dim={dim} nq={nq} ms={(t1 - t0) * 1000:.3f} qps={nq / (t1 - t0 + 1e-9):.1f}")
-
-    faiss_ok = False
-    try:
-        import faiss  # type: ignore
-
-        index = faiss.IndexFlatL2(dim)
-        index.add(data)
-        t0 = time.perf_counter()
-        _, I = index.search(queries, k)
-        t1 = time.perf_counter()
-        rec = recall_at_k(np.asarray(nb).reshape(-1), I.reshape(-1), nq, k)
-        print(f"faiss brute ms={(t1 - t0) * 1000:.3f} ovvs-vs-faiss-recall={rec:.3f}")
-        nlist, nprobe = 32, 8
-        quant = faiss.IndexFlatL2(dim)
-        ivf = faiss.IndexIVFFlat(quant, dim, nlist)
-        ivf.train(data)
-        ivf.add(data)
-        ivf.nprobe = nprobe
-        t0 = time.perf_counter()
-        _, Iivf = ivf.search(queries, k)
-        t1 = time.perf_counter()
-        print(f"faiss ivf-flat nlist={nlist} nprobe={nprobe} ms={(t1 - t0) * 1000:.3f}")
-        ivf_ix = lib.neighbors.ivf_flat.build(data, dim=dim, nlist=nlist, resources=res)
-        t0 = time.perf_counter()
-        inb, _ = ivf_ix.search(queries, k=k, nprobe=nprobe)
-        t1 = time.perf_counter()
-        rec_i = recall_at_k(np.asarray(inb).reshape(-1), Iivf.reshape(-1), nq, k)
-        ujq = energy_uj_per_query(res, lambda: ivf_ix.search(queries, k=k, nprobe=nprobe), nq)
-        print(f"ovvs ivf-flat ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_i:.3f} uj/q={fmt_ujq(ujq)}")
-        pq_m, nbits, krefine = 8, 8, 32
-        quant_pq = faiss.IndexFlatL2(dim)
-        faiss_pq = faiss.IndexIVFPQ(quant_pq, dim, nlist, pq_m, nbits)
-        faiss_pq.train(data)
-        faiss_pq.add(data)
-        faiss_pq.nprobe = nprobe
-        t0 = time.perf_counter()
-        _, Ipq = faiss_pq.search(queries, k)
-        t1 = time.perf_counter()
-        print(f"faiss ivf-pq nlist={nlist} nprobe={nprobe} M={pq_m} nbits={nbits} ms={(t1 - t0) * 1000:.3f}")
-        pq_ix = lib.neighbors.ivf_pq.build(
-            data, dim=dim, nlist=nlist, pq_m=pq_m, pq_nbits=nbits, resources=res
-        )
-        t0 = time.perf_counter()
-        pnb, _ = pq_ix.search(queries, k=k, nprobe=nprobe, krefine=krefine)
-        t1 = time.perf_counter()
-        rec_p = recall_at_k(np.asarray(pnb).reshape(-1), Ipq.reshape(-1), nq, k)
-        ujq = energy_uj_per_query(
-            res, lambda: pq_ix.search(queries, k=k, nprobe=nprobe, krefine=krefine), nq
-        )
-        print(f"ovvs ivf-pq ms={(t1 - t0) * 1000:.3f} vs-faiss-recall={rec_p:.3f} uj/q={fmt_ujq(ujq)}")
-        faiss_ok = True
-    except Exception as e:
-        print(f"faiss unavailable: {e}")
-
-    try:
-        import hnswlib  # type: ignore
-
-        p = hnswlib.Index(space="l2", dim=dim)
-        p.init_index(max_elements=n, ef_construction=50, M=16)
-        p.add_items(data)
-        p.set_ef(32)
-        t0 = time.perf_counter()
-        labels, _ = p.knn_query(queries, k=k)
-        t1 = time.perf_counter()
-        print(f"hnswlib M=16 ef=32 ms={(t1 - t0) * 1000:.3f}")
-        cg = lib.neighbors.cagra.build(data, dim=dim, graph_degree=16, intermediate_degree=32, resources=res)
-        t0 = time.perf_counter()
-        cnb, _ = cg.search(queries, k=k, itopk_size=32, search_width=2)
-        t1 = time.perf_counter()
-        rec_c = recall_at_k(np.asarray(cnb).reshape(-1), np.asarray(labels).reshape(-1), nq, k)
-        ujq = energy_uj_per_query(
-            res, lambda: cg.search(queries, k=k, itopk_size=32, search_width=2), nq
-        )
-        print(f"ovvs cagra ms={(t1 - t0) * 1000:.3f} vs-hnswlib-recall={rec_c:.3f} uj/q={fmt_ujq(ujq)}")
-    except Exception as e:
-        print(f"hnswlib unavailable: {e}")
-
-    if not faiss_ok:
-        print("ovVS-only numbers emitted; FAISS did not import.")
+            json_path, markdown_path = write_artifacts(artifact, output)
+        except (OSError, ValueError) as exc:
+            print(f"failed to write artifacts: {exc}", file=sys.stderr)
+            return 2
+    print(f"JSON: {json_path}")
+    print(f"Markdown: {markdown_path}")
+    print(f"Completion: {artifact['completion']['status']} {artifact['completion']['lane_counts']}")
+    if artifact["completion"]["issues"]:
+        print(f"Incomplete evidence: {len(artifact['completion']['issues'])} issue(s)")
+    if full_profile and artifact["completion"]["issues"] and not args.allow_partial:
+        return 3
     return 0
+
+
+def worker_main(spec_path: Path, lane_id: str) -> int:
+    from _worker import run_worker
+
+    result = run_worker(json.loads(spec_path.read_text(encoding="utf-8")), lane_id)
+    print(WORKER_PREFIX + json.dumps(result, sort_keys=True))
+    return 0 if result["status"] in ("success", "unavailable") else 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args._worker:
+        if not args._spec or not args._lane:
+            parser.error("worker mode requires --_spec and --_lane")
+        return worker_main(Path(args._spec), args._lane)
+    if args.list_profiles:
+        for name, settings in PROFILE_DEFAULTS.items():
+            print(f"{name}: {settings['description']}")
+        return 0
+    return orchestrate(args)
 
 
 if __name__ == "__main__":

@@ -94,7 +94,7 @@ Phase 23 (npu_compiler / SHAVE) is a **parallel** track, not a reason to stall i
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DOVVS_WITH_SYCL=ON
 cmake --build build
 ctest --test-dir build -L cpu
-# Windows oneAPI: call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" then icx (MSVC-like). icpx is GNU-like and breaks Ninja+MSVC flags.
+# Windows oneAPI: initialize VS (`VsDevCmd.bat -arch=amd64`), then call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" and use icx (MSVC-like). icpx is GNU-like and breaks Ninja+MSVC flags.
 # Fallback: intel/llvm nightly clang++ -fsycl at %USERPROFILE%\intel\sycl-nightly
 tools/probe > probe.json
 tools/bakeoff gemm --sku auto
