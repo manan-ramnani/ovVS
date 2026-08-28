@@ -170,6 +170,18 @@ if(OVVS_BUILD_TESTS)
   set_tests_properties(consumer PROPERTIES LABELS "cpu")
   add_test(NAME consumer_cxx COMMAND ovvs_consumer_cxx)
   set_tests_properties(consumer_cxx PROPERTIES LABELS "cpu")
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME hnswlib_interop
+      COMMAND ${CMAKE_COMMAND} -E env
+        "OVVS_LIBRARY=$<TARGET_FILE:ovvs>"
+        "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/hnswlib_interop.py)
+    set_tests_properties(hnswlib_interop PROPERTIES
+      LABELS "cpu;interop"
+      SKIP_RETURN_CODE 77
+      TIMEOUT 120)
+  endif()
 endif()
 
 install(TARGETS ovvs EXPORT ovvsTargets

@@ -55,6 +55,7 @@ struct CagraIndex {
 struct HnswIndex {
   Dataset ds;
   int32_t degree = 0;
+  int32_t hnsw_m = 0;
   std::vector<int32_t> graph;
   std::vector<int32_t> level;
   int32_t max_level = 0;
@@ -1264,25 +1265,18 @@ ovvsStatus ovvsHnswFromCagra(ovvsResources_t res, ovvsCagraIndex_t cagra, ovvsHn
   if (!res || !cagra) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* cg = reinterpret_cast<CagraIndex*>(cagra);
   if (!cg->has_dataset || cg->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (cg->ds.metric != OVVS_METRIC_L2_EXPANDED || cg->degree > 10000) {
+    return OVVS_STATUS_UNSUPPORTED;
+  }
   try {
     auto hx = std::make_unique<HnswIndex>();
     hx->ds = cg->ds;
     hx->degree = cg->degree;
+    hx->hnsw_m = cg->degree;
     hx->graph.assign(cg->graph.begin(), cg->graph.end());
     hx->level.assign(static_cast<size_t>(cg->ds.n), 0);
-    auto rng = rng_from(3);
-    std::uniform_real_distribution<float> u(0.f, 1.f);
-    const float ml = 1.f / std::log(static_cast<float>(std::max(2, cg->degree)));
     hx->max_level = 0;
     hx->enter = 0;
-    for (int64_t i = 0; i < cg->ds.n; ++i) {
-      int lvl = static_cast<int>(-std::log(std::max(u(rng), 1e-6f)) * ml);
-      hx->level[static_cast<size_t>(i)] = lvl;
-      if (lvl > hx->max_level) {
-        hx->max_level = lvl;
-        hx->enter = i;
-      }
-    }
     *index = reinterpret_cast<ovvsHnswIndex_t>(hx.release());
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
@@ -1329,8 +1323,9 @@ ovvsStatus ovvsHnswSerialize(ovvsHnswIndex_t index, const char* path) {
   auto* hx = reinterpret_cast<HnswIndex*>(index);
   std::ofstream f(path, std::ios::binary);
   if (!f) return OVVS_STATUS_IO;
-  const size_t M = static_cast<size_t>(hx->degree);
-  const size_t maxM0 = M;
+  const size_t M = static_cast<size_t>(std::max(hx->hnsw_m, 1));
+  if (M > std::numeric_limits<size_t>::max() / 2) return OVVS_STATUS_SHAPE_MISMATCH;
+  const size_t maxM0 = std::max(static_cast<size_t>(hx->degree), M * 2);
   const size_t maxM = M;
   const size_t n = static_cast<size_t>(hx->ds.n);
   const size_t dim = static_cast<size_t>(hx->ds.dim);
@@ -1340,8 +1335,11 @@ ovvsStatus ovvsHnswSerialize(ovvsHnswIndex_t index, const char* path) {
   const size_t offsetData = size_links_level0;
   const size_t label_offset = size_links_level0 + data_size;
   const size_t size_data_per_element = label_offset + sizeof(size_t);
-  const int maxlevel = hx->max_level;
-  const unsigned int enter = static_cast<unsigned int>(hx->enter);
+  /* CAGRA supplies only a base graph. Advertising synthetic upper levels while
+     writing empty upper-link blocks makes hnswlib dereference null link lists. */
+  const int maxlevel = 0;
+  const unsigned int enter =
+      static_cast<unsigned int>(hx->enter >= 0 && hx->enter < hx->ds.n ? hx->enter : 0);
   const double mult = 1.0 / std::log(static_cast<double>(std::max<size_t>(M, 2)));
   const size_t ef_construction = 200;
   write_pod(f, offsetLevel0);
@@ -1361,11 +1359,13 @@ ovvsStatus ovvsHnswSerialize(ovvsHnswIndex_t index, const char* path) {
   for (size_t i = 0; i < n; ++i) {
     std::fill(row.begin(), row.end(), 0);
     unsigned int links = 0;
-    auto* linkp = reinterpret_cast<unsigned int*>(row.data() + sizeof(unsigned int));
     for (int32_t t = 0; t < hx->degree; ++t) {
       const int32_t nb = hx->graph[i * static_cast<size_t>(hx->degree) + static_cast<size_t>(t)];
       if (nb < 0) continue;
-      linkp[links++] = static_cast<unsigned int>(nb);
+      const unsigned int encoded = static_cast<unsigned int>(nb);
+      std::memcpy(row.data() + sizeof(unsigned int) + links * sizeof(unsigned int),
+                  &encoded, sizeof(encoded));
+      ++links;
     }
     std::memcpy(row.data(), &links, sizeof(unsigned int));
     std::memcpy(row.data() + offsetData, hx->ds.x.data() + i * dim, data_size);
@@ -1402,7 +1402,10 @@ ovvsStatus ovvsHnswDeserialize(ovvsResources_t res, const char* path, ovvsHnswIn
   read_pod(f, M);
   read_pod(f, mult);
   read_pod(f, efc);
-  if (!f || cur == 0 || size_data < offsetData) return OVVS_STATUS_IO;
+  if (!f || cur == 0 || cur > max_elements || M == 0 || M > 10000 || maxM != M ||
+      maxM0 < M || maxM0 > 20000 || size_data < offsetData) {
+    return OVVS_STATUS_IO;
+  }
   const size_t dim = (label_off > offsetData) ? (label_off - offsetData) / sizeof(float) : 0;
   if (dim == 0 || dim > 4096) return OVVS_STATUS_IO;
   auto* hx = new HnswIndex();
@@ -1410,8 +1413,9 @@ ovvsStatus ovvsHnswDeserialize(ovvsResources_t res, const char* path, ovvsHnswIn
   hx->ds.dim = static_cast<int64_t>(dim);
   hx->ds.metric = OVVS_METRIC_L2_EXPANDED;
   hx->degree = static_cast<int32_t>(maxM0);
-  hx->max_level = maxlevel;
-  hx->enter = enter;
+  hx->hnsw_m = static_cast<int32_t>(M);
+  hx->max_level = 0;
+  hx->enter = enter < cur ? enter : 0;
   hx->graph.assign(cur * maxM0, -1);
   hx->level.assign(cur, 0);
   hx->ds.x.resize(cur * dim);
@@ -1424,9 +1428,19 @@ ovvsStatus ovvsHnswDeserialize(ovvsResources_t res, const char* path, ovvsHnswIn
     }
     unsigned int links = 0;
     std::memcpy(&links, row.data(), sizeof(unsigned int));
-    const auto* linkp = reinterpret_cast<const unsigned int*>(row.data() + sizeof(unsigned int));
-    for (unsigned int t = 0; t < links && t < maxM0; ++t) {
-      hx->graph[i * maxM0 + t] = static_cast<int32_t>(linkp[t]);
+    if (links > maxM0) {
+      delete hx;
+      return OVVS_STATUS_IO;
+    }
+    for (unsigned int t = 0; t < links; ++t) {
+      unsigned int encoded = 0;
+      std::memcpy(&encoded, row.data() + sizeof(unsigned int) + t * sizeof(unsigned int),
+                  sizeof(encoded));
+      if (encoded >= cur) {
+        delete hx;
+        return OVVS_STATUS_IO;
+      }
+      hx->graph[i * maxM0 + t] = static_cast<int32_t>(encoded);
     }
     std::memcpy(hx->ds.x.data() + i * dim, row.data() + offsetData, dim * sizeof(float));
   }

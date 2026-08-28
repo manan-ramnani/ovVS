@@ -331,6 +331,8 @@ _lib.ovvsHnswSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
+_lib.ovvsHnswSerialize.argtypes = [c_void_p, c_char_p]
+_lib.ovvsHnswDeserialize.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
 _lib.ovvsHnswDestroy.argtypes = [c_void_p]
 _lib.ovvsKMeansFit.argtypes = [c_void_p, POINTER(c_float), c_int64, c_int64, c_int32, c_int32, POINTER(c_void_p)]
 _lib.ovvsKMeansPredict.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64, POINTER(c_int64), POINTER(c_float)]
@@ -891,6 +893,10 @@ class ScannIndex(_Index):
 
 
 class HnswIndex(_Index):
+    def serialize(self, path):
+        rc = _lib.ovvsHnswSerialize(self._h, os.fsencode(os.fspath(path)))
+        _check_status(rc, "HNSW serialize")
+
     def search(self, queries, k=10, ef=32):
         qkeep, qptr, nq = _query_ptr(queries, self.dim)
         nb = (c_int64 * (nq * k))()

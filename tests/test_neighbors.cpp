@@ -2443,6 +2443,15 @@ OVVS_TEST(hnsw_from_cagra) {
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   expect(recall_at_k(got.data(), truth.data(), nq, k) >= 0.6f, "hnsw recall");
   ovvsHnswDestroy(hx);
+  ovvsCagraIndex_t cosine = nullptr;
+  expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_COSINE_EXPANDED, 6, 12,
+                               &cosine),
+                "cosine cagra");
+  hx = reinterpret_cast<ovvsHnswIndex_t>(uintptr_t{1});
+  expect(ovvsHnswFromCagra(res.r, cosine, &hx) == OVVS_STATUS_UNSUPPORTED,
+         "HNSW export must reject metrics not encoded by the file contract");
+  expect(hx == nullptr, "unsupported HNSW metric must clear output");
+  ovvsCagraDestroy(cosine);
   expect_status(ovvsCagraDetachDataset(cg), "detach before HNSW conversion rejection");
   hx = reinterpret_cast<ovvsHnswIndex_t>(uintptr_t{1});
   expect(ovvsHnswFromCagra(res.r, cg, &hx) == OVVS_STATUS_INVALID_ARGUMENT,
@@ -3053,11 +3062,23 @@ OVVS_TEST(hnsw_hnswlib_format_roundtrip) {
   std::vector<int64_t> lnb(static_cast<size_t>(nq * k));
   expect_status(ovvsHnswSearch(res.r, loaded, q.data(), nq, k, 16, lnb.data(), ds.data()), "ls");
   expect(recall_at_k(lnb.data(), hnsw_nb.data(), nq, k) >= 0.7f, "hnsw deser");
-  /* Header is hnswlib saveIndex: size_t offsetLevel0 at byte 0 must be 0. */
+  /* A base-only export must not advertise upper levels to hnswlib. */
   std::ifstream hf(path, std::ios::binary);
-  size_t offset0 = 1;
+  size_t offset0 = 1, ignored_size = 0;
+  size_t max_m = 0, max_m0 = 0, m = 0;
+  int maxlevel = -1;
+  unsigned int enter = static_cast<unsigned int>(n);
   hf.read(reinterpret_cast<char*>(&offset0), sizeof(size_t));
+  for (int i = 0; i < 5; ++i) hf.read(reinterpret_cast<char*>(&ignored_size), sizeof(size_t));
+  hf.read(reinterpret_cast<char*>(&maxlevel), sizeof(int));
+  hf.read(reinterpret_cast<char*>(&enter), sizeof(unsigned int));
+  hf.read(reinterpret_cast<char*>(&max_m), sizeof(size_t));
+  hf.read(reinterpret_cast<char*>(&max_m0), sizeof(size_t));
+  hf.read(reinterpret_cast<char*>(&m), sizeof(size_t));
   expect(offset0 == 0, "hnswlib offsetLevel0");
+  expect(maxlevel == 0, "base-only hnswlib maxlevel");
+  expect(enter < static_cast<unsigned int>(n), "base-only hnswlib entry point");
+  expect(max_m == m && max_m0 == 2 * m, "conventional hnswlib M capacities");
   ovvsHnswDestroy(loaded);
   ovvsHnswDestroy(hx);
   ovvsCagraDestroy(cg);

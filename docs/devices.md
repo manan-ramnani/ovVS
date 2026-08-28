@@ -62,4 +62,4 @@ C++ wrappers cover brute-force, IVF-Flat, IVF-PQ, IVF-RaBitQ, and CAGRA (`includ
 
 ## HNSW file
 
-`ovvsHnswSerialize` writes the [hnswlib](https://github.com/nmslib/hnswlib) `saveIndex` layout (size_t header, then per-element level-0 links + float data + label). Load with `hnswlib.Index(space='l2', dim=D).load_index(path)` when the package is installed, or `ovvsHnswDeserialize`.
+`ovvsHnswSerialize` writes the [hnswlib](https://github.com/nmslib/hnswlib) `saveIndex` layout (size_t header, then per-element level-0 links + float data + label). A CAGRA conversion is emitted honestly as a single-layer graph (`maxlevel=0`); it does not invent an HNSW hierarchy. The header keeps hnswlib's conventional `maxM0=2*M` capacity while the unused base slots remain zero. Load with `hnswlib.Index(space='l2', dim=D).load_index(path)` when the package is installed, or `ovvsHnswDeserialize`. Loadability is only a format contract: recall closeness and useful full-speed hnswlib search remain backlog B24.

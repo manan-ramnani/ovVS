@@ -246,7 +246,7 @@ OVVS_API ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index,
                                     int64_t nextra);
 OVVS_API ovvsStatus ovvsCagraDestroy(ovvsCagraIndex_t index);
 
-/* HNSW from CAGRA */
+/* Base-layer hnswlib-compatible export from L2-expanded CAGRA. */
 OVVS_API ovvsStatus ovvsHnswFromCagra(ovvsResources_t res, ovvsCagraIndex_t cagra, ovvsHnswIndex_t* index);
 OVVS_API ovvsStatus ovvsHnswSearch(ovvsResources_t res, ovvsHnswIndex_t index, const float* queries,
                                    int64_t nq, int64_t k, int32_t ef, int64_t* neighbors, float* distances);

@@ -242,6 +242,7 @@ class HnswIndex {
   void search(const float* queries, int64_t nq, int64_t k, int32_t ef, int64_t* neighbors, float* distances) {
     check(ovvsHnswSearch(res_->get(), ix_, queries, nq, k, ef, neighbors, distances));
   }
+  void serialize(const char* path) { check(ovvsHnswSerialize(ix_, path)); }
 
  private:
   Resources* res_ = nullptr;
