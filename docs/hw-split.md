@@ -52,16 +52,16 @@ IVF-PQ / RaBitQ
   refine              → CPU
 
 CAGRA search
-  graph walk          → iGPU SYCL (work-group/query; SIFT1M recall-closeness gate passed, QPS open)
+  graph walk          → iGPU SYCL (same graph reaches 0.9609 recall at 64/2; comparable-recall QPS remains 5.71× behind hnswlib)
   candidate scoring inside the walk → fused in the SYCL kernel
 
 CAGRA build
-  NN-Descent init n>4096 → iGPU SYCL under AUTO (90.444 s / 90.36% of clean SIFT1M median build; synchronization/readback is first target)
+  NN-Descent init n>4096 → iGPU SYCL under AUTO (90.444 s / 90.36% of clean SIFT1M median build; synchronization/readback is a separate construction target)
   prune               → CPU until T13.3 (9.034 s clean SIFT1M median; full FORCE_GPU build is unavailable)
   attribution         → success-only V1 stages plus call-local GPU lifecycle counters; external API wall remains the end-to-end measure
 
 Vamana / NN-Descent
-  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (SIFT1M CAGRA-vs-hnswlib closeness passed; T12.5 IVF-PQ comparison/prune open)
+  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (the resulting measured graph reaches 0.9609 with higher walk effort; T12.5 IVF-PQ comparison/prune open)
   Vamana prune/walk  → host control path (B21 remains open)
 
 k-means

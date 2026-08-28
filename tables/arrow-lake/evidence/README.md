@@ -55,3 +55,6 @@ The historical Gather+ReduceSum telemetry JSON and the peer production
 FORCE_GPU IVF-PQ run are not present in this checkpoint; their prose values are
 explicitly non-canonical context. The public compiler boundary is retained in
 `../../../compiler/shave/PUBLIC_TOOLCHAIN_GATE.md`.
+
+Other evidence manifests: [`cagra-build-v1/`](cagra-build-v1/README.md) and
+[`cagra-search-v1/`](cagra-search-v1/README.md).

@@ -30,7 +30,7 @@ Each full-base process passed the plan's recall-closeness gate with zero validat
 | ovVS CAGRA | 0.9036 in all runs | 100.093 s (99.874–100.525) | 3,465 (3,459–3,475) | 1.090 ms/query | 2,343.2 MiB |
 | hnswlib | 0.8911 (0.8899–0.8915) | 76.869 s (76.566–80.493) | 11,417 (11,093–11,464) | 0.101 ms/query | 1,387.0 MiB |
 
-The median recall difference is `hnswlib-CAGRA=-0.0125`; every process remained within the maximum 0.0200 gap. This is a quality-gate pass only. CAGRA remains 0.0464 below the separate 0.95 product target, took 1.302× the build wall, delivered 30.35% of hnswlib throughput, had 10.76× the amortized p99, and used 1.689× the peak RSS. The three ovVS build walls span only 0.65%, so the earlier 185.3-second load-contaminated wall is superseded for current performance status.
+The median recall difference is `hnswlib-CAGRA=-0.0125`; every process remained within the maximum 0.0200 gap. This is a quality-gate pass only. At this fixed low-effort point, CAGRA remains 0.0464 below the separate 0.95 product target, took 1.302× the build wall, delivered 30.35% of hnswlib throughput, had 10.76× the amortized p99, and used 1.689× the peak RSS. The three ovVS build walls span only 0.65%, so the earlier 185.3-second load-contaminated wall is superseded for current performance status.
 
 ## Measured attribution
 
@@ -61,4 +61,4 @@ Both sizes exhausted the six-iteration budget. At SIFT1M, changed and pending-NE
 
 The first measured construction target is the GPU NN-Descent initializer, which owns 90.36% of complete SIFT1M build wall and exposes 2,458 submissions, 1,820 waits, and 459 readbacks. Begin with the repeated reverse/proposal loop in `src/prim/gpu/backend_gpu.cpp`; the telemetry does not time that sub-loop separately. The host optimizer is the second target at 9.03 s. No NPU work is justified by this evidence.
 
-Promote a construction change only after interleaved repeated complete-wall measurements preserve recall and structural correctness, improve median SIFT1M build by at least 10%, keep search p99 within 5%, and avoid more than 5% peak-memory growth. Product acceleration still requires recall at least 0.95, faster construction and search than full-strength hnswlib, competitive batch-one tails, and complete curves plus energy.
+Promote a construction change only after interleaved repeated complete-wall measurements preserve recall and structural correctness, improve median SIFT1M build by at least 10%, keep search p99 within 5%, and avoid more than 5% peak-memory growth. A later same-index curve demonstrates 0.9609 recall with higher walk effort, but loses comparable-recall QPS and energy; it does not change this construction evidence. Product acceleration still requires recall at least 0.95, faster construction and search than full-strength hnswlib, competitive batch-one tails, and repeated complete curves plus energy. Search evidence: `tables/arrow-lake/cagra-search-v1.md`.

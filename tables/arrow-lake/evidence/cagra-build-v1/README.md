@@ -19,4 +19,4 @@ Producer identity shared by all six artifacts:
 | `cagra-build-v1-sift1m-5dc0ec7b4b90-r2.json` | `A4CC0E982833C22ED0D0590158B667852A111F665899DAE80D1D305BE7EAE638` |
 | `cagra-build-v1-sift1m-5dc0ec7b4b90-r3.json` | `453255E99F12A07D7740DEE0A6963B89380A8B0B67EBA514C87FB4FA1DA48769` |
 
-SIFT100K is an admission diagnostic and is intentionally noncanonical. SIFT1M is a matched recall-closeness gate, not the full B1 curve/energy report. Every JSON retains its partial-completion caveats; none is an acceleration claim.
+SIFT100K is an admission diagnostic and is intentionally noncanonical. SIFT1M is a matched recall-closeness gate, not the full B1 curve/energy report. Every JSON retains its partial-completion caveats; none is an acceleration claim. The later same-index effort/energy manifest is [`../cagra-search-v1/`](../cagra-search-v1/README.md).

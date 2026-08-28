@@ -4,6 +4,26 @@ Source: `tools/bench/bench.py` against `build-icpx` `ovvs.dll` (`OVVS_WITH_SYCL=
 Dataset: checksum-pinned `data/sift-128-euclidean.hdf5`; each section states its selected base/query geometry.
 Comparators: faiss-cpu 1.15.0, hnswlib 0.8.0.
 
+## SIFT1M same-index search-effort curve
+
+One clean complete process at commit `acd67e2` built a single CAGRA degree-16/intermediate-32 index and reused it across the normal batch-32 effort curve plus the high-effort batch-one point. The hnswlib lane retained `M=16`, `ef_construction=200`, 20 threads, and its complete `ef=32/64/128/256` curve. Every point used one warmup, five measured passes, exact validated HDF5 truth, and successful whole-package energy sampling. All 7,704 CAGRA calls were direct GPU walks with zero explicit index uploads.
+
+| Lane / effort | Recall@10 | Median QPS | Batch p99 | Package µJ/query |
+|---|---:|---:|---:|---:|
+| CAGRA 32/1, batch 32 | 0.9036 | 3,480.2 | 10.213 ms | 6,702.1 |
+| CAGRA 64/2, batch 32 | 0.9609 | 1,169.1 | 29.126 ms | 18,297.5 |
+| CAGRA 128/4, batch 32 | 0.9889 | 347.9 | 94.798 ms | 116,004.4 |
+| CAGRA 128/4, batch 1 | 0.9889 | 13.0 | 89.459 ms | 1,710,529.2 |
+| hnswlib ef32, batch 32 | 0.8911 | 11,112.6 | 4.570 ms | 2,981.3 |
+| hnswlib ef64, batch 32 | 0.9589 | 6,675.0 | 5.482 ms | 4,891.6 |
+| hnswlib ef128, batch 32 | 0.9879 | 3,765.6 | 9.813 ms | 8,638.5 |
+| hnswlib ef256, batch 32 | 0.9976 | 2,061.7 | 17.675 ms | 13,464.8 |
+| hnswlib ef256, batch 1 | 0.9976 | 2,040.2 | 0.635 ms | 14,713.9 |
+
+The current graph crosses the ≥0.95 target at 64/2, so the low-effort 0.9036 result is not a hard topology ceiling. This does not establish topology parity or isolate the two search knobs because `itopk_size` and `search_width` rise together. At the closest batch-32 recall points, hnswlib is 3.19×, 5.71×, and 10.82× faster as effort rises; CAGRA package energy/query is 2.25×, 3.74×, and 13.43× higher. The batch-one rows are not recall matched, but the stronger-quality hnswlib point is still 156.37× faster. This identifies traversal/selection and small-batch GPU mapping as measured problems, not an acceleration result.
+
+The curve is one benchmark invocation with two sequential isolated lane processes and no in-run clock, thermal, utilization, or background-load trace. It is causal quality/effort evidence, not repeated performance-promotion evidence. Complete provenance, counters, limitations, and the immutable raw hash: `tables/arrow-lake/cagra-search-v1.md`.
+
 ## SIFT100K current-code scale preflight
 
 Noncanonical intermediate run after the query-seed, host graph-optimizer, and bounded NEW/OLD reverse-join changes: checksum-pinned SIFT prefix `n=100,000`, `dim=128`, `nq=1,000`, `k=10`; exact FAISS `IndexFlatL2` truth recomputed against the prefix; M=16, seed 7, one warmup and five measured passes. ovVS used AUTO construction followed by FORCE_GPU search at `itopk=32`, width=1, batch=32. hnswlib 0.8.0 used `ef_construction=200`, `ef=32`, batch=32, and 20 explicit threads.
@@ -30,7 +50,7 @@ Checksum-pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=10`), exac
 | ovVS CAGRA | 0.9036 (same in all runs) | 100.093 s (99.874–100.525); final primitive CPU | 3,465.0 (3,458.7–3,474.5) | 2,343.2 MiB | 192/192 GPU attributions per run; `192/192/0/0` transfer |
 | hnswlib | 0.8911 (0.8899–0.8915) | 76.869 s (76.566–80.493) | 11,417.3 (11,093.3–11,463.8) | 1,387.0 MiB | 20 explicit threads; finite unique output |
 
-The T13.4 recall-closeness gate **passed in all three processes**. The median difference is `0.8911 - 0.9036 = -0.0125`, within the maximum allowed gap of 0.0200. CAGRA returned 125 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle. This is a closeness verdict, not the plan's separate ≥0.95 product target: CAGRA remains 0.0464 below that target. All 192 CAGRA searches per process reported GPU with zero attribution failures and zero explicit index uploads. AUTO construction ends in the CPU host optimizer, so its final-primitive label does not describe the complete mixed pipeline.
+The T13.4 recall-closeness gate **passed in all three processes**. The median difference is `0.8911 - 0.9036 = -0.0125`, within the maximum allowed gap of 0.0200. CAGRA returned 125 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle. This is a closeness verdict for the fixed low-effort point, which remains 0.0464 below the separate ≥0.95 target. The later same-index curve above reaches that target by increasing traversal effort; it does not change this gate's narrow verdict. All 192 CAGRA searches per process reported GPU with zero attribution failures and zero explicit index uploads. AUTO construction ends in the CPU host optimizer, so its final-primitive label does not describe the complete mixed pipeline.
 
 The performance result remains negative: hnswlib was 3.30× faster in median search throughput, 1.302× faster to build, 10.76× better in median amortized p99, and 1.689× lighter by isolated peak process RSS. Energy was disabled, the pre-run load sample was not retained, and the artifacts contain no in-run clock, thermal, or occupancy trace. The runs are clean revision-bound current-lab diagnostics rather than the full publishable B1 curve/energy baseline. Their build walls span only 0.65%.
 
