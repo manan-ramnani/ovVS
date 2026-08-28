@@ -23,6 +23,12 @@ SCHEMA_VERSION = "ovvs.benchmark.v1"
 SIFT_SHA256 = "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984"
 WORKER_PREFIX = "__OVVS_BENCH_RESULT__="
 LANE_STATUSES = {"success", "unavailable", "failed", "timeout", "skipped"}
+CAGRA_RECALL_GATE = "cagra-recall"
+CAGRA_RECALL_GATE_MAX_GAP = 0.0200
+CAGRA_RECALL_GATE_POINTS = {
+    "cagra": {"itopk_size": 32, "search_width": 1, "query_batch_size": 32},
+    "hnsw": {"ef": 32, "query_batch_size": 32},
+}
 
 ALGORITHM_ORDER = ("brute", "ivf-flat", "ivf-pq", "cagra")
 POLICY_ORDER = ("auto", "cpu", "npu", "gpu", "hetero")
@@ -726,16 +732,262 @@ def measure_energy(reader: Callable[[], int | None] | None, search_once: Callabl
     }
 
 
-def point_parameters(profile: dict[str, Any], algorithm: str) -> list[dict[str, Any]]:
+def point_parameters(profile: dict[str, Any], algorithm: str,
+                     selection: Sequence[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     if algorithm == "brute":
-        return [{"query_batch_size": profile["query_batch_size"]}]
-    if algorithm in ("ivf-flat", "ivf-pq"):
-        return [{"nprobe": value, "query_batch_size": profile["query_batch_size"]} for value in profile["nprobes"]]
-    if algorithm == "cagra":
-        return list(profile["cagra_points"])
-    if algorithm == "hnsw":
-        return list(profile["hnsw_points"])
-    raise ValueError(f"unsupported algorithm: {algorithm}")
+        points = [{"query_batch_size": profile["query_batch_size"]}]
+    elif algorithm in ("ivf-flat", "ivf-pq"):
+        points = [
+            {"nprobe": value, "query_batch_size": profile["query_batch_size"]}
+            for value in profile["nprobes"]
+        ]
+    elif algorithm == "cagra":
+        points = list(profile["cagra_points"])
+    elif algorithm == "hnsw":
+        points = list(profile["hnsw_points"])
+    else:
+        raise ValueError(f"unsupported algorithm: {algorithm}")
+    if selection is None:
+        return points
+    selected: list[dict[str, Any]] = []
+    for expected in selection:
+        matches = [point for point in points if point == expected]
+        if len(matches) != 1:
+            raise ValueError(f"{algorithm} point selection is not present exactly once: {expected}")
+        selected.append(matches[0])
+    return selected
+
+
+def cagra_recall_gate_result(
+    dataset: dict[str, Any],
+    ground_truth: dict[str, Any],
+    profile: dict[str, Any],
+    lanes: Sequence[dict[str, Any]],
+    hnsw_threads: int | None,
+) -> dict[str, Any]:
+    """Evaluate the narrow SIFT1M CAGRA-vs-hnswlib recall checkpoint."""
+
+    issues: list[str] = []
+    expected_profile = {
+        "k": 10,
+        "graph_degree": 16,
+        "intermediate_degree": 32,
+        "hnsw_ef_construction": 200,
+        "warmups": 1,
+        "repeats": 5,
+    }
+    for key, expected in expected_profile.items():
+        if profile.get(key) != expected:
+            issues.append(f"profile {key}={profile.get(key)!r}, expected {expected!r}")
+    source = dataset.get("source", {})
+    expected_dataset = {
+        "status": "success",
+        "kind": "sift1m",
+        "n": 1_000_000,
+        "source_n": 1_000_000,
+        "dim": 128,
+        "nq": 1_000,
+        "source_nq": 10_000,
+        "metric": "squared_l2",
+    }
+    for key, expected in expected_dataset.items():
+        if dataset.get(key) != expected:
+            issues.append(f"dataset {key}={dataset.get(key)!r}, expected {expected!r}")
+    if (
+        source.get("checksum_valid") is not True
+        or source.get("sha256") != SIFT_SHA256
+        or source.get("expected_sha256") != SIFT_SHA256
+    ):
+        issues.append("dataset is not the checksum-pinned canonical SIFT1M HDF5")
+    if dataset.get("ground_truth_hint", {}).get("hdf5_neighbors_eligible") is not True:
+        issues.append("canonical HDF5 neighbors were not eligible for this dataset selection")
+
+    truth_validation = ground_truth.get("validation", {})
+    if ground_truth.get("status") != "success" or ground_truth.get("exact") is not True:
+        issues.append("exact SIFT1M ground truth is unavailable")
+    if ground_truth.get("method") != "hdf5_neighbors":
+        issues.append("ground truth did not use the canonical HDF5 neighbors")
+    if ground_truth.get("shape") != [1_000, 10]:
+        issues.append(f"ground-truth shape {ground_truth.get('shape')!r}, expected [1000, 10]")
+    if truth_validation.get("id_count") != 10_000:
+        issues.append("ground truth does not contain exactly 10,000 neighbor IDs")
+    if truth_validation.get("complete_base_selected") is not True:
+        issues.append("ground truth was not validated against the complete SIFT1M base")
+    if truth_validation.get("query_prefix_selected") is not True:
+        issues.append("ground truth was not validated against the complete 1,000-query prefix")
+    if truth_validation.get("invalid_id_count") != 0:
+        issues.append("ground truth contains invalid neighbor IDs")
+    if truth_validation.get("duplicate_row_count") != 0:
+        issues.append("ground truth contains duplicate neighbor IDs")
+
+    expected_lane_ids = {"ovvs.cagra.gpu", "hnswlib.hnsw"}
+    lane_by_id = {str(lane.get("id")): lane for lane in lanes}
+    if len(lanes) != 2 or len(lane_by_id) != 2 or set(lane_by_id) != expected_lane_ids:
+        issues.append(
+            f"gate lanes {sorted(lane_by_id)}, expected exactly {sorted(expected_lane_ids)}"
+        )
+
+    def one_successful_point(lane_id: str, expected: dict[str, Any]) -> dict[str, Any]:
+        lane = lane_by_id.get(lane_id, {})
+        if lane.get("status") != "success":
+            issues.append(f"{lane_id} is not successful")
+        points = lane.get("points")
+        if not isinstance(points, list) or len(points) != 1:
+            issues.append(f"{lane_id} must contain exactly one point")
+            return {}
+        point = points[0]
+        if point.get("parameters") != expected:
+            issues.append(
+                f"{lane_id} parameters {point.get('parameters')!r}, expected {expected!r}"
+            )
+        if point.get("status") != "success" or point.get("validation", {}).get("status") != "success":
+            issues.append(f"{lane_id} point or neighbor validation is not successful")
+        measurement = point.get("measurement", {})
+        measurement_contract = {
+            "warmup_passes": 1,
+            "measured_passes": 5,
+            "query_count_per_pass": 1_000,
+            "query_batch_size": 32,
+        }
+        if any(measurement.get(key) != value for key, value in measurement_contract.items()):
+            issues.append(f"{lane_id} does not match the fixed 1x5, 1000-query, batch-32 contract")
+        pass_samples = measurement.get("pass_latency_ms", {}).get("samples")
+        qps_samples = measurement.get("qps", {}).get("samples")
+        if (
+            measurement.get("pass_latency_ms", {}).get("summary", {}).get("count") != 5
+            or measurement.get("qps", {}).get("summary", {}).get("count") != 5
+            or not isinstance(pass_samples, list)
+            or len(pass_samples) != 5
+            or not isinstance(qps_samples, list)
+            or len(qps_samples) != 5
+        ):
+            issues.append(f"{lane_id} does not contain exactly five latency and QPS samples")
+        return point
+
+    cagra_lane = lane_by_id.get("ovvs.cagra.gpu", {})
+    cagra_point = one_successful_point(
+        "ovvs.cagra.gpu", CAGRA_RECALL_GATE_POINTS["cagra"]
+    )
+    build = cagra_lane.get("build", {})
+    if (
+        cagra_lane.get("implementation") != "ovvs"
+        or cagra_lane.get("algorithm") != "cagra"
+        or cagra_lane.get("policy_key") != "gpu"
+        or cagra_lane.get("policy") != "FORCE_GPU"
+    ):
+        issues.append("ovVS gate lane is not CAGRA FORCE_GPU search")
+    if (
+        build.get("status") != "success"
+        or build.get("requested_policy_key") != "auto"
+        or build.get("requested_policy") != "AUTO"
+        or build.get("policy_contract", {}).get("status") != "not_forced"
+        or build.get("last_device", {}).get("status") != "reported"
+        or build.get("last_device", {}).get("label") not in ("CPU", "NPU", "GPU")
+    ):
+        issues.append("ovVS CAGRA build lacks successful AUTO-policy attribution")
+    contract = cagra_point.get("policy_contract", {})
+    if (
+        contract.get("requested") != "FORCE_GPU"
+        or contract.get("conforming") is not True
+        or contract.get("reported_last_primitive_devices") != ["GPU"]
+    ):
+        issues.append("ovVS CAGRA search lacks conforming FORCE_GPU attribution")
+    transfer = cagra_point.get("cagra_transfer", {})
+    delta = transfer.get("delta", {})
+    walks = delta.get("walks")
+    expected_walks = 192  # ceil(1000 / 32) * (1 warmup + 5 measured passes)
+    if (
+        transfer.get("status") != "success"
+        or transfer.get("contract", {}).get("conforming") is not True
+        or not all(
+            type(delta.get(key)) is int
+            for key in ("walks", "direct_walks", "index_upload_calls", "index_upload_bytes")
+        )
+        or walks != expected_walks
+        or delta.get("direct_walks") != expected_walks
+        or delta.get("index_upload_calls") != 0
+        or delta.get("index_upload_bytes") != 0
+    ):
+        issues.append(
+            "ovVS CAGRA search lacks exact direct transfer delta 192/192/0/0"
+        )
+
+    hnsw_lane = lane_by_id.get("hnswlib.hnsw", {})
+    hnsw_point = one_successful_point("hnswlib.hnsw", CAGRA_RECALL_GATE_POINTS["hnsw"])
+    hnsw_metadata = hnsw_lane.get("implementation_metadata", {})
+    if hnsw_lane.get("implementation") != "hnswlib" or hnsw_lane.get("algorithm") != "hnsw":
+        issues.append("comparator gate lane is not hnswlib HNSW")
+    if hnsw_lane.get("build", {}).get("status") != "success":
+        issues.append("hnswlib build is not successful")
+    if (
+        type(hnsw_threads) is not int
+        or hnsw_threads <= 0
+        or hnsw_metadata.get("threading") != "explicit"
+        or hnsw_metadata.get("num_threads") != hnsw_threads
+    ):
+        issues.append("hnswlib thread count was not pinned and recorded")
+    if (
+        hnsw_metadata.get("M") != 16
+        or hnsw_metadata.get("ef_construction") != 200
+        or hnsw_metadata.get("random_seed") != 7
+    ):
+        issues.append("hnswlib construction did not use M=16, ef_construction=200, seed=7")
+
+    def recall_metric(point: dict[str, Any], lane_id: str) -> float | None:
+        value = point.get("recall", {}).get("value")
+        status = point.get("recall", {}).get("status")
+        valid = status == "success" and isinstance(value, (int, float)) and 0 <= value <= 1
+        if not valid or not math.isfinite(float(value)):
+            issues.append(f"{lane_id} has no valid recall result")
+            return None
+        return float(value)
+
+    def qps_metric(point: dict[str, Any]) -> float | None:
+        value = point.get("measurement", {}).get("qps", {}).get("summary", {}).get("median")
+        return (
+            float(value)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)) and value > 0
+            else None
+        )
+
+    cagra_recall = recall_metric(cagra_point, "ovvs.cagra.gpu")
+    hnsw_recall = recall_metric(hnsw_point, "hnswlib.hnsw")
+    cagra_qps = qps_metric(cagra_point)
+    hnsw_qps = qps_metric(hnsw_point)
+    gap = hnsw_recall - cagra_recall if cagra_recall is not None and hnsw_recall is not None else None
+    if issues:
+        status = "invalid"
+    else:
+        status = (
+            "pass"
+            if gap is not None and gap <= CAGRA_RECALL_GATE_MAX_GAP + 1e-12
+            else "fail"
+        )
+    return {
+        "id": CAGRA_RECALL_GATE,
+        "status": status,
+        "passed": status == "pass",
+        "canonical": False,
+        "scope": "single_matched_quality_point_not_full_b1_recall_qps_curve",
+        "verdict_metric": "recall_only",
+        "threshold": {
+            "expression": "hnswlib_recall_minus_cagra_recall <= 0.0200",
+            "max_absolute_recall_gap": CAGRA_RECALL_GATE_MAX_GAP,
+        },
+        "recall": {
+            "cagra": cagra_recall,
+            "hnswlib": hnsw_recall,
+            "hnswlib_minus_cagra": gap,
+        },
+        "qps_median": {
+            "cagra": cagra_qps,
+            "hnswlib": hnsw_qps,
+            "used_for_verdict": False,
+        },
+        "hnswlib_threads": hnsw_threads,
+        "effective_settings": {**expected_profile, "seed": 7},
+        "validation": {"status": "success" if not issues else "failed", "issues": issues},
+    }
 
 
 def point_failure_reason(points: Sequence[dict[str, Any]]) -> str | None:
@@ -932,6 +1184,13 @@ def render_markdown(artifact: dict[str, Any]) -> str:
         "| Lane | Status | Build policy | Build ms | Build last primitive | Build NPU fallbacks Δ | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Search last primitive | CAGRA transfer Δ Wcalls/Dcalls/Ucalls/Ubytes | Reason |",
         "|---|---:|---|---:|---|---:|---|---:|---:|---:|---:|---:|---|---|---|",
     ]
+    gate = artifact.get("quality_gate")
+    if gate:
+        lines[8:8] = [
+            f"- Quality gate: **{gate['status']}**; noncanonical single-point checkpoint",
+            f"- Recall: CAGRA={format_number(gate['recall']['cagra'], 4)}, hnswlib={format_number(gate['recall']['hnswlib'], 4)}, gap={format_number(gate['recall']['hnswlib_minus_cagra'], 4)} (maximum 0.0200)",
+            f"- QPS median (reported, not part of verdict): CAGRA={format_number(gate['qps_median']['cagra'], 1)}, hnswlib={format_number(gate['qps_median']['hnswlib'], 1)}",
+        ]
     for lane in artifact["lanes"]:
         build = lane.get("build", {})
         build_ms = build.get("elapsed_ms")

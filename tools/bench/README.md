@@ -26,6 +26,14 @@ python -m pip install numpy h5py faiss-cpu hnswlib
 
 Use `--algorithms` and `--policies` for a subset, for example `--algorithms brute,ivf-flat --policies auto,cpu,gpu`. Defaults include AUTO, FORCE_CPU, FORCE_NPU, FORCE_GPU, and HETERO. `--build-policy` independently selects one construction policy for every ovVS lane and defaults to AUTO; for example, `--build-policy force-cpu` restores CPU-only construction while leaving search lanes unchanged. HETERO is recorded honestly as equivalent to AUTO until B6 lands. `--allow-unscalable-cagra` is an explicit opt-in to CAGRA above 4,096 vectors while full-scale build quality, CPU-prune cost, and peak-resource evidence remain open; otherwise those lanes stay resource-gated. CAGRA FORCE_NPU remains visible but skipped because there is no NPU graph-walk path. IVF-PQ FORCE_GPU is likewise a visible nonblocking skip: ADC deliberately has no iGPU backend and now fails closed.
 
+The narrow CAGRA quality checkpoint has a dedicated mode:
+
+```powershell
+python tools/bench/bench.py --gate-only cagra-recall --hnsw-threads 20
+```
+
+This mode deterministically selects the checksum-pinned full SIFT1M fixture, AUTO construction, FORCE_GPU CAGRA search, and one matched pair: CAGRA `itopk_size=32,search_width=1,query_batch_size=32` versus hnswlib `ef=32,query_batch_size=32`. It fixes one warmup, five measured passes, seed 7, and disables energy. The gate passes only when `hnswlib recall - CAGRA recall <= 0.0200` with valid exact truth, device attribution, and an exact CAGRA transfer delta of `192/192/0/0`. QPS is reported but never enters the verdict. The artifact and Markdown remain `partial` and noncanonical even on a passing exit, because one pair cannot close B1's full recall-QPS curves. A passing gate exits zero without `--allow-partial`; a failed or invalid gate exits nonzero. When `--hnsw-threads` is omitted, the mode pins the recorded `os.cpu_count()` value. Near-boundary recall should be rerun because parallel hnswlib insertion can vary despite a fixed seed and thread count.
+
 ## Evidence contract
 
 - Official HDF5 neighbors are accepted only when the complete HDF5 base is selected. Prefix, synthetic, and custom bases use `faiss.IndexFlatL2`; without FAISS, exact recall is explicitly unavailable.

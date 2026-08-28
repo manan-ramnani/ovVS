@@ -22,6 +22,8 @@ from typing import Any, Sequence
 
 from _common import (
     ALGORITHM_ORDER,
+    CAGRA_RECALL_GATE,
+    CAGRA_RECALL_GATE_POINTS,
     LANE_STATUSES,
     POLICY_LABELS,
     POLICY_ORDER,
@@ -29,6 +31,7 @@ from _common import (
     ROOT,
     SCHEMA_VERSION,
     WORKER_PREFIX,
+    cagra_recall_gate_result,
     completion_issues,
     default_output_path,
     enumerate_lanes,
@@ -47,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--profile", choices=tuple(PROFILE_DEFAULTS), default="smoke")
+    parser.add_argument(
+        "--gate-only",
+        choices=(CAGRA_RECALL_GATE,),
+        help="run one noncanonical SIFT1M quality checkpoint instead of a full curve",
+    )
     parser.add_argument("--algorithms", default="all", help="comma-separated: brute,ivf-flat,ivf-pq,cagra")
     parser.add_argument("--policies", default="all", help="comma-separated: auto,cpu,npu,gpu,hetero")
     parser.add_argument(
@@ -63,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeats", type=int, help="override measured passes (minimum 2)")
     parser.add_argument("--timeout-seconds", type=float, help="per-oracle/per-lane timeout")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--hnsw-threads",
+        type=int,
+        help="explicit hnswlib build/search threads; gate-only defaults to os.cpu_count()",
+    )
     parser.add_argument("--no-energy", action="store_true")
     parser.add_argument(
         "--allow-unscalable-cagra",
@@ -79,6 +92,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--_spec", help=argparse.SUPPRESS)
     parser.add_argument("--_lane", help=argparse.SUPPRESS)
     return parser
+
+
+def normalize_gate_configuration(args: argparse.Namespace) -> None:
+    """Apply the fixed effective selection for a reproducible gate-only run."""
+
+    if getattr(args, "hnsw_threads", None) is not None and args.hnsw_threads <= 0:
+        raise ValueError("hnsw threads must be positive")
+    if getattr(args, "gate_only", None) != CAGRA_RECALL_GATE:
+        return
+    args.profile = "sift1m"
+    args.algorithms = "cagra"
+    args.policies = "gpu"
+    args.build_policy = "auto"
+    args.warmups = 1
+    args.repeats = 5
+    args.seed = 7
+    args.no_energy = True
+    args.allow_unscalable_cagra = True
+    if args.hnsw_threads is None:
+        args.hnsw_threads = max(1, os.cpu_count() or 1)
+
+
+def gate_exit_code(artifact: dict[str, Any]) -> int:
+    return 0 if artifact.get("quality_gate", {}).get("status") == "pass" else 3
 
 
 def _tail(value: str | bytes | None, limit: int = 4_000) -> str | None:
@@ -175,6 +212,16 @@ def _artifact(
     started_at: str,
 ) -> dict[str, Any]:
     issues = completion_issues(args.profile, dataset, ground_truth, lanes)
+    gate_only = getattr(args, "gate_only", None)
+    quality_gate = None
+    if gate_only == CAGRA_RECALL_GATE:
+        quality_gate = cagra_recall_gate_result(
+            dataset, ground_truth, profile, lanes, getattr(args, "hnsw_threads", None)
+        )
+        issues.append(
+            "gate-only cagra-recall is a noncanonical two-point quality checkpoint; it does not "
+            "satisfy B1 full recall-QPS curves or package-energy evidence"
+        )
     if args.profile == "embedding-100k" and dataset.get("kind") == "synthetic":
         issues.append(
             "embedding-100k uses the provisional synthetic workload; this exercises the B1 harness but "
@@ -186,16 +233,25 @@ def _artifact(
         artifact_dataset.pop("query_path", None)
         artifact_dataset["runtime_storage"] = "ephemeral_files_deleted_after_run"
     counts = {status: sum(lane.get("status") == status for lane in lanes) for status in sorted(LANE_STATUSES)}
-    return {
+    artifact = {
         "schema_version": SCHEMA_VERSION,
         "started_at": started_at,
         "finished_at": utc_now(),
         "profile": {"name": args.profile, "settings": profile},
         "selection": {
+            "gate_only": gate_only,
             "algorithms": algorithms,
             "build_policy": POLICY_LABELS[getattr(args, "build_policy", "auto")],
             "build_policy_key": getattr(args, "build_policy", "auto"),
             "policies": [POLICY_LABELS[value] for value in policies],
+            "point_selection": (
+                {key: [value] for key, value in CAGRA_RECALL_GATE_POINTS.items()}
+                if gate_only == CAGRA_RECALL_GATE
+                else None
+            ),
+            "hnswlib_threads": getattr(args, "hnsw_threads", None),
+            "seed": getattr(args, "seed", 7),
+            "energy": not getattr(args, "no_energy", False),
         },
         "dataset": artifact_dataset,
         "ground_truth": ground_truth,
@@ -204,7 +260,9 @@ def _artifact(
             "status": "complete" if not issues else "partial",
             "issues": issues,
             "lane_counts": counts,
-            "full_profile_strict": args.profile != "smoke" and not args.allow_partial,
+            "full_profile_strict": (
+                args.profile != "smoke" and not args.allow_partial and gate_only is None
+            ),
         },
         "metadata": {
             "command": [str(Path(__file__).resolve()), *sys.argv[1:]],
@@ -229,13 +287,27 @@ def _artifact(
                 "HETERO currently equals AUTO (backlog B6).",
                 "IVF-PQ FORCE_GPU is a visible expected skip because ADC has no iGPU backend and fails closed.",
                 "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
+                *(
+                    [
+                        "Gate-only CAGRA recall reports timing but decides only on matched-point recall; "
+                        "it is never full B1 evidence."
+                    ]
+                    if gate_only == CAGRA_RECALL_GATE
+                    else []
+                ),
             ],
         },
     }
+    if quality_gate is not None:
+        artifact["selection"]["canonical"] = False
+        artifact["completion"]["canonical_b1_evidence"] = False
+        artifact["quality_gate"] = quality_gate
+    return artifact
 
 
 def orchestrate(args: argparse.Namespace) -> int:
     try:
+        normalize_gate_configuration(args)
         algorithms = parse_selection(args.algorithms, ALGORITHM_ORDER, "algorithm")
         policies = parse_selection(args.policies, POLICY_ORDER, "policy")
         build_policies = parse_selection(args.build_policy, POLICY_ORDER, "build policy")
@@ -270,6 +342,13 @@ def orchestrate(args: argparse.Namespace) -> int:
             "library": args.library,
             "energy": not args.no_energy,
             "seed": args.seed,
+            "gate_only": getattr(args, "gate_only", None),
+            "point_selection": (
+                {key: [value] for key, value in CAGRA_RECALL_GATE_POINTS.items()}
+                if getattr(args, "gate_only", None) == CAGRA_RECALL_GATE
+                else {}
+            ),
+            "hnsw_threads": getattr(args, "hnsw_threads", None),
         }
         spec_path = directory / "run-spec.json"
         spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
@@ -312,6 +391,13 @@ def orchestrate(args: argparse.Namespace) -> int:
     print(f"Completion: {artifact['completion']['status']} {artifact['completion']['lane_counts']}")
     if artifact["completion"]["issues"]:
         print(f"Incomplete evidence: {len(artifact['completion']['issues'])} issue(s)")
+    if getattr(args, "gate_only", None) == CAGRA_RECALL_GATE:
+        gate = artifact["quality_gate"]
+        print(
+            f"Quality gate: {gate['status']} "
+            f"(hnswlib-CAGRA recall={gate['recall']['hnswlib_minus_cagra']})"
+        )
+        return gate_exit_code(artifact)
     if full_profile and artifact["completion"]["issues"] and not args.allow_partial:
         return 3
     return 0

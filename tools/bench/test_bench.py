@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,12 +11,16 @@ from unittest.mock import patch
 import numpy as np
 
 import bench
+import _common
 import _worker
 from _worker import _cagra_transfer_evidence, exception_point_status
 from _common import (
     ALGORITHM_ORDER,
+    CAGRA_RECALL_GATE_POINTS,
     POLICY_ORDER,
     ROOT,
+    SIFT_SHA256,
+    cagra_recall_gate_result,
     completion_issues,
     default_output_path,
     duplicate_safe_recall,
@@ -23,6 +29,7 @@ from _common import (
     ovvs_resource_metadata,
     parse_selection,
     percentile,
+    point_parameters,
     point_failure_reason,
     policy_contract,
     prepare_dataset,
@@ -71,6 +78,88 @@ def successful_gpu_cagra_lane(transfer: dict | None) -> dict:
     return lane
 
 
+def gate_dataset() -> dict:
+    return {
+        "status": "success",
+        "kind": "sift1m",
+        "n": 1_000_000,
+        "source_n": 1_000_000,
+        "dim": 128,
+        "nq": 1_000,
+        "source_nq": 10_000,
+        "metric": "squared_l2",
+        "source": {
+            "checksum_valid": True,
+            "sha256": SIFT_SHA256,
+            "expected_sha256": SIFT_SHA256,
+        },
+        "ground_truth_hint": {"hdf5_neighbors_eligible": True},
+    }
+
+
+def gate_truth() -> dict:
+    return {
+        "status": "success",
+        "method": "hdf5_neighbors",
+        "exact": True,
+        "shape": [1_000, 10],
+        "validation": {
+            "complete_base_selected": True,
+            "query_prefix_selected": True,
+            "id_count": 10_000,
+            "invalid_id_count": 0,
+            "duplicate_row_count": 0,
+        },
+    }
+
+
+def gate_lanes(cagra_recall: float = 0.88, hnsw_recall: float = 0.90,
+               walks: int = 192, threads: int = 20) -> list[dict]:
+    transfer = _cagra_transfer_evidence(
+        {"walks": 0, "direct_walks": 0, "index_upload_calls": 0, "index_upload_bytes": 0},
+        {
+            "walks": walks,
+            "direct_walks": walks,
+            "index_upload_calls": 0,
+            "index_upload_bytes": 0,
+        },
+    )
+    cagra = successful_gpu_cagra_lane(transfer)
+    measurement = {
+        "warmup_passes": 1,
+        "measured_passes": 5,
+        "query_count_per_pass": 1_000,
+        "query_batch_size": 32,
+        "pass_latency_ms": {"samples": [1.0] * 5, "summary": {"count": 5}},
+        "qps": {"samples": [123.0] * 5, "summary": {"count": 5, "median": 123.0}},
+    }
+    cagra["points"][0].update(
+        parameters=CAGRA_RECALL_GATE_POINTS["cagra"],
+        recall={"status": "success", "value": cagra_recall},
+        measurement=json.loads(json.dumps(measurement)),
+        policy_contract={
+            "requested": "FORCE_GPU",
+            "conforming": True,
+            "reported_last_primitive_devices": ["GPU"],
+        },
+    )
+    hnsw = successful_lane("hnswlib.hnsw")
+    hnsw.update(implementation="hnswlib", algorithm="hnsw")
+    hnsw["points"][0].update(
+        parameters=CAGRA_RECALL_GATE_POINTS["hnsw"],
+        recall={"status": "success", "value": hnsw_recall},
+        measurement=json.loads(json.dumps(measurement)),
+    )
+    hnsw["implementation_metadata"] = {
+        "M": 16,
+        "ef_construction": 200,
+        "random_seed": 7,
+        "threading": "explicit",
+        "num_threads": threads,
+    }
+    return [cagra, hnsw]
+
+
 class PureHelperTests(unittest.TestCase):
     def test_duplicate_results_do_not_inflate_recall(self) -> None:
         self.assertEqual(duplicate_safe_recall([[1, 1]], [[1, 2]], 2), 0.5)
@@ -103,6 +192,120 @@ class PureHelperTests(unittest.TestCase):
             parse_selection("cuda", POLICY_ORDER, "policy")
         with self.assertRaises(ValueError):
             parse_selection(" , ", POLICY_ORDER, "policy")
+
+    def test_gate_point_selector_returns_exactly_one_matched_point(self) -> None:
+        profile = resolved_profile("sift1m")
+        self.assertEqual(point_parameters(profile, "cagra"), profile["cagra_points"])
+        self.assertEqual(point_parameters(profile, "hnsw"), profile["hnsw_points"])
+        self.assertEqual(
+            point_parameters(profile, "cagra", [CAGRA_RECALL_GATE_POINTS["cagra"]]),
+            [CAGRA_RECALL_GATE_POINTS["cagra"]],
+        )
+        with self.assertRaises(ValueError):
+            point_parameters(
+                profile,
+                "cagra",
+                [{"itopk_size": 31, "search_width": 1, "query_batch_size": 32}],
+            )
+
+    def test_gate_configuration_normalizes_conflicting_selection(self) -> None:
+        args = bench.build_parser().parse_args(
+            [
+                "--gate-only", "cagra-recall",
+                "--profile", "smoke",
+                "--algorithms", "brute",
+                "--policies", "cpu",
+                "--build-policy", "gpu",
+                "--warmups", "9",
+                "--repeats", "9",
+                "--seed", "99",
+                "--timeout-seconds", "7200",
+            ]
+        )
+        with patch.object(bench.os, "cpu_count", return_value=20):
+            bench.normalize_gate_configuration(args)
+        self.assertEqual(args.profile, "sift1m")
+        self.assertEqual(args.algorithms, "cagra")
+        self.assertEqual(args.policies, "gpu")
+        self.assertEqual(args.build_policy, "auto")
+        self.assertEqual((args.warmups, args.repeats, args.seed), (1, 5, 7))
+        self.assertEqual(args.timeout_seconds, 7200)
+        self.assertEqual(args.hnsw_threads, 20)
+        self.assertTrue(args.no_energy)
+        self.assertTrue(args.allow_unscalable_cagra)
+
+    def test_non_gate_configuration_preserves_existing_defaults(self) -> None:
+        args = bench.build_parser().parse_args([])
+        before = vars(args).copy()
+        bench.normalize_gate_configuration(args)
+        self.assertEqual(vars(args), before)
+
+    def test_cagra_recall_gate_passes_at_absolute_boundary_without_using_qps(self) -> None:
+        lanes = gate_lanes(cagra_recall=0.88, hnsw_recall=0.90)
+        lanes[0]["points"][0]["measurement"]["qps"]["summary"]["median"] = None
+        lanes[1]["points"][0]["measurement"]["qps"]["summary"]["median"] = 1_000_000.0
+        result = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["qps_median"]["used_for_verdict"])
+        self.assertIsNone(result["qps_median"]["cagra"])
+
+    def test_cagra_recall_gate_fails_only_above_absolute_boundary(self) -> None:
+        result = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"),
+            gate_lanes(cagra_recall=0.8799, hnsw_recall=0.90), 20
+        )
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["validation"]["status"], "success")
+
+    def test_cagra_recall_gate_rejects_wrong_transfer_count_and_truth(self) -> None:
+        truth = gate_truth()
+        truth["validation"]["duplicate_row_count"] = 1
+        result = cagra_recall_gate_result(
+            gate_dataset(), truth, resolved_profile("sift1m"), gate_lanes(walks=191), 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("duplicate" in issue for issue in result["validation"]["issues"]))
+        self.assertTrue(any("192/192/0/0" in issue for issue in result["validation"]["issues"]))
+
+    def test_cagra_recall_gate_rejects_duplicate_lanes_and_non_integer_transfer(self) -> None:
+        lanes = gate_lanes()
+        lanes[0]["points"][0]["cagra_transfer"]["delta"]["index_upload_calls"] = False
+        lanes.append(json.loads(json.dumps(lanes[0])))
+        result = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("expected exactly" in issue for issue in result["validation"]["issues"]))
+        self.assertTrue(any("192/192/0/0" in issue for issue in result["validation"]["issues"]))
+
+    def test_cagra_recall_gate_rejects_wrong_measurement_contract(self) -> None:
+        lanes = gate_lanes()
+        lanes[1]["points"][0]["measurement"]["query_batch_size"] = 1
+        result = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("batch-32" in issue for issue in result["validation"]["issues"]))
+
+    def test_cagra_recall_gate_rejects_drifted_build_geometry(self) -> None:
+        profile = resolved_profile("sift1m")
+        profile["graph_degree"] = 32
+        result = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), profile, gate_lanes(), 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("graph_degree" in issue for issue in result["validation"]["issues"]))
+
+    def test_gate_exit_code_uses_quality_status_not_partial_completion(self) -> None:
+        self.assertEqual(
+            bench.gate_exit_code({"quality_gate": {"status": "pass"}, "completion": {"status": "partial"}}),
+            0,
+        )
+        for status in ("fail", "invalid", "unavailable", None):
+            self.assertEqual(bench.gate_exit_code({"quality_gate": {"status": status}}), 3)
 
     def test_hash_helper_is_content_stable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -408,6 +611,157 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertNotIn("base_path", artifact["dataset"])
         self.assertNotIn("query_path", artifact["dataset"])
         self.assertEqual(artifact["dataset"]["runtime_storage"], "ephemeral_files_deleted_after_run")
+
+    def test_gate_artifact_is_partial_noncanonical_even_when_gate_passes(self) -> None:
+        artifact = bench._artifact(
+            SimpleNamespace(
+                profile="sift1m",
+                gate_only="cagra-recall",
+                hnsw_threads=20,
+                build_policy="auto",
+                allow_partial=False,
+            ),
+            resolved_profile("sift1m"),
+            ["cagra"],
+            ["gpu"],
+            gate_dataset(),
+            gate_truth(),
+            gate_lanes(),
+            "2026-08-28T00:00:00Z",
+        )
+        self.assertEqual(artifact["quality_gate"]["status"], "pass")
+        self.assertEqual(artifact["completion"]["status"], "partial")
+        self.assertFalse(artifact["completion"]["canonical_b1_evidence"])
+        self.assertFalse(artifact["completion"]["full_profile_strict"])
+        self.assertFalse(artifact["selection"]["canonical"])
+        markdown = _common.render_markdown(artifact)
+        self.assertIn("QPS median (reported, not part of verdict)", markdown)
+
+    def test_official_ground_truth_rejects_duplicate_rows(self) -> None:
+        class FakeFile:
+            def __enter__(self):
+                return {"neighbors": np.asarray([[0, 0], [1, 2]], dtype=np.int64)}
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_h5py = SimpleNamespace(File=lambda *_args, **_kwargs: FakeFile())
+        with tempfile.TemporaryDirectory() as raw:
+            spec = {
+                "dataset": {
+                    "ground_truth_hint": {"hdf5_neighbors_eligible": True},
+                    "path": "fixture.hdf5",
+                    "neighbors_key": "neighbors",
+                    "nq": 2,
+                    "n": 4,
+                    "source_n": 4,
+                },
+                "profile": {"k": 2},
+                "truth_path": str(Path(raw) / "truth.npy"),
+            }
+            with patch.dict(sys.modules, {"h5py": fake_h5py}):
+                with self.assertRaisesRegex(RuntimeError, "duplicate IDs"):
+                    _worker.compute_ground_truth(spec)
+
+    def test_official_ground_truth_rejects_wrong_shape_and_invalid_ids(self) -> None:
+        cases = (
+            (np.asarray([[0, 1]], dtype=np.int64), "neighbor shape"),
+            (np.asarray([[0, 4], [1, 2]], dtype=np.int64), "out-of-range IDs"),
+        )
+        for neighbors, message in cases:
+            with self.subTest(message=message):
+                class FakeFile:
+                    def __enter__(self):
+                        return {"neighbors": neighbors}
+
+                    def __exit__(self, *_args):
+                        return False
+
+                fake_h5py = SimpleNamespace(File=lambda *_args, **_kwargs: FakeFile())
+                with tempfile.TemporaryDirectory() as raw:
+                    spec = {
+                        "dataset": {
+                            "ground_truth_hint": {"hdf5_neighbors_eligible": True},
+                            "path": "fixture.hdf5",
+                            "neighbors_key": "neighbors",
+                            "nq": 2,
+                            "n": 4,
+                            "source_n": 4,
+                        },
+                        "profile": {"k": 2},
+                        "truth_path": str(Path(raw) / "truth.npy"),
+                    }
+                    with patch.dict(sys.modules, {"h5py": fake_h5py}):
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            _worker.compute_ground_truth(spec)
+
+
+class HnswThreadingTests(unittest.TestCase):
+    def test_explicit_hnsw_threads_apply_to_build_and_search_and_are_recorded(self) -> None:
+        class FakeIndex:
+            def __init__(self, **_kwargs) -> None:
+                self.set_threads: list[int] = []
+                self.add_threads: list[int | None] = []
+                self.query_threads: list[int | None] = []
+
+            def init_index(self, **_kwargs) -> None:
+                pass
+
+            def set_num_threads(self, value: int) -> None:
+                self.set_threads.append(value)
+
+            def add_items(self, _base, _ids, num_threads=None) -> None:
+                self.add_threads.append(num_threads)
+
+            def set_ef(self, _value: int) -> None:
+                pass
+
+            def knn_query(self, batch, k: int, num_threads=None):
+                self.query_threads.append(num_threads)
+                return (
+                    np.zeros((len(batch), k), dtype=np.int64),
+                    np.zeros((len(batch), k), dtype=np.float32),
+                )
+
+        index = FakeIndex()
+        fake_hnswlib = SimpleNamespace(Index=lambda **_kwargs: index)
+        profile = resolved_profile("smoke")
+        profile.update(k=1, warmups=0, repeats=2)
+        base = np.zeros((2, 2), dtype=np.float32)
+        queries = np.zeros((1, 2), dtype=np.float32)
+        with tempfile.TemporaryDirectory() as raw:
+            truth_path = Path(raw) / "truth.npy"
+            np.save(truth_path, np.zeros((1, 1), dtype=np.int64), allow_pickle=False)
+            spec = {
+                "dataset": {"n": 2, "nq": 1, "dim": 2},
+                "profile": profile,
+                "truth_path": str(truth_path),
+                "energy": False,
+                "seed": 7,
+                "library": None,
+                "gate_only": "cagra-recall",
+                "point_selection": {"hnsw": [CAGRA_RECALL_GATE_POINTS["hnsw"]]},
+                "hnsw_threads": 3,
+            }
+            lane = {
+                "id": "hnswlib.hnsw",
+                "implementation": "hnswlib",
+                "algorithm": "hnsw",
+            }
+            with (
+                patch.dict(sys.modules, {"hnswlib": fake_hnswlib}),
+                patch.object(_worker, "load_dataset", return_value=(base, queries)),
+                patch.object(_worker, "_optional_energy_reader", return_value=(None, None)),
+            ):
+                result = _worker.run_hnsw(spec, lane)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(index.set_threads, [3])
+        self.assertEqual(index.add_threads, [3])
+        self.assertTrue(index.query_threads)
+        self.assertEqual(set(index.query_threads), {3})
+        self.assertEqual(result["implementation_metadata"]["threading"], "explicit")
+        self.assertEqual(result["implementation_metadata"]["num_threads"], 3)
 
 
 class OvvsBuildPolicyTests(unittest.TestCase):

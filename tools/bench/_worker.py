@@ -50,9 +50,19 @@ def compute_ground_truth(spec: dict[str, Any]) -> dict[str, Any]:
             truth = np.asarray(
                 handle[dataset["neighbors_key"]][: dataset["nq"], : profile["k"]], dtype=np.int64
             )
+        expected_shape = (int(dataset["nq"]), int(profile["k"]))
+        if tuple(truth.shape) != expected_shape:
+            raise RuntimeError(
+                f"official HDF5 neighbor shape {tuple(truth.shape)} != {expected_shape}"
+            )
         bad = int(np.count_nonzero((truth < 0) | (truth >= dataset["n"])))
         if bad:
             raise RuntimeError(f"official HDF5 neighbors contain {bad} out-of-range IDs")
+        duplicate_rows = sum(len(set(int(value) for value in row)) != profile["k"] for row in truth)
+        if duplicate_rows:
+            raise RuntimeError(
+                f"official HDF5 neighbors contain duplicate IDs in {duplicate_rows} rows"
+            )
         np.save(truth_path, truth, allow_pickle=False)
         return {
             "status": "success",
@@ -62,7 +72,9 @@ def compute_ground_truth(spec: dict[str, Any]) -> dict[str, Any]:
             "validation": {
                 "complete_base_selected": dataset["n"] == dataset["source_n"],
                 "query_prefix_selected": True,
+                "id_count": int(truth.size),
                 "invalid_id_count": bad,
+                "duplicate_row_count": duplicate_rows,
             },
             "elapsed_ms": (time.perf_counter() - started) * 1_000,
         }
@@ -293,6 +305,14 @@ def _ovvs_search(index: Any, algorithm: str, point: dict[str, Any], k: int):
     raise ValueError(f"unsupported ovVS algorithm: {algorithm}")
 
 
+def _selected_points(spec: dict[str, Any], algorithm: str) -> list[dict[str, Any]]:
+    selection = spec.get("point_selection", {}).get(algorithm)
+    points = point_parameters(spec["profile"], algorithm, selection)
+    if spec.get("gate_only") and len(points) != 1:
+        raise ValueError(f"gate-only {algorithm} selector produced {len(points)} points, expected 1")
+    return points
+
+
 def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     import numpy as np
 
@@ -355,7 +375,7 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
         )
         resources.set_policy(POLICY_VALUES[policy])
         points: list[dict[str, Any]] = []
-        for configured in point_parameters(spec["profile"], lane["algorithm"]):
+        for configured in _selected_points(spec, lane["algorithm"]):
             point = dict(configured)
             if lane["algorithm"] == "ivf-pq":
                 point["krefine"] = spec["profile"]["krefine"]
@@ -495,7 +515,7 @@ def run_faiss(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     reader, energy_resources = _optional_energy_reader(spec.get("library"))
     points: list[dict[str, Any]] = []
     try:
-        for point in point_parameters(spec["profile"], lane["algorithm"]):
+        for point in _selected_points(spec, lane["algorithm"]):
             point = dict(point)
             if lane["algorithm"] in ("ivf-flat", "ivf-pq"):
                 index.nprobe = point["nprobe"]
@@ -567,16 +587,29 @@ def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
         M=profile["graph_degree"],
         random_seed=spec["seed"],
     )
-    index.add_items(base, np.arange(spec["dataset"]["n"], dtype=np.int64))
+    hnsw_threads = spec.get("hnsw_threads")
+    if hnsw_threads is not None:
+        if type(hnsw_threads) is not int or hnsw_threads <= 0:
+            raise ValueError("hnsw_threads must be a positive integer")
+        index.set_num_threads(hnsw_threads)
+        index.add_items(
+            base,
+            np.arange(spec["dataset"]["n"], dtype=np.int64),
+            num_threads=hnsw_threads,
+        )
+    else:
+        index.add_items(base, np.arange(spec["dataset"]["n"], dtype=np.int64))
     build_ms = (time.perf_counter() - build_started) * 1_000
     reader, energy_resources = _optional_energy_reader(spec.get("library"))
     points: list[dict[str, Any]] = []
     try:
-        for point in point_parameters(profile, "hnsw"):
+        for point in _selected_points(spec, "hnsw"):
             point = dict(point)
             index.set_ef(max(point["ef"], profile["k"]))
 
             def search(batch: Any):
+                if hnsw_threads is not None:
+                    return index.knn_query(batch, k=profile["k"], num_threads=hnsw_threads)
                 return index.knn_query(batch, k=profile["k"])
 
             try:
@@ -618,7 +651,9 @@ def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
             "hnswlib_version": package_version("hnswlib"),
             "M": profile["graph_degree"],
             "ef_construction": profile["hnsw_ef_construction"],
-            "threading": "hnswlib_default",
+            "random_seed": spec["seed"],
+            "threading": "explicit" if hnsw_threads is not None else "hnswlib_default",
+            "num_threads": hnsw_threads,
         },
     }
 
