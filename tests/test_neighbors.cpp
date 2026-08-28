@@ -78,8 +78,8 @@ static void brute_oracle(const float* data, int64_t n, int64_t dim, const float*
 }
 
 static float sampled_graph_l2_overlap(const float* data, int64_t n, int64_t dim,
-                                      const int32_t* graph, int32_t degree,
-                                      int32_t sample_rows) {
+                                       const int32_t* graph, int32_t degree,
+                                       int32_t sample_rows) {
   int64_t hits = 0;
   for (int32_t sample = 0; sample < sample_rows; ++sample) {
     const int64_t row = (static_cast<int64_t>(sample) * 104729 + 17) % n;
@@ -109,6 +109,62 @@ static float sampled_graph_l2_overlap(const float* data, int64_t n, int64_t dim,
     }
   }
   return static_cast<float>(hits) / static_cast<float>(sample_rows * degree);
+}
+
+struct NnDescentStatsSnapshot {
+  int32_t iterations_run = 0;
+  int64_t changed_edges = 0;
+  int64_t pending_new_edges = 0;
+  double change_ratio = 0.0;
+  int64_t peak_device_bytes = 0;
+  bool converged = false;
+};
+
+static NnDescentStatsSnapshot nndescent_stats(ovvsResources_t resources) {
+  auto* data = ovvs::impl::rd(resources);
+  std::lock_guard<std::mutex> lock(data->nndescent_stats_mutex);
+  return {data->nndescent_iterations_run, data->nndescent_changed_edges,
+          data->nndescent_pending_new_edges, data->nndescent_change_ratio,
+          data->nndescent_peak_device_bytes, data->nndescent_converged};
+}
+
+static bool same_nndescent_stats(const NnDescentStatsSnapshot& lhs,
+                                 const NnDescentStatsSnapshot& rhs) {
+  return lhs.iterations_run == rhs.iterations_run &&
+         lhs.changed_edges == rhs.changed_edges &&
+         lhs.pending_new_edges == rhs.pending_new_edges &&
+         lhs.change_ratio == rhs.change_ratio &&
+         lhs.peak_device_bytes == rhs.peak_device_bytes && lhs.converged == rhs.converged;
+}
+
+static float l2_distance(const float* data, int64_t dim, int64_t lhs, int64_t rhs) {
+  float distance = 0.f;
+  for (int64_t d = 0; d < dim; ++d) {
+    const float delta = data[lhs * dim + d] - data[rhs * dim + d];
+    distance += delta * delta;
+  }
+  return distance;
+}
+
+static void expect_graph_l2_rows_sorted(const float* data, int64_t n, int64_t dim,
+                                        const int32_t* graph, int32_t degree) {
+  for (int64_t row = 0; row < n; ++row) {
+    float previous_distance = -1.f;
+    int32_t previous_id = -1;
+    for (int32_t edge = 0; edge < degree; ++edge) {
+      const int32_t id = graph[row * degree + edge];
+      const float distance = l2_distance(data, dim, row, id);
+      expect(edge == 0 || previous_distance < distance ||
+                 (previous_distance == distance && previous_id < id),
+             "NN-Descent row must be ordered by (distance, id): row=" +
+                 std::to_string(row) + " edge=" + std::to_string(edge) +
+                 " previous_id=" + std::to_string(previous_id) + " id=" +
+                 std::to_string(id) + " previous_distance=" +
+                 std::to_string(previous_distance) + " distance=" + std::to_string(distance));
+      previous_distance = distance;
+      previous_id = id;
+    }
+  }
 }
 
 OVVS_TEST(brute_force_recall_one) {
@@ -654,9 +710,36 @@ OVVS_TEST(nndescent_gpu_n_over_4096) {
     }
     expect(static_cast<int32_t>(unique.size()) == degree, "large NN-Descent unique row");
   }
+  expect_graph_l2_rows_sorted(data.data(), n, dim, ids, degree);
+  const NnDescentStatsSnapshot first_stats = nndescent_stats(res.r);
+  const int64_t edge_count = n * degree;
+  expect(first_stats.iterations_run > 0 && first_stats.iterations_run <= iterations,
+         "NN-Descent iteration telemetry bounds");
+  expect(first_stats.changed_edges >= 0 && first_stats.changed_edges <= edge_count,
+         "NN-Descent exact changed-edge bounds");
+  expect(first_stats.pending_new_edges >= 0 && first_stats.pending_new_edges <= edge_count,
+         "NN-Descent pending-NEW bounds");
+  expect(std::isfinite(first_stats.change_ratio) && first_stats.change_ratio >= 0.0 &&
+             first_stats.change_ratio <= 1.0,
+         "NN-Descent finite change-ratio bounds");
+  expect(std::fabs(first_stats.change_ratio -
+                   static_cast<double>(first_stats.changed_edges) /
+                       static_cast<double>(edge_count)) < 1e-15,
+         "NN-Descent exact changed-edge ratio");
+  expect(first_stats.peak_device_bytes > 0, "NN-Descent peak owned bytes telemetry");
+  expect(!first_stats.converged ||
+             (first_stats.change_ratio < 0.0001 && first_stats.pending_new_edges == 0),
+         "NN-Descent convergence requires no pending NEW edges");
+  expect(first_stats.converged || first_stats.iterations_run == iterations,
+         "NN-Descent non-converged build must exhaust its iteration budget");
   const float overlap = sampled_graph_l2_overlap(data.data(), n, dim, ids, degree, 64);
-  std::printf("    nndescent_gpu_n_over_4096 build_ms=%.3f sampled_overlap=%.4f\n", build_ms,
-              static_cast<double>(overlap));
+  std::printf("    nndescent_gpu_n_over_4096 build_ms=%.3f sampled_overlap=%.4f "
+              "iterations=%d changed_edges=%lld pending_new_edges=%lld converged=%d "
+              "peak_device_bytes=%lld\n",
+              build_ms, static_cast<double>(overlap), first_stats.iterations_run,
+              static_cast<long long>(first_stats.changed_edges),
+              static_cast<long long>(first_stats.pending_new_edges), first_stats.converged ? 1 : 0,
+              static_cast<long long>(first_stats.peak_device_bytes));
   expect(overlap >= 0.60f, "large NN-Descent sampled exact overlap " + std::to_string(overlap));
 
   std::vector<int32_t> first(ids, ids + n * degree);
@@ -668,6 +751,9 @@ OVVS_TEST(nndescent_gpu_n_over_4096) {
   expect_status(ovvsNnDescentNeighbors(graph, &ids, &graph_n, &graph_degree),
                 "deterministic NN-Descent neighbors");
   expect(std::equal(first.begin(), first.end(), ids), "GPU NN-Descent deterministic graph");
+  const NnDescentStatsSnapshot second_stats = nndescent_stats(res.r);
+  expect(same_nndescent_stats(first_stats, second_stats),
+         "GPU NN-Descent deterministic convergence telemetry");
   ovvsNnDescentDestroy(graph);
 }
 
@@ -711,12 +797,84 @@ OVVS_TEST(nndescent_gpu_bounded_scale) {
     expect(static_cast<int32_t>(unique.size()) == degree,
            "bounded-scale NN-Descent unique row");
   }
+  const NnDescentStatsSnapshot stats = nndescent_stats(res.r);
   const float overlap = sampled_graph_l2_overlap(data.data(), n, dim, ids, degree, 32);
-  std::printf("    nndescent_gpu_bounded_scale build_ms=%.3f sampled_overlap=%.4f\n", build_ms,
-              static_cast<double>(overlap));
+  std::printf("    nndescent_gpu_bounded_scale build_ms=%.3f sampled_overlap=%.4f "
+              "iterations=%d changed_edges=%lld pending_new_edges=%lld converged=%d "
+              "peak_device_bytes=%lld\n",
+              build_ms, static_cast<double>(overlap), stats.iterations_run,
+              static_cast<long long>(stats.changed_edges),
+              static_cast<long long>(stats.pending_new_edges), stats.converged ? 1 : 0,
+              static_cast<long long>(stats.peak_device_bytes));
   expect(overlap >= 0.25f,
          "bounded-scale NN-Descent sampled exact overlap " + std::to_string(overlap));
   ovvsNnDescentDestroy(graph);
+}
+
+OVVS_TEST(nndescent_gpu_nonfinite_fails_closed) {
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "nonfinite NN-Descent GPU availability");
+  if (!gpu) skip_test("GPU device unavailable");
+
+  const int64_t n = 4097, dim = 4;
+  auto data = make_data(n, dim, 307);
+  data[data.size() / 2u] = std::numeric_limits<float>::quiet_NaN();
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  ovvsNnDescentGraph_t graph = reinterpret_cast<ovvsNnDescentGraph_t>(uintptr_t{1});
+  expect(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 8, 4,
+                            &graph) == OVVS_STATUS_INVALID_ARGUMENT,
+         "nonfinite GPU NN-Descent input must fail closed");
+  expect(graph == nullptr, "nonfinite GPU NN-Descent must not publish a graph");
+  const NnDescentStatsSnapshot stats = nndescent_stats(res.r);
+  expect(stats.iterations_run == 0 && stats.changed_edges == 0 &&
+             stats.pending_new_edges == 0 && stats.change_ratio == 0.0 &&
+             stats.peak_device_bytes == 0 && !stats.converged,
+         "failed GPU NN-Descent must clear prior convergence telemetry");
+}
+
+OVVS_TEST(nndescent_gpu_structured_iteration_progress) {
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "structured NN-Descent GPU availability");
+  if (!gpu) skip_test("GPU device unavailable");
+
+  const int64_t n = 4097, dim = 2;
+  const int32_t degree = 8;
+  std::vector<float> data(static_cast<size_t>(n * dim));
+  for (int64_t row = 0; row < n; ++row) {
+    data[static_cast<size_t>(row * dim)] = static_cast<float>(row) / 4096.f;
+    data[static_cast<size_t>(row * dim + 1)] =
+        static_cast<float>((row * 37) % 101) * 1e-5f;
+  }
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+
+  ovvsNnDescentGraph_t one_iteration = nullptr;
+  expect_status(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                                   degree, 1, &one_iteration),
+                "structured one-iteration NN-Descent build");
+  const int32_t* ids = nullptr;
+  int64_t graph_n = 0;
+  int32_t graph_degree = 0;
+  expect_status(ovvsNnDescentNeighbors(one_iteration, &ids, &graph_n, &graph_degree),
+                "structured one-iteration neighbors");
+  std::vector<int32_t> first(ids, ids + n * degree);
+  ovvsNnDescentDestroy(one_iteration);
+
+  ovvsNnDescentGraph_t two_iterations = nullptr;
+  expect_status(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                                   degree, 2, &two_iterations),
+                "structured two-iteration NN-Descent build");
+  expect_status(ovvsNnDescentNeighbors(two_iterations, &ids, &graph_n, &graph_degree),
+                "structured two-iteration neighbors");
+  const NnDescentStatsSnapshot stats = nndescent_stats(res.r);
+  expect(stats.iterations_run == 2 && stats.changed_edges > 0,
+         "structured second reverse/proposal join must make topology progress");
+  expect(!std::equal(first.begin(), first.end(), ids),
+         "structured second iteration must change the graph");
+  ovvsNnDescentDestroy(two_iterations);
 }
 
 OVVS_TEST(nndescent_large_forced_policy_contract) {

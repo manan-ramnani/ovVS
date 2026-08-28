@@ -60,7 +60,7 @@ CAGRA build
   prune               → CPU until T13.3 (full FORCE_GPU build is unavailable)
 
 Vamana / NN-Descent
-  NN-Descent n>4096  → iGPU SYCL sampled local join (B5 bounded checkpoint)
+  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (B5 partial)
   Vamana prune/walk  → host control path (B21 remains open)
 
 k-means
@@ -97,6 +97,8 @@ The current measured Windows build links OpenVINO **2025.3.0** with Intel NPU dr
 - An OpenVINO custom `ov::Op` supplies graph semantics, shape inference, serialization, and optional CPU evaluation. It does **not** provide a public NPU kernel implementation. GPU custom operations separately require OpenCL kernel code; ovVS keeps ANN hot loops in SYCL and the compiler/SHAVE track rather than treating `add_extension` as NPU support.
 
 The archived Intel NPU Acceleration Library is reference material only; Intel directs users to OpenVINO/OpenVINO GenAI. Its useful confirmation is architectural: static/tiled graphs, managed DMA/cache, and quantized/mixed-precision paths. ovVS will not add it as a dependency. From OpenVINO GenAI, only the bounded scheduler, persistent compiled state, and explicit performance telemetry generalize. Token/KV/prefix caches, paged attention, and speculative decoding are LLM-specific and are not ANN index techniques.
+
+The current B3/B6/B7 experiments are software-only and require no BIOS or firmware change. Resizable BAR and firmware power tuning have no measured ovVS benefit on this machine and are excluded unless future authoritative device evidence plus a controlled end-to-end benchmark justifies reopening them.
 
 Primary references: [Intel NPU Acceleration Library EOL](https://github.com/intel/intel-npu-acceleration-library), [OpenVINO NPU device and model caching](https://docs.openvino.ai/2026/openvino-workflow/running-inference/inference-devices-and-modes/npu-device.html), [NPU Remote Tensor API](https://docs.openvino.ai/2026/openvino-workflow/running-inference/inference-devices-and-modes/npu-device/remote-tensor-api-npu-plugin.html), [custom OpenVINO operations](https://docs.openvino.ai/2026/documentation/openvino-extensibility/custom-openvino-operations.html), and [OpenVINO GenAI continuous batching](https://github.com/openvinotoolkit/openvino.genai/blob/master/src/README.md#continuous-batching-with-llmpipeline).
 

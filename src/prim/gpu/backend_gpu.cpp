@@ -587,6 +587,15 @@ bool sycl_gpu_available() {
 ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
                                int64_t dim, ovvsMetric metric, int32_t degree,
                                int32_t iters, int32_t* graph) {
+  {
+    std::lock_guard<std::mutex> lock(r.nndescent_stats_mutex);
+    r.nndescent_iterations_run = 0;
+    r.nndescent_changed_edges = 0;
+    r.nndescent_pending_new_edges = 0;
+    r.nndescent_change_ratio = 0.0;
+    r.nndescent_peak_device_bytes = 0;
+    r.nndescent_converged = false;
+  }
 #if defined(OVVS_WITH_SYCL)
   if (!sycl_gpu_available()) return OVVS_STATUS_DEVICE_UNAVAILABLE;
   if (!dataset || !graph || n <= 1 || dim <= 0 || degree <= 0 || iters <= 0) {
@@ -606,67 +615,109 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
     const size_t N = static_cast<size_t>(n);
     const size_t D = static_cast<size_t>(dim);
     const size_t DEG = static_cast<size_t>(degree);
-    const size_t neighbor_samples = std::min<size_t>(DEG, 8u);
-    const size_t exploration_count = std::min<size_t>(32u, std::max<size_t>(8u, DEG / 2u));
+    constexpr size_t kSampleCap = 16u;
+    constexpr size_t kReverseSourceChunk = 196608u;
+    constexpr size_t kProposalVertexChunk = 16384u;
+    constexpr size_t kVertexGroupsPerLaunch = 65536u;
+    constexpr uint32_t kNewMask = 0x80000000u;
+    constexpr uint32_t kIdMask = 0x7fffffffu;
+    constexpr uint32_t kInvalidId = 0x7fffffffu;
+    constexpr double kTerminationThreshold = 0.0001;
+    const size_t sample_count = std::min(DEG, kSampleCap);
+    const size_t max_bi_samples = sample_count * 2u;
+    const size_t proposals_per_vertex = sample_count * 12u;
     const int met = static_cast<int>(metric);
     const int64_t iteration_count = static_cast<int64_t>(iters);
 
     size_t dataset_count = 0;
     size_t graph_count = 0;
-    size_t sampled_count = 0;
+    size_t reverse_count = 0;
     if (!checked_product(N, D, dataset_count) || !checked_product(N, DEG, graph_count) ||
-        !checked_product(DEG, neighbor_samples, sampled_count)) {
+        !checked_product(N, sample_count, reverse_count)) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
-    if (sampled_count > std::numeric_limits<size_t>::max() - DEG ||
-        sampled_count + DEG > std::numeric_limits<size_t>::max() - exploration_count) {
+    const size_t reverse_chunk = std::min(N, kReverseSourceChunk);
+    const size_t proposal_chunk = std::min(N, kProposalVertexChunk);
+    size_t reverse_inbox_count = 0;
+    size_t proposal_inbox_count = 0;
+    if (!checked_product(reverse_chunk, sample_count, reverse_inbox_count) ||
+        !checked_product(proposal_chunk, proposals_per_vertex, proposal_inbox_count)) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
-    const size_t candidate_capacity = DEG + sampled_count + exploration_count;
-    if (candidate_capacity > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+    const size_t link_count = std::max(reverse_inbox_count, proposal_inbox_count);
+    if (link_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
 
     size_t dataset_bytes = 0;
-    size_t graph_bytes = 0;
+    size_t graph_plane_bytes = 0;
+    size_t reverse_plane_bytes = 0;
+    size_t link_bytes = 0;
+    size_t proposal_id_bytes = 0;
+    size_t proposal_distance_bytes = 0;
+    size_t row_bytes = 0;
     if (!checked_product(dataset_count, sizeof(float), dataset_bytes) ||
-        !checked_product(graph_count, sizeof(int32_t), graph_bytes)) {
+        !checked_product(graph_count, sizeof(uint32_t), graph_plane_bytes) ||
+        !checked_product(reverse_count, sizeof(uint32_t), reverse_plane_bytes) ||
+        !checked_product(link_count, sizeof(int32_t), link_bytes) ||
+        !checked_product(proposal_inbox_count, sizeof(uint32_t), proposal_id_bytes) ||
+        !checked_product(proposal_inbox_count, sizeof(float), proposal_distance_bytes) ||
+        !checked_product(N, sizeof(uint32_t), row_bytes)) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
     const bool dataset_direct = gpu_pointer_accessible(q, dataset);
     const size_t max_alloc = device.get_info<sycl::info::device::max_mem_alloc_size>();
-    if ((!dataset_direct && dataset_bytes > max_alloc) || graph_bytes > max_alloc) {
+    if ((!dataset_direct && dataset_bytes > max_alloc) || graph_plane_bytes > max_alloc ||
+        reverse_plane_bytes > max_alloc || link_bytes > max_alloc ||
+        proposal_id_bytes > max_alloc || proposal_distance_bytes > max_alloc ||
+        row_bytes > max_alloc) {
       return OVVS_STATUS_OOM;
     }
 
-    size_t device_bytes = dataset_direct ? 0u : dataset_bytes;
-    if (graph_bytes > (std::numeric_limits<size_t>::max() - device_bytes) / 2u) {
+    size_t device_bytes = 0;
+    const auto add_device_bytes = [&](size_t bytes) {
+      if (bytes > std::numeric_limits<size_t>::max() - device_bytes) return false;
+      device_bytes += bytes;
+      return true;
+    };
+    if ((!dataset_direct && !add_device_bytes(dataset_bytes)) ||
+        !add_device_bytes(graph_plane_bytes) || !add_device_bytes(graph_plane_bytes) ||
+        !add_device_bytes(graph_plane_bytes) || !add_device_bytes(graph_plane_bytes) ||
+        !add_device_bytes(reverse_plane_bytes) || !add_device_bytes(reverse_plane_bytes) ||
+        !add_device_bytes(link_bytes) || !add_device_bytes(proposal_id_bytes) ||
+        !add_device_bytes(proposal_distance_bytes) || !add_device_bytes(row_bytes) ||
+        !add_device_bytes(row_bytes) || !add_device_bytes(2u * sizeof(int32_t))) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
-    device_bytes += graph_bytes * 2u;
     const uint64_t global_mem = device.get_info<sycl::info::device::global_mem_size>();
     if (static_cast<uint64_t>(device_bytes) > global_mem) return OVVS_STATUS_OOM;
-
-    size_t requested_bloom_bits = 0;
-    if (!checked_product(candidate_capacity, 8u, requested_bloom_bits)) {
+    if (device_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
-    const size_t bloom_bits = next_power_of_two(std::max<size_t>(256u, requested_bloom_bits));
-    if (bloom_bits == 0 || (bloom_bits & 31u) != 0) return OVVS_STATUS_SHAPE_MISMATCH;
-    const size_t bloom_words = bloom_bits / 32u;
 
-    size_t candidate_bytes = 0;
-    size_t bloom_bytes = 0;
-    if (!checked_product(candidate_capacity, sizeof(int32_t) + sizeof(float), candidate_bytes) ||
-        !checked_product(bloom_words, sizeof(uint32_t), bloom_bytes) ||
-        bloom_bytes > std::numeric_limits<size_t>::max() - 4u * sizeof(int32_t) ||
-        candidate_bytes >
-            std::numeric_limits<size_t>::max() - bloom_bytes - 4u * sizeof(int32_t)) {
+    size_t twice_degree = 0;
+    if (!checked_product(DEG, 2u, twice_degree)) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
-    const size_t local_bytes = candidate_bytes + bloom_bytes + 4u * sizeof(int32_t);
+    const size_t convergence_hash_capacity =
+        next_power_of_two(std::max<size_t>(2u, twice_degree));
+    if (convergence_hash_capacity == 0) return OVVS_STATUS_SHAPE_MISMATCH;
+    size_t convergence_local_bytes = 0;
+    size_t matrix_cells = 0;
+    size_t join_local_bytes = 0;
+    if (!checked_product(convergence_hash_capacity, sizeof(int32_t), convergence_local_bytes) ||
+        !checked_product(max_bi_samples, max_bi_samples, matrix_cells) ||
+        !checked_product(matrix_cells, 2u * sizeof(float), join_local_bytes) ||
+        max_bi_samples >
+            (std::numeric_limits<size_t>::max() - join_local_bytes - 2u * sizeof(int32_t)) /
+                (2u * sizeof(uint32_t))) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    join_local_bytes += max_bi_samples * 2u * sizeof(uint32_t) + 2u * sizeof(int32_t);
     const size_t local_mem = device.get_info<sycl::info::device::local_mem_size>();
-    if (local_bytes > local_mem) return OVVS_STATUS_OOM;
+    if (std::max(join_local_bytes, convergence_local_bytes) > local_mem) {
+      return OVVS_STATUS_OOM;
+    }
 
     const size_t max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>();
     if (max_work_group_size == 0) return OVVS_STATUS_DEVICE_UNAVAILABLE;
@@ -674,17 +725,52 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
     while (work_group_size < 128u && work_group_size <= max_work_group_size / 2u) {
       work_group_size <<= 1u;
     }
-    constexpr size_t kVertexGroupsPerLaunch = 65536u;
 
     ScopedDeviceUsm<float> dataset_copy(q, dataset_direct ? 0u : dataset_count);
-    ScopedDeviceUsm<int32_t> graph_a(q, graph_count);
-    ScopedDeviceUsm<int32_t> graph_b(q, graph_count);
+    ScopedDeviceUsm<uint32_t> ids_a(q, graph_count);
+    ScopedDeviceUsm<uint32_t> ids_b(q, graph_count);
+    ScopedDeviceUsm<float> distances_a(q, graph_count);
+    ScopedDeviceUsm<float> distances_b(q, graph_count);
+    ScopedDeviceUsm<uint32_t> reverse_new(q, reverse_count);
+    ScopedDeviceUsm<uint32_t> reverse_old(q, reverse_count);
+    ScopedDeviceUsm<int32_t> inbox_links(q, link_count);
+    ScopedDeviceUsm<uint32_t> proposal_ids(q, proposal_inbox_count);
+    ScopedDeviceUsm<float> proposal_distances(q, proposal_inbox_count);
+    ScopedDeviceUsm<int32_t> heads(q, N);
+    ScopedDeviceUsm<uint32_t> active_targets(q, N);
+    ScopedDeviceUsm<int32_t> scalars(q, 2u);
+    uint32_t* const reverse_new_ptr = reverse_new.get();
+    uint32_t* const reverse_old_ptr = reverse_old.get();
+    int32_t* const inbox_links_ptr = inbox_links.get();
+    uint32_t* const proposal_ids_ptr = proposal_ids.get();
+    float* const proposal_distances_ptr = proposal_distances.get();
+    int32_t* const heads_ptr = heads.get();
+    uint32_t* const active_targets_ptr = active_targets.get();
+    int32_t* const scalars_ptr = scalars.get();
     const float* DS = dataset_direct ? dataset : dataset_copy.get();
     if (!dataset_direct) q.memcpy(dataset_copy.get(), dataset, dataset_bytes);
     q.wait_and_throw();
 
-    int32_t* current = graph_a.get();
-    int32_t* next = graph_b.get();
+    q.fill(scalars_ptr + 1, 0, 1u);
+    q.wait_and_throw();
+    q.parallel_for(sycl::range<1>(dataset_count), [=](sycl::id<1> index) {
+      if (!sycl::isfinite(DS[index])) {
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            invalid(scalars_ptr[1]);
+        invalid.store(1);
+      }
+    });
+    q.wait_and_throw();
+    int32_t invalid_numeric = 0;
+    q.memcpy(&invalid_numeric, scalars_ptr + 1, sizeof(invalid_numeric));
+    q.wait_and_throw();
+    if (invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+
+    uint32_t* current_ids = ids_a.get();
+    uint32_t* next_ids = ids_b.get();
+    float* current_distances = distances_a.get();
+    float* next_distances = distances_b.get();
 
     for (size_t vertex_offset = 0; vertex_offset < N; vertex_offset += kVertexGroupsPerLaunch) {
       const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
@@ -726,61 +812,345 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
              const uint64_t permuted =
                  (start + static_cast<uint64_t>(edge) * step) % modulus;
              const size_t id = (vertex + 1u + static_cast<size_t>(permuted)) % N;
-             current[vertex * DEG + edge] = static_cast<int32_t>(id);
+             float l2 = 0.f;
+             float ip = 0.f;
+             float nx = 0.f;
+             float ny = 0.f;
+             const bool needs_ip = met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT) ||
+                                   met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED);
+             for (size_t d = 0; d < D; ++d) {
+               const float a = DS[vertex * D + d];
+               const float b = DS[id * D + d];
+               if (!needs_ip) {
+                 const float delta = a - b;
+                 l2 += delta * delta;
+               } else {
+                 ip += a * b;
+                 if (met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED)) {
+                   nx += a * a;
+                   ny += b * b;
+                 }
+               }
+             }
+             float distance = l2;
+             if (met == static_cast<int>(OVVS_METRIC_L2_SQRT_EXPANDED)) {
+               distance = sycl::sqrt(l2);
+             } else if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) {
+               distance = -ip;
+             } else if (met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED)) {
+               const float safe_nx = nx > 1e-12f ? nx : 1e-12f;
+               const float safe_ny = ny > 1e-12f ? ny : 1e-12f;
+               distance = 1.f - ip / (sycl::sqrt(safe_nx) * sycl::sqrt(safe_ny));
+             }
+             if (!sycl::isfinite(distance)) {
+               sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                sycl::memory_scope::device,
+                                sycl::access::address_space::global_space>
+                   invalid(scalars_ptr[1]);
+               invalid.store(1);
+               distance = std::numeric_limits<float>::max();
+             }
+             const size_t position = vertex * DEG + edge;
+             current_ids[position] = kNewMask | static_cast<uint32_t>(id);
+             current_distances[position] = distance;
+           }
+           item.barrier(sycl::access::fence_space::global_and_local);
+
+           if (lid == 0) {
+             const size_t row = vertex * DEG;
+             for (size_t edge = 1; edge < DEG; ++edge) {
+               const uint32_t tagged = current_ids[row + edge];
+               const uint32_t raw = tagged & kIdMask;
+               const float distance = current_distances[row + edge];
+               size_t insert = edge;
+               while (insert > 0) {
+                 const float previous_distance = current_distances[row + insert - 1u];
+                 const uint32_t previous_raw = current_ids[row + insert - 1u] & kIdMask;
+                 if (previous_distance < distance ||
+                     (previous_distance == distance && previous_raw <= raw)) {
+                   break;
+                 }
+                 current_ids[row + insert] = current_ids[row + insert - 1u];
+                 current_distances[row + insert] = previous_distance;
+                 --insert;
+               }
+               current_ids[row + insert] = tagged;
+               current_distances[row + insert] = distance;
+             }
            }
          });
        });
     }
     q.wait_and_throw();
+    q.memcpy(&invalid_numeric, scalars_ptr + 1, sizeof(invalid_numeric));
+    q.wait_and_throw();
+    if (invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+
+    std::vector<int32_t> changed_per_row(N);
+    std::vector<uint32_t> pending_new_per_row(N);
+    int32_t iterations_run = 0;
+    int64_t last_changed_edges = 0;
+    int64_t last_pending_new_edges = 0;
+    double last_change_ratio = 0.0;
+    bool converged = false;
 
     for (int64_t iteration = 0; iteration < iteration_count; ++iteration) {
-      for (size_t vertex_offset = 0; vertex_offset < N; vertex_offset += kVertexGroupsPerLaunch) {
+      for (size_t vertex_offset = 0; vertex_offset < N;
+           vertex_offset += kVertexGroupsPerLaunch) {
         const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
         size_t global_size = 0;
         if (!checked_product(launch_vertices, work_group_size, global_size)) {
           return OVVS_STATUS_SHAPE_MISMATCH;
         }
         q.submit([&](sycl::handler& h) {
-           sycl::local_accessor<int32_t, 1> candidate_ids(sycl::range<1>(candidate_capacity), h);
-           sycl::local_accessor<float, 1> candidate_distances(sycl::range<1>(candidate_capacity), h);
-           sycl::local_accessor<uint32_t, 1> seen_edges(sycl::range<1>(bloom_words), h);
-           sycl::local_accessor<int32_t, 1> state(sycl::range<1>(4), h);
+          h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
+                                           sycl::range<1>(work_group_size)),
+                         [=](sycl::nd_item<1> item) {
+            const size_t lid = item.get_local_linear_id();
+            const size_t vertex = vertex_offset + item.get_group_linear_id();
+            const size_t row = vertex * DEG;
+            for (size_t edge = lid; edge < DEG; edge += work_group_size) {
+              next_ids[row + edge] = current_ids[row + edge];
+              next_distances[row + edge] = current_distances[row + edge];
+            }
+            item.barrier(sycl::access::fence_space::global_and_local);
+            if (lid == 0) {
+              size_t sampled = 0;
+              for (size_t edge = 0; edge < DEG && sampled < sample_count; ++edge) {
+                const uint32_t tagged = current_ids[row + edge];
+                if ((tagged & kNewMask) != 0u) {
+                  next_ids[row + edge] = tagged & kIdMask;
+                  ++sampled;
+                }
+              }
+            }
+          });
+        });
+      }
+      q.wait_and_throw();
+
+      q.fill(reverse_new_ptr, kInvalidId, reverse_count);
+      q.fill(reverse_old_ptr, kInvalidId, reverse_count);
+      q.wait_and_throw();
+
+      const auto build_reverse = [&](bool select_new, uint32_t* reverse_graph) -> ovvsStatus {
+        for (size_t source_offset = 0; source_offset < N; source_offset += reverse_chunk) {
+          const size_t source_count = std::min(reverse_chunk, N - source_offset);
+          q.fill(heads_ptr, -1, N);
+          q.fill(scalars_ptr, 0, 1u);
+          q.wait_and_throw();
+
+          q.parallel_for(sycl::range<1>(source_count), [=](sycl::id<1> source_index) {
+            const size_t local_source = source_index[0];
+            const size_t source = source_offset + local_source;
+            size_t sample_rank = 0;
+            for (size_t edge = 0; edge < DEG && sample_rank < sample_count; ++edge) {
+              const uint32_t tagged = current_ids[source * DEG + edge];
+              const bool edge_is_new = (tagged & kNewMask) != 0u;
+              if (edge_is_new != select_new) continue;
+              const uint32_t target = tagged & kIdMask;
+              const size_t slot_size = local_source * sample_count + sample_rank;
+              const int32_t slot = static_cast<int32_t>(slot_size);
+              sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                               sycl::memory_scope::device,
+                               sycl::access::address_space::global_space>
+                  target_head(heads_ptr[target]);
+              const int32_t prior = target_head.exchange(slot);
+              inbox_links_ptr[slot_size] = prior;
+              if (prior == -1) {
+                sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                 sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>
+                    active_count(scalars_ptr[0]);
+                const int32_t active_slot = active_count.fetch_add(1);
+                active_targets_ptr[static_cast<size_t>(active_slot)] = target;
+              }
+              ++sample_rank;
+            }
+          });
+          q.wait_and_throw();
+
+          int32_t active_count = 0;
+          q.memcpy(&active_count, scalars_ptr, sizeof(active_count));
+          q.wait_and_throw();
+          if (active_count < 0 || static_cast<size_t>(active_count) > N) {
+            return OVVS_STATUS_ERROR;
+          }
+
+          q.parallel_for(sycl::range<1>(static_cast<size_t>(active_count)),
+                         [=](sycl::id<1> active_index) {
+            const uint32_t target = active_targets_ptr[active_index];
+            uint32_t best_ids[kSampleCap];
+            uint32_t best_priorities[kSampleCap];
+            for (size_t i = 0; i < kSampleCap; ++i) {
+              best_ids[i] = kInvalidId;
+              best_priorities[i] = std::numeric_limits<uint32_t>::max();
+            }
+            size_t count = 0;
+            auto mix32 = [](uint32_t value) {
+              value ^= value >> 16u;
+              value *= 0x7feb352du;
+              value ^= value >> 15u;
+              value *= 0x846ca68bu;
+              value ^= value >> 16u;
+              return value;
+            };
+            const uint32_t class_seed = select_new ? 0x9e3779b9u : 0xa511e9b3u;
+            const uint32_t priority_seed =
+                mix32(target ^ class_seed ^
+                      (static_cast<uint32_t>(iteration) + 1u) * 0x85ebca6bu);
+            auto consider = [&](uint32_t source) {
+              if (source == kInvalidId || source == target ||
+                  static_cast<size_t>(source) >= N) {
+                return;
+              }
+              for (size_t i = 0; i < count; ++i) {
+                if (best_ids[i] == source) return;
+              }
+              const uint32_t priority = mix32(source ^ priority_seed);
+              size_t position = 0;
+              while (position < count &&
+                     (best_priorities[position] < priority ||
+                      (best_priorities[position] == priority && best_ids[position] < source))) {
+                ++position;
+              }
+              if (position >= sample_count) return;
+              const size_t new_count = count < sample_count ? count + 1u : count;
+              for (size_t i = new_count; i > position + 1u; --i) {
+                best_ids[i - 1u] = best_ids[i - 2u];
+                best_priorities[i - 1u] = best_priorities[i - 2u];
+              }
+              best_ids[position] = source;
+              best_priorities[position] = priority;
+              count = new_count;
+            };
+
+            for (size_t i = 0; i < sample_count; ++i) {
+              consider(reverse_graph[static_cast<size_t>(target) * sample_count + i]);
+            }
+            int32_t link = heads_ptr[target];
+            size_t traversed = 0;
+            while (link >= 0 && traversed < reverse_inbox_count) {
+              const size_t slot = static_cast<size_t>(link);
+              const size_t local_source = slot / sample_count;
+              consider(static_cast<uint32_t>(source_offset + local_source));
+              link = inbox_links_ptr[slot];
+              ++traversed;
+            }
+            for (size_t i = 0; i < sample_count; ++i) {
+              reverse_graph[static_cast<size_t>(target) * sample_count + i] =
+                  i < count ? best_ids[i] : kInvalidId;
+            }
+          });
+          q.wait_and_throw();
+        }
+        return OVVS_STATUS_SUCCESS;
+      };
+
+      ovvsStatus reverse_status = build_reverse(true, reverse_new_ptr);
+      if (reverse_status != OVVS_STATUS_SUCCESS) return reverse_status;
+      reverse_status = build_reverse(false, reverse_old_ptr);
+      if (reverse_status != OVVS_STATUS_SUCCESS) return reverse_status;
+
+      for (size_t vertex_offset = 0; vertex_offset < N; vertex_offset += proposal_chunk) {
+        const size_t launch_vertices = std::min(proposal_chunk, N - vertex_offset);
+        size_t global_size = 0;
+        if (!checked_product(launch_vertices, work_group_size, global_size)) {
+          return OVVS_STATUS_SHAPE_MISMATCH;
+        }
+        q.fill(heads_ptr, -1, N);
+        q.fill(scalars_ptr, 0, 1u);
+        q.wait_and_throw();
+
+        q.submit([&](sycl::handler& h) {
+           sycl::local_accessor<uint32_t, 1> new_ids(sycl::range<1>(max_bi_samples), h);
+           sycl::local_accessor<uint32_t, 1> old_ids(sycl::range<1>(max_bi_samples), h);
+           sycl::local_accessor<float, 1> new_new_distances(sycl::range<1>(matrix_cells), h);
+           sycl::local_accessor<float, 1> new_old_distances(sycl::range<1>(matrix_cells), h);
+           sycl::local_accessor<int32_t, 1> state(sycl::range<1>(2), h);
            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
                                            sycl::range<1>(work_group_size)),
                           [=](sycl::nd_item<1> item) {
              const size_t lid = item.get_local_linear_id();
              const size_t vertex = vertex_offset + item.get_group_linear_id();
-             auto group = item.get_group();
-
-             auto mix32 = [](uint32_t value) {
-               value ^= value >> 16u;
-               value *= 0x7feb352du;
-               value ^= value >> 15u;
-               value *= 0x846ca68bu;
-               value ^= value >> 16u;
-               return value;
-             };
-
-             for (size_t word = lid; word < bloom_words; word += work_group_size) {
-               seen_edges[word] = 0u;
+             if (lid == 0) {
+               for (size_t i = 0; i < max_bi_samples; ++i) {
+                 new_ids[i] = kInvalidId;
+                 old_ids[i] = kInvalidId;
+               }
+               size_t new_count = 0;
+               size_t old_count = 0;
+               auto add_unique = [](auto& ids, size_t& count, size_t capacity, uint32_t id) {
+                 if (id == kInvalidId) return;
+                 for (size_t i = 0; i < count; ++i) {
+                   if (ids[i] == id) return;
+                 }
+                 if (count < capacity) ids[count++] = id;
+               };
+               size_t forward_new = 0;
+               size_t forward_old = 0;
+               for (size_t edge = 0; edge < DEG; ++edge) {
+                 const uint32_t tagged = current_ids[vertex * DEG + edge];
+                 const uint32_t raw = tagged & kIdMask;
+                 if ((tagged & kNewMask) != 0u) {
+                   if (forward_new < sample_count) {
+                     add_unique(new_ids, new_count, max_bi_samples, raw);
+                     ++forward_new;
+                   }
+                 } else if (forward_old < sample_count) {
+                   add_unique(old_ids, old_count, max_bi_samples, raw);
+                   ++forward_old;
+                 }
+               }
+               for (size_t i = 0; i < sample_count; ++i) {
+                 add_unique(new_ids, new_count, max_bi_samples,
+                            reverse_new_ptr[vertex * sample_count + i]);
+               }
+               for (size_t i = 0; i < sample_count; ++i) {
+                 const uint32_t candidate = reverse_old_ptr[vertex * sample_count + i];
+                 bool promoted_new = false;
+                 for (size_t j = 0; j < new_count; ++j) {
+                   if (new_ids[j] == candidate) {
+                     promoted_new = true;
+                     break;
+                   }
+                 }
+                 if (!promoted_new) {
+                   add_unique(old_ids, old_count, max_bi_samples, candidate);
+                 }
+               }
+               for (size_t i = 0; i < old_count;) {
+                 bool promoted_new = false;
+                 for (size_t j = 0; j < new_count; ++j) {
+                   if (old_ids[i] == new_ids[j]) {
+                     promoted_new = true;
+                     break;
+                   }
+                 }
+                 if (promoted_new) {
+                   for (size_t j = i + 1u; j < old_count; ++j) old_ids[j - 1u] = old_ids[j];
+                   --old_count;
+                 } else {
+                   ++i;
+                 }
+               }
+               state[0] = static_cast<int32_t>(new_count);
+               state[1] = static_cast<int32_t>(old_count);
              }
-             for (size_t slot = lid; slot < candidate_capacity; slot += work_group_size) {
-               candidate_ids[slot] = -1;
-               candidate_distances[slot] = std::numeric_limits<float>::max();
-             }
-             if (lid == 0) state[0] = 0;
              item.barrier(sycl::access::fence_space::local_space);
 
-             auto cooperative_distance = [&](int32_t id) {
+             const size_t new_count = static_cast<size_t>(state[0]);
+             const size_t old_count = static_cast<size_t>(state[1]);
+              auto point_distance = [&](uint32_t lhs, uint32_t rhs) {
                float l2 = 0.f;
                float ip = 0.f;
                float nx = 0.f;
                float ny = 0.f;
                const bool needs_ip = met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT) ||
                                      met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED);
-               for (size_t d = lid; d < D; d += work_group_size) {
-                 const float a = DS[vertex * D + d];
-                 const float b = DS[static_cast<size_t>(id) * D + d];
+               for (size_t d = 0; d < D; ++d) {
+                 const float a = DS[static_cast<size_t>(lhs) * D + d];
+                 const float b = DS[static_cast<size_t>(rhs) * D + d];
                  if (!needs_ip) {
                    const float delta = a - b;
                    l2 += delta * delta;
@@ -793,126 +1163,321 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
                  }
                }
                if (!needs_ip) {
-                 l2 = sycl::reduce_over_group(group, l2, sycl::plus<float>());
                  return met == static_cast<int>(OVVS_METRIC_L2_SQRT_EXPANDED) ? sycl::sqrt(l2)
                                                                              : l2;
                }
-               ip = sycl::reduce_over_group(group, ip, sycl::plus<float>());
                if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) return -ip;
-               nx = sycl::reduce_over_group(group, nx, sycl::plus<float>());
-               ny = sycl::reduce_over_group(group, ny, sycl::plus<float>());
                const float safe_nx = nx > 1e-12f ? nx : 1e-12f;
                const float safe_ny = ny > 1e-12f ? ny : 1e-12f;
-               return 1.f - ip / (sycl::sqrt(safe_nx) * sycl::sqrt(safe_ny));
-             };
+                return 1.f - ip / (sycl::sqrt(safe_nx) * sycl::sqrt(safe_ny));
+              };
+              auto checked_distance = [&](float distance) {
+                if (sycl::isfinite(distance)) return distance;
+                sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                 sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>
+                    invalid(scalars_ptr[1]);
+                invalid.store(1);
+                return std::numeric_limits<float>::max();
+              };
 
-             auto add_candidate = [&](int32_t candidate) {
-               if (candidate < 0 || static_cast<size_t>(candidate) >= N ||
-                   candidate == static_cast<int32_t>(vertex)) {
-                 return -1;
-               }
-               const uint32_t h1 = mix32(static_cast<uint32_t>(candidate));
-               const uint32_t h2 = mix32(static_cast<uint32_t>(candidate) ^ 0x9e3779b9u);
-               const size_t bit1 = static_cast<size_t>(h1) & (bloom_bits - 1u);
-               const size_t bit2 = static_cast<size_t>(h2) & (bloom_bits - 1u);
-               const uint32_t mask1 = 1u << (bit1 & 31u);
-               const uint32_t mask2 = 1u << (bit2 & 31u);
-               const bool maybe_seen = (seen_edges[bit1 >> 5u] & mask1) != 0u &&
-                                       (seen_edges[bit2 >> 5u] & mask2) != 0u;
-               if (maybe_seen) {
-                 for (int32_t i = 0; i < state[0]; ++i) {
-                   if (candidate_ids[static_cast<size_t>(i)] == candidate) return -1;
-                 }
-               }
-               if (state[0] >= static_cast<int32_t>(candidate_capacity)) return -1;
-               seen_edges[bit1 >> 5u] |= mask1;
-               seen_edges[bit2 >> 5u] |= mask2;
-               const int32_t slot = state[0]++;
-               candidate_ids[static_cast<size_t>(slot)] = candidate;
-               return slot;
-             };
-
-             auto evaluate_candidate = [&](int32_t candidate) {
-               if (lid == 0) {
-                 state[1] = candidate;
-                 state[2] = add_candidate(candidate);
-               }
-               item.barrier(sycl::access::fence_space::local_space);
-               const int32_t accepted = state[1];
-               const int32_t slot = state[2];
-               const float distance = slot >= 0 ? cooperative_distance(accepted) : 0.f;
-               if (lid == 0 && slot >= 0) {
-                 candidate_distances[static_cast<size_t>(slot)] = distance;
-               }
-               item.barrier(sycl::access::fence_space::local_space);
-             };
-
-             for (size_t edge = 0; edge < DEG; ++edge) {
-               evaluate_candidate(current[vertex * DEG + edge]);
-             }
-
-             for (size_t edge = 0; edge < DEG; ++edge) {
-               const int32_t neighbor = current[vertex * DEG + edge];
-               for (size_t sample = 0; sample < neighbor_samples; ++sample) {
-                 int32_t candidate = -1;
-                 if (neighbor >= 0 && static_cast<size_t>(neighbor) < N) {
-                   const uint32_t offset_hash = mix32(static_cast<uint32_t>(vertex) ^
-                                                      static_cast<uint32_t>(edge * 0x9e37u) ^
-                                                      (static_cast<uint32_t>(iteration) * 0x85ebu));
-                   const size_t offset = static_cast<size_t>(offset_hash) % DEG;
-                   const size_t sampled_edge =
-                       (offset + (sample * DEG) / neighbor_samples) % DEG;
-                   candidate = current[static_cast<size_t>(neighbor) * DEG + sampled_edge];
-                 }
-                 evaluate_candidate(candidate);
+              for (size_t cell = lid; cell < new_count * new_count;
+                  cell += work_group_size) {
+               const size_t i = cell / new_count;
+               const size_t j = cell % new_count;
+               if (i == j) {
+                 new_new_distances[cell] = std::numeric_limits<float>::max();
+               } else if (i < j) {
+                 const float distance =
+                     checked_distance(point_distance(new_ids[i], new_ids[j]));
+                 new_new_distances[i * new_count + j] = distance;
+                 new_new_distances[j * new_count + i] = distance;
                }
              }
-
-             for (size_t explore = 0; explore < exploration_count; ++explore) {
-               const uint32_t random = mix32(static_cast<uint32_t>(vertex) ^
-                                             ((static_cast<uint32_t>(iteration) + 1u) * 0x9e3779b9u) ^
-                                             static_cast<uint32_t>((explore + 1u) * 0x85ebca6bu));
-               int32_t candidate = static_cast<int32_t>(static_cast<size_t>(random) % N);
-               if (candidate == static_cast<int32_t>(vertex)) {
-                 candidate = static_cast<int32_t>((static_cast<size_t>(candidate) + 1u) % N);
-               }
-               evaluate_candidate(candidate);
+             for (size_t cell = lid; cell < new_count * old_count;
+                  cell += work_group_size) {
+               const size_t i = cell / old_count;
+               const size_t j = cell % old_count;
+               const float distance = checked_distance(point_distance(new_ids[i], old_ids[j]));
+               new_old_distances[i * old_count + j] = distance;
              }
+             item.barrier(sycl::access::fence_space::local_space);
 
              if (lid == 0) {
-               const int32_t count = state[0];
-               for (size_t out_edge = 0; out_edge < DEG; ++out_edge) {
-                 int32_t best = -1;
-                 for (int32_t slot = 0; slot < count; ++slot) {
-                   const int32_t id = candidate_ids[static_cast<size_t>(slot)];
-                   if (id < 0) continue;
-                   if (best < 0 ||
-                       candidate_distances[static_cast<size_t>(slot)] <
-                           candidate_distances[static_cast<size_t>(best)] ||
-                       (candidate_distances[static_cast<size_t>(slot)] ==
-                            candidate_distances[static_cast<size_t>(best)] &&
-                        id < candidate_ids[static_cast<size_t>(best)])) {
-                     best = slot;
+               const size_t proposal_base =
+                   item.get_group_linear_id() * proposals_per_vertex;
+               size_t proposal_ordinal = 0;
+               auto emit_directed = [&](uint32_t target, uint32_t candidate, float distance) {
+                 if (target == candidate || target == kInvalidId || candidate == kInvalidId ||
+                     !sycl::isfinite(distance) || proposal_ordinal >= proposals_per_vertex) {
+                   return;
+                 }
+                 const size_t slot_size = proposal_base + proposal_ordinal++;
+                 const int32_t slot = static_cast<int32_t>(slot_size);
+                 proposal_ids_ptr[slot_size] = candidate;
+                 proposal_distances_ptr[slot_size] = distance;
+                 sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                  sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+                     target_head(heads_ptr[target]);
+                 const int32_t prior = target_head.exchange(slot);
+                 inbox_links_ptr[slot_size] = prior;
+                 if (prior == -1) {
+                   sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                    sycl::memory_scope::device,
+                                    sycl::access::address_space::global_space>
+                       active_count(scalars_ptr[0]);
+                   const int32_t active_slot = active_count.fetch_add(1);
+                   active_targets_ptr[static_cast<size_t>(active_slot)] = target;
+                 }
+               };
+               auto emit_reciprocal = [&](uint32_t a, uint32_t b, float distance) {
+                 emit_directed(a, b, distance);
+                 emit_directed(b, a, distance);
+               };
+               auto nearer = [](float lhs_distance, uint32_t lhs_id, float rhs_distance,
+                                uint32_t rhs_id) {
+                 return lhs_distance < rhs_distance ||
+                        (lhs_distance == rhs_distance && lhs_id < rhs_id);
+               };
+
+               for (size_t i = 0; i < new_count; ++i) {
+                 uint32_t best_id = kInvalidId;
+                 float best_distance = std::numeric_limits<float>::max();
+                 for (size_t j = 0; j < new_count; ++j) {
+                   if (i == j) continue;
+                   const float distance = new_new_distances[i * new_count + j];
+                   if (best_id == kInvalidId ||
+                       nearer(distance, new_ids[j], best_distance, best_id)) {
+                     best_id = new_ids[j];
+                     best_distance = distance;
                    }
                  }
-                 if (best >= 0) {
-                   next[vertex * DEG + out_edge] = candidate_ids[static_cast<size_t>(best)];
-                   candidate_ids[static_cast<size_t>(best)] = -1;
-                 } else {
-                   next[vertex * DEG + out_edge] = current[vertex * DEG + out_edge];
+                 if (best_id != kInvalidId) {
+                   emit_reciprocal(new_ids[i], best_id, best_distance);
+                 }
+
+                 best_id = kInvalidId;
+                 best_distance = std::numeric_limits<float>::max();
+                 for (size_t j = 0; j < old_count; ++j) {
+                   const float distance = new_old_distances[i * old_count + j];
+                   if (best_id == kInvalidId ||
+                       nearer(distance, old_ids[j], best_distance, best_id)) {
+                     best_id = old_ids[j];
+                     best_distance = distance;
+                   }
+                 }
+                 if (best_id != kInvalidId) {
+                   emit_reciprocal(new_ids[i], best_id, best_distance);
+                 }
+               }
+
+               for (size_t j = 0; j < old_count; ++j) {
+                 uint32_t best_id = kInvalidId;
+                 float best_distance = std::numeric_limits<float>::max();
+                 for (size_t i = 0; i < new_count; ++i) {
+                   const float distance = new_old_distances[i * old_count + j];
+                   if (best_id == kInvalidId ||
+                       nearer(distance, new_ids[i], best_distance, best_id)) {
+                     best_id = new_ids[i];
+                     best_distance = distance;
+                   }
+                 }
+                 if (best_id != kInvalidId) {
+                   emit_reciprocal(old_ids[j], best_id, best_distance);
                  }
                }
              }
            });
          });
+        q.wait_and_throw();
+
+        int32_t scalar_values[2] = {0, 0};
+        q.memcpy(scalar_values, scalars_ptr, sizeof(scalar_values));
+        q.wait_and_throw();
+        if (scalar_values[1] != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+        const int32_t active_count = scalar_values[0];
+        if (active_count < 0 || static_cast<size_t>(active_count) > N) {
+          return OVVS_STATUS_ERROR;
+        }
+
+        q.parallel_for(sycl::range<1>(static_cast<size_t>(active_count)),
+                       [=](sycl::id<1> active_index) {
+          const uint32_t target = active_targets_ptr[active_index];
+          const size_t row = static_cast<size_t>(target) * DEG;
+          int32_t link = heads_ptr[target];
+          size_t traversed = 0;
+          while (link >= 0 && traversed < proposal_inbox_count) {
+            const size_t slot = static_cast<size_t>(link);
+            const uint32_t candidate = proposal_ids_ptr[slot];
+            const float candidate_distance = proposal_distances_ptr[slot];
+            link = inbox_links_ptr[slot];
+            ++traversed;
+            if (candidate == target || candidate == kInvalidId ||
+                static_cast<size_t>(candidate) >= N || !sycl::isfinite(candidate_distance)) {
+              continue;
+            }
+
+            bool duplicate = false;
+            for (size_t edge = 0; edge < DEG; ++edge) {
+              if ((next_ids[row + edge] & kIdMask) == candidate) {
+                duplicate = true;
+                break;
+              }
+            }
+            if (duplicate) continue;
+
+            const float worst_distance = next_distances[row + DEG - 1u];
+            const uint32_t worst_id = next_ids[row + DEG - 1u] & kIdMask;
+            if (candidate_distance > worst_distance ||
+                (candidate_distance == worst_distance && candidate >= worst_id)) {
+              continue;
+            }
+
+            uint32_t tagged_candidate = kNewMask | candidate;
+            size_t new_rank = 0;
+            for (size_t edge = 0; edge < DEG; ++edge) {
+              const uint32_t tagged = current_ids[row + edge];
+              const bool edge_is_new = (tagged & kNewMask) != 0u;
+              if ((tagged & kIdMask) == candidate) {
+                if (!edge_is_new || new_rank < sample_count) {
+                  tagged_candidate = candidate;
+                }
+                break;
+              }
+              if (edge_is_new) ++new_rank;
+            }
+
+            size_t insert = 0;
+            while (insert < DEG) {
+              const float distance = next_distances[row + insert];
+              const uint32_t id = next_ids[row + insert] & kIdMask;
+              if (candidate_distance < distance ||
+                  (candidate_distance == distance && candidate < id)) {
+                break;
+              }
+              ++insert;
+            }
+            if (insert >= DEG) continue;
+            for (size_t edge = DEG - 1u; edge > insert; --edge) {
+              next_ids[row + edge] = next_ids[row + edge - 1u];
+              next_distances[row + edge] = next_distances[row + edge - 1u];
+            }
+            next_ids[row + insert] = tagged_candidate;
+            next_distances[row + insert] = candidate_distance;
+          }
+        });
+        q.wait_and_throw();
+      }
+
+      for (size_t vertex_offset = 0; vertex_offset < N;
+           vertex_offset += kVertexGroupsPerLaunch) {
+        const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
+        size_t global_size = 0;
+        if (!checked_product(launch_vertices, work_group_size, global_size)) {
+          return OVVS_STATUS_SHAPE_MISMATCH;
+        }
+        q.submit([&](sycl::handler& h) {
+          sycl::local_accessor<int32_t, 1> row_hash(
+              sycl::range<1>(convergence_hash_capacity), h);
+          h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
+                                           sycl::range<1>(work_group_size)),
+                         [=](sycl::nd_item<1> item) {
+            const size_t lid = item.get_local_linear_id();
+            const size_t vertex = vertex_offset + item.get_group_linear_id();
+            auto group = item.get_group();
+            for (size_t slot = lid; slot < convergence_hash_capacity;
+                 slot += work_group_size) {
+              row_hash[slot] = -1;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+            if (lid == 0) {
+              for (size_t edge = 0; edge < DEG; ++edge) {
+                const int32_t id = static_cast<int32_t>(
+                    current_ids[vertex * DEG + edge] & kIdMask);
+                size_t slot = static_cast<size_t>(static_cast<uint32_t>(id) * 0x9e3779b9u) &
+                              (convergence_hash_capacity - 1u);
+                while (row_hash[slot] != -1 && row_hash[slot] != id) {
+                  slot = (slot + 1u) & (convergence_hash_capacity - 1u);
+                }
+                row_hash[slot] = id;
+              }
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+            uint32_t local_changed = 0;
+            uint32_t local_pending_new = 0;
+            for (size_t edge = lid; edge < DEG; edge += work_group_size) {
+              const uint32_t tagged = next_ids[vertex * DEG + edge];
+              const int32_t id = static_cast<int32_t>(tagged & kIdMask);
+              size_t slot = static_cast<size_t>(static_cast<uint32_t>(id) * 0x9e3779b9u) &
+                            (convergence_hash_capacity - 1u);
+              while (row_hash[slot] != -1 && row_hash[slot] != id) {
+                slot = (slot + 1u) & (convergence_hash_capacity - 1u);
+              }
+              if (row_hash[slot] != id) ++local_changed;
+              if ((tagged & kNewMask) != 0u) ++local_pending_new;
+            }
+            const uint32_t row_changed =
+                sycl::reduce_over_group(group, local_changed, sycl::plus<uint32_t>());
+            const uint32_t row_pending_new =
+                sycl::reduce_over_group(group, local_pending_new, sycl::plus<uint32_t>());
+            if (lid == 0) {
+              heads_ptr[vertex] = static_cast<int32_t>(row_changed);
+              active_targets_ptr[vertex] = row_pending_new;
+            }
+          });
+        });
       }
       q.wait_and_throw();
-      std::swap(current, next);
+      q.memcpy(changed_per_row.data(), heads_ptr, N * sizeof(int32_t));
+      q.memcpy(pending_new_per_row.data(), active_targets_ptr, N * sizeof(uint32_t));
+      q.wait_and_throw();
+
+      int64_t changed_edges = 0;
+      int64_t pending_new_edges = 0;
+      for (const int32_t row_changed : changed_per_row) {
+        if (row_changed < 0 || row_changed > degree) return OVVS_STATUS_ERROR;
+        changed_edges += static_cast<int64_t>(row_changed);
+      }
+      for (const uint32_t row_pending_new : pending_new_per_row) {
+        if (row_pending_new > static_cast<uint32_t>(degree)) return OVVS_STATUS_ERROR;
+        pending_new_edges += static_cast<int64_t>(row_pending_new);
+      }
+      const double change_ratio =
+          static_cast<double>(changed_edges) / static_cast<double>(graph_count);
+      if (!std::isfinite(change_ratio) || change_ratio < 0.0 || change_ratio > 1.0) {
+        return OVVS_STATUS_ERROR;
+      }
+
+      std::swap(current_ids, next_ids);
+      std::swap(current_distances, next_distances);
+      ++iterations_run;
+      last_changed_edges = changed_edges;
+      last_pending_new_edges = pending_new_edges;
+      last_change_ratio = change_ratio;
+      if (iterations_run >= 2 && change_ratio < kTerminationThreshold &&
+          pending_new_edges == 0) {
+        converged = true;
+        break;
+      }
     }
 
-    q.memcpy(graph, current, graph_bytes);
+    q.parallel_for(sycl::range<1>(graph_count), [=](sycl::id<1> index) {
+      next_ids[index] = current_ids[index] & kIdMask;
+    });
     q.wait_and_throw();
-    (void)r;
+    q.memcpy(graph, next_ids, graph_plane_bytes);
+    q.wait_and_throw();
+
+    {
+      std::lock_guard<std::mutex> lock(r.nndescent_stats_mutex);
+      r.nndescent_iterations_run = iterations_run;
+      r.nndescent_changed_edges = last_changed_edges;
+      r.nndescent_pending_new_edges = last_pending_new_edges;
+      r.nndescent_change_ratio = last_change_ratio;
+      r.nndescent_peak_device_bytes = static_cast<int64_t>(device_bytes);
+      r.nndescent_converged = converged;
+    }
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;

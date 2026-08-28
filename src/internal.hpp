@@ -137,6 +137,13 @@ struct ResourcesData {
   int64_t cagra_direct_index_calls = 0;
   int64_t cagra_index_upload_calls = 0;
   int64_t cagra_index_upload_bytes = 0;
+  std::mutex nndescent_stats_mutex;
+  int32_t nndescent_iterations_run = 0;
+  int64_t nndescent_changed_edges = 0;
+  int64_t nndescent_pending_new_edges = 0;
+  double nndescent_change_ratio = 0.0;
+  int64_t nndescent_peak_device_bytes = 0;
+  bool nndescent_converged = false;
   bool npu_busy = false;
   ovvsDevice large_gemm_winner = OVVS_DEVICE_AUTO;
   int64_t large_gemm_flops = 100000LL * 32LL * 768LL;
