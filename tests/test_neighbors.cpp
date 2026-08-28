@@ -152,6 +152,26 @@ static IvfPqStatsSnapshot ivfpq_stats(ovvsResources_t resources) {
           data->ivfpq_unfiltered_direct_rows, data->ivfpq_filtered_code_copy_bytes};
 }
 
+struct PqAdcStatsSnapshot {
+  int64_t calls = 0;
+  int64_t logical_tasks = 0;
+  int64_t chunks = 0;
+  int64_t valid_rows = 0;
+  int64_t padded_rows = 0;
+  int64_t npu_requests = 0;
+  int64_t npu_rows = 0;
+  int64_t cpu_rows = 0;
+};
+
+static PqAdcStatsSnapshot pq_adc_stats(ovvsResources_t resources) {
+  auto* data = ovvs::impl::rd(resources);
+  std::lock_guard<std::mutex> lock(data->pq_adc_stats_mutex);
+  return {data->pq_adc_calls,       data->pq_adc_logical_tasks,
+          data->pq_adc_chunks,      data->pq_adc_valid_rows,
+          data->pq_adc_padded_rows, data->pq_adc_npu_requests,
+          data->pq_adc_npu_rows,    data->pq_adc_cpu_rows};
+}
+
 static std::vector<uint8_t> read_binary_file(const std::filesystem::path& path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   expect(static_cast<bool>(file), "open binary file for reading");
@@ -647,6 +667,7 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
          "packed-layout build commits one packed rebuild");
   expect(built.packed_rebuild_rows == before.packed_rebuild_rows + n,
          "packed-layout build records every row");
+  const PqAdcStatsSnapshot adc_built = pq_adc_stats(res.r);
 
   std::vector<int64_t> direct_ids(static_cast<size_t>(nq * k));
   std::vector<int64_t> repeated_ids(static_cast<size_t>(nq * k));
@@ -671,6 +692,21 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
          "packed-layout direct search records rows without repacking");
   expect(direct.filtered_code_copy_bytes == built.filtered_code_copy_bytes,
          "packed-layout direct search copies no PQ codes");
+  const PqAdcStatsSnapshot adc_direct = pq_adc_stats(res.r);
+  expect(adc_direct.calls == adc_built.calls + 2 * nq,
+         "full-probe searches use one bounded ADC batch per query");
+  expect(adc_direct.logical_tasks - adc_built.logical_tasks >
+                 adc_direct.calls - adc_built.calls &&
+             adc_direct.chunks - adc_built.chunks >=
+                 adc_direct.logical_tasks - adc_built.logical_tasks,
+         "bounded ADC batches contain multiple query/list tasks");
+  expect(adc_direct.valid_rows == adc_built.valid_rows + 2 * nq * n &&
+             adc_direct.cpu_rows == adc_built.cpu_rows + 2 * nq * n,
+         "batched CPU ADC scores every direct candidate exactly once");
+  expect(adc_direct.padded_rows > adc_built.padded_rows &&
+             adc_direct.npu_requests == adc_built.npu_requests &&
+             adc_direct.npu_rows == adc_built.npu_rows,
+         "FORCE_CPU plans fixed buckets without submitting NPU requests");
 
   std::vector<uint8_t> all_allowed(static_cast<size_t>((n + 7) / 8), 0xff);
   expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
@@ -686,6 +722,11 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
   expect(all_allowed_stats.filtered_code_copy_bytes ==
              direct.filtered_code_copy_bytes + nq * n * pq_m,
          "all-allowed filter records aligned PQ scratch copies");
+  const PqAdcStatsSnapshot adc_all_allowed = pq_adc_stats(res.r);
+  expect(adc_all_allowed.calls == adc_direct.calls + nq &&
+             adc_all_allowed.valid_rows == adc_direct.valid_rows + nq * n &&
+             adc_all_allowed.cpu_rows == adc_direct.cpu_rows + nq * n,
+         "all-allowed filter preserves bounded batching and aligned rows");
 
   const std::vector<int64_t> allowed_ids{2, 19, 47};
   std::vector<uint8_t> selective(static_cast<size_t>((n + 7) / 8), 0);
@@ -714,6 +755,13 @@ OVVS_TEST(ivf_pq_packed_layout_filter_alignment) {
              all_allowed_stats.filtered_code_copy_bytes +
                  static_cast<int64_t>(allowed_ids.size()) * pq_m,
          "selective filter records only copied allowed codes");
+  const PqAdcStatsSnapshot adc_selective = pq_adc_stats(res.r);
+  expect(adc_selective.calls == adc_all_allowed.calls + 1 &&
+             adc_selective.valid_rows ==
+                 adc_all_allowed.valid_rows + static_cast<int64_t>(allowed_ids.size()) &&
+             adc_selective.cpu_rows ==
+                 adc_all_allowed.cpu_rows + static_cast<int64_t>(allowed_ids.size()),
+         "selective filter batches only allowed candidate rows");
 
   std::vector<int64_t> final_ids(static_cast<size_t>(nq * k));
   std::vector<float> final_distances(static_cast<size_t>(nq * k));

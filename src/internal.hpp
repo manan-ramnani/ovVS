@@ -121,6 +121,21 @@ struct MixerDecision {
   bool npu_failed = false;
 };
 
+struct PqAdcTask {
+  const float* tables = nullptr;
+  const uint8_t* codes = nullptr;
+  int64_t rows = 0;
+  int64_t output_offset = 0;
+};
+
+struct PqAdcChunk {
+  const float* tables = nullptr;
+  const uint8_t* codes = nullptr;
+  int32_t valid_rows = 0;
+  int32_t bucket_rows = 0;
+  int64_t output_offset = 0;
+};
+
 struct ResourcesData {
   ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
@@ -132,6 +147,7 @@ struct ResourcesData {
   std::string gpu_name;
   std::string cache_dir;
   int32_t npu_compile_fails = 0;
+  int32_t npu_runtime_fails = 0;
   int32_t npu_fallbacks = 0;
   std::mutex cagra_transfer_mutex;
   int64_t cagra_walk_calls = 0;
@@ -150,6 +166,16 @@ struct ResourcesData {
   int64_t ivfpq_packed_rebuild_rows = 0;
   int64_t ivfpq_unfiltered_direct_rows = 0;
   int64_t ivfpq_filtered_code_copy_bytes = 0;
+  std::mutex pq_adc_stats_mutex;
+  int64_t pq_adc_calls = 0;
+  int64_t pq_adc_logical_tasks = 0;
+  int64_t pq_adc_chunks = 0;
+  int64_t pq_adc_valid_rows = 0;
+  int64_t pq_adc_padded_rows = 0;
+  int64_t pq_adc_npu_requests = 0;
+  int64_t pq_adc_npu_rows = 0;
+  int64_t pq_adc_npu_capacity_rows = 0;
+  int64_t pq_adc_cpu_rows = 0;
   bool npu_busy = false;
   ovvsDevice large_gemm_winner = OVVS_DEVICE_AUTO;
   int64_t large_gemm_flops = 100000LL * 32LL * 768LL;
@@ -244,8 +270,8 @@ bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
                   int64_t ny, int64_t dim, float* out, float metric_arg);
 bool npu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg);
-bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
-                int64_t ncodes, float* out);
+bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_count,
+                      int32_t pq_m, int32_t ks, float* out);
 int32_t sycl_enabled();
 bool sycl_gpu_available();
 bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components);
@@ -274,6 +300,14 @@ ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, in
                          const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
 ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
                        const uint8_t* codes, int64_t ncodes, float* out);
+/* Private C++ test seams; not part of the installed C ABI. */
+OVVS_API int32_t pq_adc_bucket_rows(int64_t remaining);
+OVVS_API ovvsStatus plan_pq_adc_chunks(const PqAdcTask* tasks, int64_t task_count,
+                                       int32_t pq_m, int64_t output_rows,
+                                       std::vector<PqAdcChunk>& chunks);
+OVVS_API ovvsStatus prim_pq_adc_batch(ResourcesData& r, const PqAdcTask* tasks,
+                                      int64_t task_count, int32_t pq_m, int32_t ks,
+                                      float* out, int64_t output_rows);
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph);

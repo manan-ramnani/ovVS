@@ -540,30 +540,16 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
     status = prim_topk(*rd(res), cscores.data(), nq, ix->nlist, nprobe, cl.data(),
                        cd.data(), false);
     if (status != OVVS_STATUS_SUCCESS) return status;
+
     const int64_t dim = ix->ds.dim;
-    std::vector<float> tables(static_cast<size_t>(ix->pq_m) *
-                              static_cast<size_t>(ix->pq_ks));
+    const size_t table_elements =
+        static_cast<size_t>(ix->pq_m) * static_cast<size_t>(ix->pq_ks);
+    std::vector<int64_t> query_raw_rows(static_cast<size_t>(nq), 0);
     for (int64_t q = 0; q < nq; ++q) {
-      std::vector<int64_t> ids;
-      std::vector<float> adc;
-      const float* query = queries + q * dim;
+      int64_t rows = 0;
       for (int32_t p = 0; p < nprobe; ++p) {
         const int64_t c = cl[q * nprobe + p];
         if (c < 0 || c >= ix->nlist) return OVVS_STATUS_ERROR;
-        const float* cent = ix->centroids.data() + c * dim;
-        std::vector<float> qres(static_cast<size_t>(dim));
-        for (int64_t t = 0; t < dim; ++t) {
-          qres[static_cast<size_t>(t)] = query[t] - cent[t];
-        }
-        for (int32_t m = 0; m < ix->pq_m; ++m) {
-          const float* sub = qres.data() + static_cast<size_t>(m) * ix->dsub;
-          const float* cb =
-              ix->codebooks.data() + static_cast<size_t>(m) * ix->pq_ks * ix->dsub;
-          for (int32_t cs = 0; cs < ix->pq_ks; ++cs) {
-            tables[static_cast<size_t>(m * ix->pq_ks + cs)] =
-                l2sq(sub, cb + cs * ix->dsub, ix->dsub);
-          }
-        }
         const int64_t list_begin = ix->list_offsets[static_cast<size_t>(c)];
         const int64_t list_end = ix->list_offsets[static_cast<size_t>(c + 1)];
         if (list_begin < 0 || list_end < list_begin ||
@@ -571,103 +557,244 @@ ovvsStatus ovvsIvfPqSearch(ovvsResources_t res, ovvsIvfPqIndex_t index, const fl
           return OVVS_STATUS_ERROR;
         }
         const int64_t list_size = list_end - list_begin;
-        if (!bitset && list_size > 0) {
-          const size_t begin = static_cast<size_t>(list_begin);
-          std::vector<float> scores(static_cast<size_t>(list_size));
-          status = prim_pq_adc(
-              *rd(res), tables.data(), ix->pq_m, ix->pq_ks,
-              ix->packed_codes.data() + begin * static_cast<size_t>(ix->pq_m), list_size,
-              scores.data());
-          if (status != OVVS_STATUS_SUCCESS) return status;
-          ids.insert(ids.end(), ix->packed_ids.begin() + list_begin,
-                     ix->packed_ids.begin() + list_end);
-          adc.insert(adc.end(), scores.begin(), scores.end());
-          saturating_add(direct_rows, list_size);
-        } else if (bitset && list_size > 0) {
-          std::vector<int64_t> list_ids;
-          std::vector<uint8_t> list_codes;
-          list_ids.reserve(static_cast<size_t>(list_size));
-          list_codes.reserve(static_cast<size_t>(list_size) * static_cast<size_t>(ix->pq_m));
-          for (int64_t position = list_begin; position < list_end; ++position) {
+        if (list_size > ix->ds.n - rows) return OVVS_STATUS_ERROR;
+        rows += list_size;
+      }
+      query_raw_rows[static_cast<size_t>(q)] = rows;
+    }
+
+    const size_t output_elements = static_cast<size_t>(nq) * static_cast<size_t>(k);
+    std::vector<int64_t> staged_neighbors(output_elements, -1);
+    std::vector<float> staged_distances(output_elements, kInf);
+
+    struct AdcPlan {
+      int64_t query = 0;
+      int32_t cluster = 0;
+      int64_t list_begin = 0;
+      int64_t list_end = 0;
+      int64_t rows = 0;
+      int64_t output_offset = 0;
+    };
+
+    std::vector<AdcPlan> plans;
+    std::vector<PqAdcTask> tasks;
+    std::vector<int64_t> query_offsets;
+    std::vector<int64_t> candidate_ids;
+    std::vector<float> adc;
+    std::vector<float> lut_storage;
+    std::vector<uint8_t> filtered_codes;
+    std::vector<float> qres(static_cast<size_t>(dim));
+
+    std::vector<int64_t> topk_indices;
+    std::vector<float> topk_values;
+    std::vector<int64_t> candidates;
+    std::vector<float> gathered;
+    std::vector<float> refined_scores;
+    std::vector<int64_t> final_indices;
+    std::vector<float> final_values;
+
+    constexpr int64_t kMaxQueriesPerBlock = 32;
+    for (int64_t block_begin = 0; block_begin < nq;) {
+      int64_t block_end = block_begin;
+      int64_t block_raw_rows = 0;
+      while (block_end < nq && block_end - block_begin < kMaxQueriesPerBlock) {
+        const int64_t query_rows = query_raw_rows[static_cast<size_t>(block_end)];
+        if (block_end != block_begin && query_rows > ix->ds.n - block_raw_rows) break;
+        block_raw_rows += query_rows;
+        ++block_end;
+        if (block_raw_rows >= ix->ds.n) break;
+      }
+      if (block_end == block_begin) return OVVS_STATUS_ERROR;
+
+      const int64_t block_queries = block_end - block_begin;
+      plans.clear();
+      query_offsets.assign(static_cast<size_t>(block_queries) + 1, 0);
+      int64_t candidate_rows = 0;
+      for (int64_t q = block_begin; q < block_end; ++q) {
+        for (int32_t p = 0; p < nprobe; ++p) {
+          const int64_t c = cl[q * nprobe + p];
+          if (c < 0 || c >= ix->nlist) return OVVS_STATUS_ERROR;
+          const int64_t list_begin = ix->list_offsets[static_cast<size_t>(c)];
+          const int64_t list_end = ix->list_offsets[static_cast<size_t>(c + 1)];
+          if (list_begin < 0 || list_end < list_begin ||
+              list_end > static_cast<int64_t>(ix->packed_ids.size())) {
+            return OVVS_STATUS_ERROR;
+          }
+
+          int64_t accepted_rows = list_end - list_begin;
+          if (bitset && accepted_rows > 0) {
+            accepted_rows = 0;
+            for (int64_t position = list_begin; position < list_end; ++position) {
+              const int64_t id = ix->packed_ids[static_cast<size_t>(position)];
+              if (id < 0 || id >= ix->ds.n) return OVVS_STATUS_ERROR;
+              if (allowed(bitset, id)) ++accepted_rows;
+            }
+          }
+          if (accepted_rows <= 0) continue;
+          if (accepted_rows > ix->ds.n - candidate_rows) return OVVS_STATUS_ERROR;
+          plans.push_back(
+              {q, static_cast<int32_t>(c), list_begin, list_end, accepted_rows, candidate_rows});
+          candidate_rows += accepted_rows;
+        }
+        query_offsets[static_cast<size_t>(q - block_begin + 1)] = candidate_rows;
+      }
+
+      if (plans.size() > std::numeric_limits<size_t>::max() / table_elements) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+      const size_t candidate_count = static_cast<size_t>(candidate_rows);
+      if (candidate_count > std::numeric_limits<size_t>::max() /
+                                static_cast<size_t>(ix->pq_m)) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+
+      candidate_ids.resize(candidate_count);
+      adc.resize(candidate_count);
+      tasks.resize(plans.size());
+      lut_storage.resize(plans.size() * table_elements);
+      if (bitset) {
+        filtered_codes.resize(candidate_count * static_cast<size_t>(ix->pq_m));
+      } else {
+        filtered_codes.clear();
+      }
+
+      for (size_t task_index = 0; task_index < plans.size(); ++task_index) {
+        const AdcPlan& plan = plans[task_index];
+        const float* query = queries + plan.query * dim;
+        const float* cent = ix->centroids.data() + static_cast<int64_t>(plan.cluster) * dim;
+        for (int64_t t = 0; t < dim; ++t) {
+          qres[static_cast<size_t>(t)] = query[t] - cent[t];
+        }
+
+        float* table = lut_storage.data() + task_index * table_elements;
+        for (int32_t m = 0; m < ix->pq_m; ++m) {
+          const float* sub = qres.data() + static_cast<size_t>(m) * ix->dsub;
+          const float* cb =
+              ix->codebooks.data() + static_cast<size_t>(m) * ix->pq_ks * ix->dsub;
+          for (int32_t cs = 0; cs < ix->pq_ks; ++cs) {
+            table[static_cast<size_t>(m * ix->pq_ks + cs)] =
+                l2sq(sub, cb + cs * ix->dsub, ix->dsub);
+          }
+        }
+
+        const size_t output_offset = static_cast<size_t>(plan.output_offset);
+        const uint8_t* task_codes = nullptr;
+        if (!bitset) {
+          const size_t list_begin = static_cast<size_t>(plan.list_begin);
+          const size_t rows = static_cast<size_t>(plan.rows);
+          std::memcpy(candidate_ids.data() + output_offset,
+                      ix->packed_ids.data() + list_begin, rows * sizeof(int64_t));
+          task_codes =
+              ix->packed_codes.data() + list_begin * static_cast<size_t>(ix->pq_m);
+          saturating_add(direct_rows, plan.rows);
+        } else {
+          size_t destination = output_offset;
+          for (int64_t position = plan.list_begin; position < plan.list_end; ++position) {
             const size_t packed_position = static_cast<size_t>(position);
             const int64_t id = ix->packed_ids[packed_position];
             if (id < 0 || id >= ix->ds.n) return OVVS_STATUS_ERROR;
             if (!allowed(bitset, id)) continue;
-            list_ids.push_back(id);
-            const uint8_t* code =
-                ix->packed_codes.data() + packed_position * static_cast<size_t>(ix->pq_m);
-            list_codes.insert(list_codes.end(), code, code + ix->pq_m);
+            candidate_ids[destination] = id;
+            std::memcpy(filtered_codes.data() + destination * static_cast<size_t>(ix->pq_m),
+                        ix->packed_codes.data() +
+                            packed_position * static_cast<size_t>(ix->pq_m),
+                        static_cast<size_t>(ix->pq_m));
+            ++destination;
           }
-          if (!list_ids.empty()) {
-            std::vector<float> scores(list_ids.size());
-            status = prim_pq_adc(*rd(res), tables.data(), ix->pq_m, ix->pq_ks,
-                                 list_codes.data(), static_cast<int64_t>(list_ids.size()),
-                                 scores.data());
-            if (status != OVVS_STATUS_SUCCESS) return status;
-            ids.insert(ids.end(), list_ids.begin(), list_ids.end());
-            adc.insert(adc.end(), scores.begin(), scores.end());
-            const size_t copied_bytes =
-                list_ids.size() * static_cast<size_t>(ix->pq_m);
-            saturating_add(
-                filtered_copy_bytes,
-                copied_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())
-                    ? std::numeric_limits<int64_t>::max()
-                    : static_cast<int64_t>(copied_bytes));
+          if (destination != output_offset + static_cast<size_t>(plan.rows)) {
+            return OVVS_STATUS_ERROR;
           }
+          task_codes =
+              filtered_codes.data() + output_offset * static_cast<size_t>(ix->pq_m);
+          const size_t copied_bytes =
+              static_cast<size_t>(plan.rows) * static_cast<size_t>(ix->pq_m);
+          saturating_add(
+              filtered_copy_bytes,
+              copied_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())
+                  ? std::numeric_limits<int64_t>::max()
+                  : static_cast<int64_t>(copied_bytes));
         }
+        tasks[task_index] = {table, task_codes, plan.rows, plan.output_offset};
       }
-      if (ids.empty()) {
-        for (int64_t t = 0; t < k; ++t) {
-          neighbors[q * k + t] = -1;
-          distances[q * k + t] = kInf;
+
+      if (candidate_rows > 0) {
+        if (tasks.empty()) return OVVS_STATUS_ERROR;
+        status = prim_pq_adc_batch(*rd(res), tasks.data(), static_cast<int64_t>(tasks.size()),
+                                   ix->pq_m, ix->pq_ks, adc.data(), candidate_rows);
+        if (status != OVVS_STATUS_SUCCESS) return status;
+      } else if (!tasks.empty()) {
+        return OVVS_STATUS_ERROR;
+      }
+
+      int64_t max_refine = 0;
+      for (int64_t local_query = 0; local_query < block_queries; ++local_query) {
+        const int64_t count = query_offsets[static_cast<size_t>(local_query + 1)] -
+                              query_offsets[static_cast<size_t>(local_query)];
+        max_refine = std::max(max_refine,
+                              std::min(static_cast<int64_t>(krefine), count));
+      }
+      const size_t refine_count = static_cast<size_t>(max_refine);
+      if (refine_count > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+      topk_indices.resize(refine_count);
+      topk_values.resize(refine_count);
+      candidates.resize(refine_count);
+      gathered.resize(refine_count * static_cast<size_t>(dim));
+      refined_scores.resize(refine_count);
+      const size_t final_count = static_cast<size_t>(std::min(k, max_refine));
+      final_indices.resize(final_count);
+      final_values.resize(final_count);
+
+      for (int64_t local_query = 0; local_query < block_queries; ++local_query) {
+        const int64_t q = block_begin + local_query;
+        const int64_t query_begin = query_offsets[static_cast<size_t>(local_query)];
+        const int64_t query_end = query_offsets[static_cast<size_t>(local_query + 1)];
+        const int64_t query_rows = query_end - query_begin;
+        if (query_rows <= 0) continue;
+
+        const int64_t kr = std::min(static_cast<int64_t>(krefine), query_rows);
+        status = prim_topk(*rd(res), adc.data() + query_begin, 1, query_rows, kr,
+                           topk_indices.data(), topk_values.data(), false);
+        if (status != OVVS_STATUS_SUCCESS) return status;
+        for (int64_t t = 0; t < kr; ++t) {
+          const int64_t selected = topk_indices[static_cast<size_t>(t)];
+          if (selected < 0 || selected >= query_rows) return OVVS_STATUS_ERROR;
+          candidates[static_cast<size_t>(t)] =
+              candidate_ids[static_cast<size_t>(query_begin + selected)];
         }
-        continue;
-      }
-      const int64_t kr =
-          std::min(static_cast<int64_t>(krefine), static_cast<int64_t>(ids.size()));
-      std::vector<int64_t> ti(static_cast<size_t>(kr));
-      std::vector<float> tv(static_cast<size_t>(kr));
-      status = prim_topk(*rd(res), adc.data(), 1, static_cast<int64_t>(ids.size()), kr,
-                         ti.data(), tv.data(), false);
-      if (status != OVVS_STATUS_SUCCESS) return status;
-      std::vector<int64_t> cand(static_cast<size_t>(kr));
-      for (int64_t t = 0; t < kr; ++t) {
-        const int64_t selected = ti[static_cast<size_t>(t)];
-        if (selected < 0 || selected >= static_cast<int64_t>(ids.size())) {
-          return OVVS_STATUS_ERROR;
-        }
-        cand[static_cast<size_t>(t)] = ids[static_cast<size_t>(selected)];
-      }
-      std::vector<float> gathered(static_cast<size_t>(kr) * static_cast<size_t>(dim));
-      status = prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim, cand.data(), kr,
-                                gathered.data());
-      if (status != OVVS_STATUS_SUCCESS) return status;
-      std::vector<float> sc(static_cast<size_t>(kr));
-      status = prim_pairwise(*rd(res), ix->ds.metric, query, 1, gathered.data(), kr, dim,
-                             sc.data(), 2.f);
-      if (status != OVVS_STATUS_SUCCESS) return status;
-      const int64_t kk = std::min(k, kr);
-      std::vector<int64_t> fi(static_cast<size_t>(kk));
-      std::vector<float> fv(static_cast<size_t>(kk));
-      status = prim_topk(*rd(res), sc.data(), 1, kr, kk, fi.data(), fv.data(),
-                         metric_largest(ix->ds.metric));
-      if (status != OVVS_STATUS_SUCCESS) return status;
-      for (int64_t t = 0; t < k; ++t) {
-        if (t < kk) {
-          const int64_t selected = fi[static_cast<size_t>(t)];
+        status = prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim,
+                                  candidates.data(), kr,
+                                 gathered.data());
+        if (status != OVVS_STATUS_SUCCESS) return status;
+        const float* query = queries + q * dim;
+        status = prim_pairwise(*rd(res), ix->ds.metric, query, 1, gathered.data(), kr, dim,
+                               refined_scores.data(), 2.f);
+        if (status != OVVS_STATUS_SUCCESS) return status;
+        const int64_t kk = std::min(k, kr);
+        status = prim_topk(*rd(res), refined_scores.data(), 1, kr, kk,
+                           final_indices.data(), final_values.data(),
+                           metric_largest(ix->ds.metric));
+        if (status != OVVS_STATUS_SUCCESS) return status;
+        for (int64_t t = 0; t < kk; ++t) {
+          const int64_t selected = final_indices[static_cast<size_t>(t)];
           if (selected < 0 || selected >= kr) return OVVS_STATUS_ERROR;
-          neighbors[q * k + t] = cand[static_cast<size_t>(selected)];
-          float d = fv[static_cast<size_t>(t)];
+          staged_neighbors[static_cast<size_t>(q * k + t)] =
+              candidates[static_cast<size_t>(selected)];
+          float d = final_values[static_cast<size_t>(t)];
           if (ix->ds.metric == OVVS_METRIC_INNER_PRODUCT) d = -d;
-          distances[q * k + t] = d;
-        } else {
-          neighbors[q * k + t] = -1;
-          distances[q * k + t] = kInf;
+          staged_distances[static_cast<size_t>(q * k + t)] = d;
         }
       }
+      block_begin = block_end;
     }
+
+    std::memcpy(neighbors, staged_neighbors.data(), staged_neighbors.size() * sizeof(int64_t));
+    std::memcpy(distances, staged_distances.data(), staged_distances.size() * sizeof(float));
     record_ivf_pq_search_layout(*rd(res), direct_rows, filtered_copy_bytes);
     return OVVS_STATUS_SUCCESS;
+  } catch (const std::length_error&) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
   } catch (...) {

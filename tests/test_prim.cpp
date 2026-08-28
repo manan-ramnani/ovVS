@@ -1,4 +1,5 @@
 #include "test_harness.hpp"
+#include "internal.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -242,6 +243,430 @@ OVVS_TEST(gemm_gpu_matches_ref_gemm) {
   expect(last == OVVS_DEVICE_GPU, "FORCE_GPU last_device");
   std::printf("    gemm_gpu_matches_ref_gemm last_device=gpu\n");
   for (size_t i = 0; i < g.size(); ++i) expect(std::fabs(g[i] - R[i]) < 2e-2f, "gpu vs ref_gemm");
+}
+
+static float independent_pq_adc(const float* tables, const uint8_t* code, int32_t pq_m,
+                                int32_t ks) {
+  float score = 0.0f;
+  for (int32_t m = 0; m < pq_m; ++m) {
+    score += tables[static_cast<size_t>(m * ks + static_cast<int32_t>(code[m]))];
+  }
+  return score;
+}
+
+OVVS_TEST(pq_adc_fixed_bucket_planner_boundaries_and_splits) {
+  using ovvs::impl::PqAdcChunk;
+  using ovvs::impl::PqAdcTask;
+
+  struct BucketCase {
+    int64_t rows;
+    int32_t bucket;
+  };
+  const std::vector<BucketCase> bucket_cases{
+      {0, 0},       {1, 128},     {127, 128},   {128, 128},   {129, 256},
+      {255, 256},   {256, 256},   {257, 512},   {511, 512},   {512, 512},
+      {513, 1024},  {1023, 1024}, {1024, 1024}, {1025, 2048}, {2047, 2048},
+      {2048, 2048},
+  };
+  for (const BucketCase& item : bucket_cases) {
+    expect(ovvs::impl::pq_adc_bucket_rows(item.rows) == item.bucket,
+           "fixed ADC bucket for rows=" + std::to_string(item.rows));
+  }
+
+  float dummy_table = 0.0f;
+  uint8_t dummy_codes[6]{};
+  const std::vector<int64_t> rows{127, 128, 129, 255, 256, 257};
+  const std::vector<int32_t> expected_buckets{128, 128, 256, 256, 256, 512};
+  std::vector<PqAdcTask> tasks;
+  int64_t output_rows = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    tasks.push_back({&dummy_table, &dummy_codes[i], rows[i], output_rows});
+    output_rows += rows[i];
+  }
+  expect(output_rows == 1152, "fixed ADC boundary fixture real rows");
+
+  std::vector<PqAdcChunk> chunks;
+  expect_status(ovvs::impl::plan_pq_adc_chunks(tasks.data(),
+                                                static_cast<int64_t>(tasks.size()),
+                                                1, output_rows, chunks),
+                "fixed ADC boundary plan");
+  expect(chunks.size() == tasks.size(), "one chunk per sub-512 boundary task");
+  int64_t planned_rows = 0;
+  int64_t planned_capacity = 0;
+  int32_t bucket_128 = 0, bucket_256 = 0, bucket_512 = 0;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    const PqAdcChunk& chunk = chunks[i];
+    expect(chunk.tables == tasks[i].tables && chunk.codes == tasks[i].codes,
+           "fixed ADC planner preserves task payload pointers");
+    expect(chunk.valid_rows == rows[i], "fixed ADC planner preserves valid rows");
+    expect(chunk.bucket_rows == expected_buckets[i], "fixed ADC planner selects bucket");
+    expect(chunk.output_offset == tasks[i].output_offset,
+           "fixed ADC planner preserves dense output order");
+    planned_rows += chunk.valid_rows;
+    planned_capacity += chunk.bucket_rows;
+    bucket_128 += chunk.bucket_rows == 128 ? 1 : 0;
+    bucket_256 += chunk.bucket_rows == 256 ? 1 : 0;
+    bucket_512 += chunk.bucket_rows == 512 ? 1 : 0;
+  }
+  expect(planned_rows == 1152 && planned_capacity == 1536,
+         "fixed ADC boundary real and padded row totals");
+  expect(planned_capacity - planned_rows == 384, "fixed ADC boundary padding total");
+  expect(bucket_128 == 2 && bucket_256 == 3 && bucket_512 == 1,
+         "fixed ADC boundary bucket histogram");
+
+  struct SplitCase {
+    int64_t rows;
+    std::vector<int32_t> valid;
+    std::vector<int32_t> buckets;
+  };
+  const std::vector<SplitCase> split_cases{
+      {2049, {2048, 1}, {2048, 128}},
+      {2177, {2048, 129}, {2048, 256}},
+      {4096, {2048, 2048}, {2048, 2048}},
+      {4097, {2048, 2048, 1}, {2048, 2048, 128}},
+  };
+  for (const SplitCase& item : split_cases) {
+    constexpr int32_t split_pq_m = 3;
+    std::vector<uint8_t> split_codes(static_cast<size_t>(item.rows * split_pq_m));
+    const PqAdcTask task{&dummy_table, split_codes.data(), item.rows, 0};
+    chunks.clear();
+    expect_status(ovvs::impl::plan_pq_adc_chunks(&task, 1, split_pq_m, item.rows, chunks),
+                  "fixed ADC split plan");
+    expect(chunks.size() == item.valid.size(), "fixed ADC split chunk count");
+    int64_t offset = 0;
+    int64_t valid_sum = 0;
+    for (size_t i = 0; i < chunks.size(); ++i) {
+      expect(chunks[i].valid_rows == item.valid[i] &&
+                 chunks[i].bucket_rows == item.buckets[i],
+             "fixed ADC split shape");
+      expect(chunks[i].output_offset == offset, "fixed ADC split output continuity");
+      expect(chunks[i].codes == split_codes.data() + offset * split_pq_m,
+             "fixed ADC split advances the code pointer");
+      offset += chunks[i].valid_rows;
+      valid_sum += chunks[i].valid_rows;
+    }
+    expect(valid_sum == item.rows, "fixed ADC split covers every real row");
+  }
+}
+
+OVVS_TEST(pq_adc_cpu_multitask_matches_oracle_and_rejects_bad_codes_atomically) {
+  using ovvs::impl::PqAdcTask;
+  Res res;
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "CPU multi-task ADC policy");
+  constexpr int32_t pq_m = 4, ks = 16;
+  const std::vector<int64_t> rows{3, 129, 5};
+  std::vector<std::vector<float>> tables(rows.size(),
+                                         std::vector<float>(static_cast<size_t>(pq_m * ks)));
+  std::vector<std::vector<uint8_t>> codes(rows.size());
+  std::vector<PqAdcTask> tasks;
+  int64_t output_rows = 0;
+  for (size_t task = 0; task < rows.size(); ++task) {
+    for (int32_t m = 0; m < pq_m; ++m) {
+      for (int32_t code = 0; code < ks; ++code) {
+        tables[task][static_cast<size_t>(m * ks + code)] =
+            10.0f * static_cast<float>(task + 1) + 0.25f * static_cast<float>(m) +
+            0.01f * static_cast<float>(code);
+      }
+    }
+    codes[task].resize(static_cast<size_t>(rows[task] * pq_m));
+    for (int64_t row = 0; row < rows[task]; ++row) {
+      for (int32_t m = 0; m < pq_m; ++m) {
+        codes[task][static_cast<size_t>(row * pq_m + m)] =
+            static_cast<uint8_t>((row * 7 + m * 3 + static_cast<int64_t>(task)) % ks);
+      }
+    }
+    tasks.push_back({tables[task].data(), codes[task].data(), rows[task], output_rows});
+    output_rows += rows[task];
+  }
+
+  std::vector<float> expected(static_cast<size_t>(output_rows));
+  for (size_t task = 0; task < tasks.size(); ++task) {
+    for (int64_t row = 0; row < tasks[task].rows; ++row) {
+      expected[static_cast<size_t>(tasks[task].output_offset + row)] =
+          independent_pq_adc(tasks[task].tables, tasks[task].codes + row * pq_m, pq_m, ks);
+    }
+  }
+  std::vector<float> actual(static_cast<size_t>(output_rows + 2), -12345.0f);
+  expect_status(ovvs::impl::prim_pq_adc_batch(
+                    *ovvs::impl::rd(res.r), tasks.data(), static_cast<int64_t>(tasks.size()),
+                    pq_m, ks, actual.data() + 1, output_rows),
+                "CPU multi-task ADC");
+  expect(actual.front() == -12345.0f && actual.back() == -12345.0f,
+         "CPU multi-task ADC canaries");
+  for (int64_t row = 0; row < output_rows; ++row) {
+    const float tolerance =
+        1e-5f * std::max(1.0f, std::fabs(expected[static_cast<size_t>(row)]));
+    expect(std::fabs(actual[static_cast<size_t>(row + 1)] -
+                     expected[static_cast<size_t>(row)]) <= tolerance,
+           "CPU multi-task ADC oracle/order row=" + std::to_string(row));
+  }
+  ovvsDevice last = OVVS_DEVICE_NPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "CPU multi-task ADC last device");
+  expect(last == OVVS_DEVICE_CPU, "CPU multi-task ADC attribution");
+
+  codes[1][static_cast<size_t>(17 * pq_m + 2)] = static_cast<uint8_t>(ks);
+  std::fill(actual.begin(), actual.end(), -12345.0f);
+  expect(ovvs::impl::prim_pq_adc_batch(
+             *ovvs::impl::rd(res.r), tasks.data(), static_cast<int64_t>(tasks.size()), pq_m,
+             ks, actual.data() + 1, output_rows) == OVVS_STATUS_INVALID_ARGUMENT,
+         "multi-task ADC rejects a code outside the LUT");
+  for (float value : actual) {
+    expect(value == -12345.0f, "invalid multi-task ADC publishes no output");
+  }
+}
+
+OVVS_TEST(pq_adc_multitask_forced_policies_fail_atomically) {
+  using ovvs::impl::PqAdcTask;
+  Res res;
+  constexpr int32_t pq_m = 8, ks = 16;
+  const std::vector<int64_t> rows{129, 257};
+  std::vector<float> safe_tables(static_cast<size_t>(pq_m * ks), 0.25f);
+  std::vector<float> unsafe_tables(static_cast<size_t>(pq_m * ks), 8192.0f);
+  std::vector<uint8_t> first_codes(static_cast<size_t>(rows[0] * pq_m), 1);
+  std::vector<uint8_t> second_codes(static_cast<size_t>(rows[1] * pq_m), 2);
+  const int64_t output_rows = rows[0] + rows[1];
+  const PqAdcTask tasks[]{{safe_tables.data(), first_codes.data(), rows[0], 0},
+                          {unsafe_tables.data(), second_codes.data(), rows[1], rows[0]}};
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "forced-policy ADC CPU seed");
+  std::vector<float> seeded(static_cast<size_t>(output_rows));
+  expect_status(ovvs::impl::prim_pq_adc_batch(*ovvs::impl::rd(res.r), tasks, 2, pq_m, ks,
+                                               seeded.data(), output_rows),
+                "forced-policy ADC CPU seed call");
+
+  int32_t fallbacks_before = 0;
+  int32_t compile_fails_before = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_before),
+                "forced-policy ADC fallback count before");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_before),
+                "forced-policy ADC compile-fail count before");
+
+  std::vector<float> actual(static_cast<size_t>(output_rows + 2), -12345.0f);
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU),
+                "multi-task ADC FORCE_GPU policy");
+  expect(ovvs::impl::prim_pq_adc_batch(*ovvs::impl::rd(res.r), tasks, 2, pq_m, ks,
+                                       actual.data() + 1, output_rows) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "multi-task ADC FORCE_GPU fails closed");
+  for (float value : actual) expect(value == -12345.0f, "FORCE_GPU ADC output is atomic");
+  int32_t fallbacks_after_gpu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after_gpu),
+                "multi-task ADC FORCE_GPU fallback count");
+  expect(fallbacks_after_gpu == fallbacks_before,
+         "FORCE_GPU multi-task ADC does not increment NPU fallback count");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
+                "multi-task ADC FORCE_NPU policy");
+  expect(ovvs::impl::prim_pq_adc_batch(*ovvs::impl::rd(res.r), tasks, 2, pq_m, ks,
+                                       actual.data() + 1, output_rows) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "unsafe multi-task FORCE_NPU ADC fails closed");
+  for (float value : actual) expect(value == -12345.0f, "FORCE_NPU ADC output is atomic");
+  int32_t fallbacks_after_npu = 0;
+  int32_t compile_fails_after = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after_npu),
+                "multi-task ADC FORCE_NPU fallback count");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_after),
+                "multi-task ADC FORCE_NPU compile-fail count");
+  expect(fallbacks_after_npu == fallbacks_before + 1,
+         "unsafe multi-task FORCE_NPU ADC records one logical fallback");
+  expect(compile_fails_after == compile_fails_before,
+         "range rejection is not an NPU compile failure");
+  ovvsDevice last = OVVS_DEVICE_NPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "failed multi-task ADC last device");
+  expect(last == OVVS_DEVICE_CPU, "failed multi-task ADC preserves prior attribution");
+}
+
+OVVS_TEST(npu_pq_adc_true_multitask_matches_reference_when_present) {
+  using ovvs::impl::PqAdcTask;
+  Res res;
+  int32_t npu = 0;
+  expect_status(ovvsResourcesNpuAvailable(res.r, &npu), "multi-task ADC NPU probe");
+  if (!npu) skip_test("NPU not available");
+
+  constexpr int32_t pq_m = 8, ks = 256;
+  const std::vector<int64_t> rows{127, 128, 129, 255, 256, 257};
+  std::vector<std::vector<float>> tables(rows.size(),
+                                         std::vector<float>(static_cast<size_t>(pq_m * ks)));
+  std::vector<std::vector<uint8_t>> codes(rows.size());
+  std::vector<PqAdcTask> tasks;
+  int64_t output_rows = 0;
+  for (size_t task = 0; task < rows.size(); ++task) {
+    for (int32_t m = 0; m < pq_m; ++m) {
+      for (int32_t code = 0; code < ks; ++code) {
+        tables[task][static_cast<size_t>(m * ks + code)] =
+            0.03125f * static_cast<float>(task + 1) +
+            0.0005f * static_cast<float>(m + 1) + 0.0001f * static_cast<float>(code);
+      }
+    }
+    codes[task].resize(static_cast<size_t>(rows[task] * pq_m));
+    for (int64_t row = 0; row < rows[task]; ++row) {
+      for (int32_t m = 0; m < pq_m; ++m) {
+        codes[task][static_cast<size_t>(row * pq_m + m)] =
+            static_cast<uint8_t>((row * 37 + m * 53 + static_cast<int64_t>(task) * 97) % ks);
+      }
+    }
+    tasks.push_back({tables[task].data(), codes[task].data(), rows[task], output_rows});
+    output_rows += rows[task];
+  }
+  expect(output_rows == 1152, "true multi-task ADC real row count");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
+                "true multi-task ADC FORCE_NPU policy");
+  auto telemetry = [&]() {
+    auto* resources = ovvs::impl::rd(res.r);
+    std::lock_guard<std::mutex> lock(resources->pq_adc_stats_mutex);
+    return std::vector<int64_t>{resources->pq_adc_calls,
+                                resources->pq_adc_logical_tasks,
+                                resources->pq_adc_chunks,
+                                resources->pq_adc_valid_rows,
+                                resources->pq_adc_padded_rows,
+                                resources->pq_adc_npu_requests,
+                                resources->pq_adc_npu_rows,
+                                resources->pq_adc_npu_capacity_rows,
+                                resources->pq_adc_cpu_rows};
+  };
+  std::vector<int64_t> before = telemetry();
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      for (size_t task = 0; task < tables.size(); ++task) {
+        for (size_t i = 0; i < tables[task].size(); ++i) {
+          tables[task][i] += 0.00001f * static_cast<float>((i + task) % 13 + 1);
+        }
+      }
+    }
+    std::vector<float> expected(static_cast<size_t>(output_rows));
+    for (const PqAdcTask& task : tasks) {
+      for (int64_t row = 0; row < task.rows; ++row) {
+        expected[static_cast<size_t>(task.output_offset + row)] =
+            independent_pq_adc(task.tables, task.codes + row * pq_m, pq_m, ks);
+      }
+    }
+    std::vector<float> actual(static_cast<size_t>(output_rows + 2), -12345.0f);
+    const ovvsStatus status = ovvs::impl::prim_pq_adc_batch(
+        *ovvs::impl::rd(res.r), tasks.data(), static_cast<int64_t>(tasks.size()), pq_m, ks,
+        actual.data() + 1, output_rows);
+    expect(status != OVVS_STATUS_DEVICE_UNAVAILABLE,
+           "NPU present but true multi-task ADC unavailable");
+    expect_status(status, "true multi-task NPU ADC");
+    expect(actual.front() == -12345.0f && actual.back() == -12345.0f,
+           "true multi-task NPU ADC canaries");
+    float max_abs_error = 0.0f;
+    for (int64_t row = 0; row < output_rows; ++row) {
+      max_abs_error = std::max(
+          max_abs_error,
+          std::fabs(actual[static_cast<size_t>(row + 1)] - expected[static_cast<size_t>(row)]));
+    }
+    expect(max_abs_error < 2e-2f,
+           "true multi-task NPU ADC max error " + std::to_string(max_abs_error) +
+               " pass=" + std::to_string(pass));
+    ovvsDevice last = OVVS_DEVICE_CPU;
+    expect_status(ovvsResourcesLastDevice(res.r, &last), "true multi-task ADC last device");
+    expect(last == OVVS_DEVICE_NPU, "true multi-task FORCE_NPU ADC attribution");
+    const std::vector<int64_t> after = telemetry();
+    expect(after[0] - before[0] == 1, "true multi-task ADC records one logical call");
+    expect(after[1] - before[1] == 6 && after[2] - before[2] == 6,
+           "true multi-task ADC records six tasks and chunks");
+    expect(after[3] - before[3] == 1152 && after[4] - before[4] == 384,
+           "true multi-task ADC records valid and padded rows");
+    expect(after[5] - before[5] == 3,
+           "true multi-task ADC groups six chunks into three NPU requests");
+    expect(after[6] - before[6] == 1152 && after[7] - before[7] == 1792 &&
+               after[8] == before[8],
+           "true multi-task ADC records real and submitted NPU rows without CPU fallback");
+    before = after;
+  }
+}
+
+OVVS_TEST(npu_pq_adc_split_and_bucket_regrouping_matches_reference_when_present) {
+  using ovvs::impl::PqAdcTask;
+  Res res;
+  int32_t npu = 0;
+  expect_status(ovvsResourcesNpuAvailable(res.r, &npu), "split ADC NPU probe");
+  if (!npu) skip_test("NPU not available");
+
+  constexpr int32_t pq_m = 8, ks = 256;
+  /* Alternating bucket classes plus a >2048 task exercise both bucket regrouping and
+     the planner's code-pointer advance for the split tail. Three 256-row chunks also
+     force a four-slot request, making inactive-slot work visible in telemetry. */
+  const std::vector<int64_t> rows{129, 3, 2049, 257, 255, 130};
+  std::vector<std::vector<float>> tables(
+      rows.size(), std::vector<float>(static_cast<size_t>(pq_m * ks)));
+  std::vector<std::vector<uint8_t>> codes(rows.size());
+  std::vector<PqAdcTask> tasks;
+  int64_t output_rows = 0;
+  for (size_t task = 0; task < rows.size(); ++task) {
+    for (int32_t m = 0; m < pq_m; ++m) {
+      for (int32_t code = 0; code < ks; ++code) {
+        tables[task][static_cast<size_t>(m * ks + code)] =
+            0.02f * static_cast<float>(task + 1) +
+            0.0007f * static_cast<float>(m + 1) +
+            0.00003f * static_cast<float>(code);
+      }
+    }
+    codes[task].resize(static_cast<size_t>(rows[task] * pq_m));
+    for (int64_t row = 0; row < rows[task]; ++row) {
+      for (int32_t m = 0; m < pq_m; ++m) {
+        codes[task][static_cast<size_t>(row * pq_m + m)] = static_cast<uint8_t>(
+            (row * 71 + m * 29 + static_cast<int64_t>(task) * 43) % ks);
+      }
+    }
+    tasks.push_back({tables[task].data(), codes[task].data(), rows[task], output_rows});
+    output_rows += rows[task];
+  }
+  expect(output_rows == 2823, "split ADC real row count");
+
+  auto telemetry = [&]() {
+    auto* resources = ovvs::impl::rd(res.r);
+    std::lock_guard<std::mutex> lock(resources->pq_adc_stats_mutex);
+    return std::vector<int64_t>{resources->pq_adc_calls,
+                                resources->pq_adc_logical_tasks,
+                                resources->pq_adc_chunks,
+                                resources->pq_adc_valid_rows,
+                                resources->pq_adc_padded_rows,
+                                resources->pq_adc_npu_requests,
+                                resources->pq_adc_npu_rows,
+                                resources->pq_adc_npu_capacity_rows,
+                                resources->pq_adc_cpu_rows};
+  };
+  const std::vector<int64_t> before = telemetry();
+  std::vector<float> expected(static_cast<size_t>(output_rows));
+  for (const PqAdcTask& task : tasks) {
+    for (int64_t row = 0; row < task.rows; ++row) {
+      expected[static_cast<size_t>(task.output_offset + row)] =
+          independent_pq_adc(task.tables, task.codes + row * pq_m, pq_m, ks);
+    }
+  }
+  std::vector<float> actual(static_cast<size_t>(output_rows + 2), -12345.0f);
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
+                "split ADC FORCE_NPU policy");
+  const ovvsStatus status = ovvs::impl::prim_pq_adc_batch(
+      *ovvs::impl::rd(res.r), tasks.data(), static_cast<int64_t>(tasks.size()), pq_m, ks,
+      actual.data() + 1, output_rows);
+  expect(status != OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "NPU present but split/regroup ADC unavailable");
+  expect_status(status, "split/regroup NPU ADC");
+  expect(actual.front() == -12345.0f && actual.back() == -12345.0f,
+         "split/regroup NPU ADC canaries");
+  float max_abs_error = 0.0f;
+  for (int64_t row = 0; row < output_rows; ++row) {
+    max_abs_error = std::max(
+        max_abs_error,
+        std::fabs(actual[static_cast<size_t>(row + 1)] - expected[static_cast<size_t>(row)]));
+  }
+  expect(max_abs_error < 2e-2f,
+         "split/regroup NPU ADC max error " + std::to_string(max_abs_error));
+  const std::vector<int64_t> after = telemetry();
+  expect(after[0] - before[0] == 1 && after[1] - before[1] == 6 &&
+             after[2] - before[2] == 7,
+         "split/regroup ADC records one call, six tasks, and seven chunks");
+  expect(after[3] - before[3] == 2823 && after[4] - before[4] == 761,
+         "split/regroup ADC records real and intra-bucket padded rows");
+  expect(after[5] - before[5] == 4 && after[6] - before[6] == 2823 &&
+             after[7] - before[7] == 3840 && after[8] == before[8],
+         "split/regroup ADC records four requests and actual device capacity");
 }
 
 OVVS_TEST(npu_pq_adc_matches_shave_when_present) {

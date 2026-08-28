@@ -82,6 +82,27 @@ bool npu_gemm_range_safe(const float* a, int64_t na, const float* b, int64_t nb,
   return std::isfinite(dot_bound) && dot_bound < static_cast<double>(kNpuFp16FiniteMax);
 }
 
+void saturating_add_i64(int64_t& dst, int64_t value) {
+  if (value <= 0) return;
+  if (dst > std::numeric_limits<int64_t>::max() - value) {
+    dst = std::numeric_limits<int64_t>::max();
+  } else {
+    dst += value;
+  }
+}
+
+void record_npu_adc_execution(ResourcesData& r, int64_t requests, int64_t rows,
+                              int64_t capacity_rows) noexcept {
+  if (requests <= 0 && rows <= 0 && capacity_rows <= 0) return;
+  try {
+    std::lock_guard<std::mutex> lock(r.pq_adc_stats_mutex);
+    saturating_add_i64(r.pq_adc_npu_requests, requests);
+    saturating_add_i64(r.pq_adc_npu_rows, rows);
+    saturating_add_i64(r.pq_adc_npu_capacity_rows, capacity_rows);
+  } catch (...) {
+  }
+}
+
 }  // namespace
 
 #if defined(OVVS_WITH_OPENVINO)
@@ -182,13 +203,14 @@ static CachedReq& cached_req(const std::string& key, const std::function<ov::Com
   static auto& g = *new std::unordered_map<std::string, std::unique_ptr<CachedReq>>();
   static std::mutex gmu;
   std::lock_guard<std::mutex> lk(gmu);
-  auto& slot = g[key];
-  if (!slot) {
-    slot = std::make_unique<CachedReq>();
-    slot->compiled = make();
-    slot->req = slot->compiled.create_infer_request();
-  }
-  return *slot;
+  auto found = g.find(key);
+  if (found != g.end()) return *found->second;
+  auto slot = std::make_unique<CachedReq>();
+  slot->compiled = make();
+  slot->req = slot->compiled.create_infer_request();
+  CachedReq* published = slot.get();
+  g.emplace(key, std::move(slot));
+  return *published;
 }
 
 #endif
@@ -591,63 +613,191 @@ bool npu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
   return true;
 }
 
-bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
-                int64_t ncodes, float* out) {
+bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_count,
+                      int32_t pq_m, int32_t ks, float* out) {
 #if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device("NPU")) return false;
-  if (!npu_pq_adc_range_safe(tables, pq_m, ks)) return false;
-  constexpr int64_t kTile = 128;
+  if (!chunks || !out || chunk_count <= 0 || pq_m <= 0 || ks <= 0 || ks > 256) return false;
+  if (pq_m > std::numeric_limits<int32_t>::max() / ks) return false;
+  if (static_cast<int64_t>(pq_m) > std::numeric_limits<int64_t>::max() / ks) return false;
+  const int64_t lut_n = static_cast<int64_t>(pq_m) * ks;
+  if (static_cast<uint64_t>(lut_n) >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+    return false;
+  }
+
+  constexpr int32_t kBuckets[] = {128, 256, 512, 1024, 2048};
+  int64_t executed_requests = 0;
+  int64_t executed_rows = 0;
+  int64_t executed_capacity_rows = 0;
+  bool creating_request = false;
   try {
     using namespace ov;
-    const int64_t lut_n = static_cast<int64_t>(pq_m) * ks;
-    std::vector<float> staged(static_cast<size_t>(ncodes));
-    std::filesystem::create_directories(r.cache_dir);
-    for (int64_t off = 0; off < ncodes; off += kTile) {
-      const int64_t nn = std::min(kTile, ncodes - off);
-      std::ostringstream key;
-      key << "NPU_adc_m" << pq_m << "_ks" << ks << "_n" << nn;
-      CachedReq& slot = cached_req(key.str(), [&] {
-        auto pLut = std::make_shared<opset8::Parameter>(element::f32, Shape{static_cast<size_t>(lut_n)});
-        auto pIdx = std::make_shared<opset8::Parameter>(element::i32, Shape{static_cast<size_t>(nn),
-                                                                            static_cast<size_t>(pq_m)});
-        auto axis = opset8::Constant::create(element::i64, Shape{}, {0});
-        auto g = std::make_shared<ov::op::v8::Gather>(pLut, pIdx, axis);
-        auto red_axes = opset8::Constant::create(element::i64, Shape{1}, {1});
-        auto red = std::make_shared<ov::op::v1::ReduceSum>(g, red_axes, false);
-        auto model = std::make_shared<Model>(OutputVector{red}, ParameterVector{pLut, pIdx});
-        return compile_on("NPU", model, r.cache_dir);
-      });
-      std::lock_guard<std::mutex> lk(slot.mu);
-      fill_in(slot, 0, tables, static_cast<size_t>(lut_n) * sizeof(float));
-      Tensor tI = slot.req.get_input_tensor(1);
-      int32_t* idxp = tI.data<int32_t>();
-      for (int64_t i = 0; i < nn; ++i) {
-        const uint8_t* code = codes + (off + i) * pq_m;
-        for (int32_t m = 0; m < pq_m; ++m) {
-          idxp[static_cast<size_t>(i * pq_m + m)] = m * ks + static_cast<int32_t>(code[m]);
+    std::vector<int64_t> bucket_chunks[5];
+    std::vector<std::pair<int64_t, int64_t>> output_ranges;
+    output_ranges.reserve(static_cast<size_t>(chunk_count));
+    int64_t max_output_end = 0;
+
+    /* Validate the complete logical call before compiling or submitting any request.
+       FORCE_NPU relies on this to fail without partially executing a safe prefix. */
+    for (int64_t ci = 0; ci < chunk_count; ++ci) {
+      const PqAdcChunk& chunk = chunks[ci];
+      if (!chunk.tables || !chunk.codes || chunk.valid_rows <= 0 || chunk.bucket_rows <= 0 ||
+          chunk.valid_rows > chunk.bucket_rows || chunk.output_offset < 0 ||
+          chunk.output_offset > std::numeric_limits<int64_t>::max() - chunk.valid_rows) {
+        return false;
+      }
+      int bucket_index = -1;
+      for (int bi = 0; bi < 5; ++bi) {
+        if (chunk.bucket_rows == kBuckets[bi]) {
+          bucket_index = bi;
+          break;
         }
       }
-      slot.req.infer();
-      Tensor result = slot.req.get_output_tensor(0);
-      const size_t result_bytes = static_cast<size_t>(nn) * sizeof(float);
-      if (result.get_byte_size() < result_bytes) return false;
-      const float* result_data = result.data<const float>();
-      if (!finite_below_npu_limit(result_data, nn)) return false;
-      std::memcpy(staged.data() + off, result_data, result_bytes);
+      if (bucket_index < 0 || !npu_pq_adc_range_safe(chunk.tables, pq_m, ks)) return false;
+      for (int32_t row = 0; row < chunk.valid_rows; ++row) {
+        const uint8_t* code =
+            chunk.codes + static_cast<size_t>(row) * static_cast<size_t>(pq_m);
+        for (int32_t m = 0; m < pq_m; ++m) {
+          if (static_cast<int32_t>(code[m]) >= ks) return false;
+        }
+      }
+      const int64_t output_end = chunk.output_offset + chunk.valid_rows;
+      max_output_end = std::max(max_output_end, output_end);
+      output_ranges.emplace_back(chunk.output_offset, output_end);
+      bucket_chunks[bucket_index].push_back(ci);
     }
-    std::memcpy(out, staged.data(), staged.size() * sizeof(float));
+    std::sort(output_ranges.begin(), output_ranges.end());
+    for (size_t i = 1; i < output_ranges.size(); ++i) {
+      if (output_ranges[i].first < output_ranges[i - 1].second) return false;
+    }
+    if (static_cast<uint64_t>(max_output_end) >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+      return false;
+    }
+
+    std::vector<float> staged(static_cast<size_t>(max_output_end));
+    std::filesystem::create_directories(r.cache_dir);
+    for (int bucket_index = 0; bucket_index < 5; ++bucket_index) {
+      const std::vector<int64_t>& group = bucket_chunks[bucket_index];
+      if (group.empty()) continue;
+      const int32_t bucket = kBuckets[bucket_index];
+      const int64_t index_elems_per_chunk = static_cast<int64_t>(bucket) * pq_m;
+      const int32_t raw_capacity_limit = static_cast<int32_t>(
+          std::max<int64_t>(1, std::min<int64_t>(32, 65536 / index_elems_per_chunk)));
+      int32_t capacity_limit = 1;
+      while (capacity_limit <= raw_capacity_limit / 2) capacity_limit *= 2;
+
+      for (size_t base = 0; base < group.size();) {
+        const size_t remaining = group.size() - base;
+        const size_t target =
+            std::min(remaining, static_cast<size_t>(capacity_limit));
+        int32_t capacity = 1;
+        while (static_cast<size_t>(capacity) < target) capacity *= 2;
+        const size_t active = std::min(static_cast<size_t>(capacity), remaining);
+        std::ostringstream key;
+        key << "NPU_adc_v3_m" << pq_m << "_ks" << ks << "_b" << bucket << "_cap"
+            << capacity << "_latency";
+        creating_request = true;
+        CachedReq& slot = cached_req(key.str(), [&] {
+          auto pLut = std::make_shared<opset8::Parameter>(
+              element::f32,
+              Shape{static_cast<size_t>(capacity), static_cast<size_t>(lut_n)});
+          auto pIdx = std::make_shared<opset8::Parameter>(
+              element::i32,
+              Shape{static_cast<size_t>(capacity), static_cast<size_t>(bucket),
+                    static_cast<size_t>(pq_m)});
+          auto axis = opset8::Constant::create(element::i64, Shape{}, {1});
+          auto g = std::make_shared<ov::op::v8::Gather>(pLut, pIdx, axis, 1);
+          auto red_axes = opset8::Constant::create(element::i64, Shape{1}, {2});
+          auto red = std::make_shared<ov::op::v1::ReduceSum>(g, red_axes, false);
+          auto model = std::make_shared<Model>(OutputVector{red}, ParameterVector{pLut, pIdx});
+          return compile_on("NPU", model, r.cache_dir);
+        });
+        creating_request = false;
+        std::lock_guard<std::mutex> lk(slot.mu);
+        Tensor tLut = slot.req.get_input_tensor(0);
+        Tensor tIdx = slot.req.get_input_tensor(1);
+        const size_t lut_elems = static_cast<size_t>(capacity) * static_cast<size_t>(lut_n);
+        const size_t idx_elems = static_cast<size_t>(capacity) * static_cast<size_t>(bucket) *
+                                 static_cast<size_t>(pq_m);
+        if (tLut.get_byte_size() < lut_elems * sizeof(float) ||
+            tIdx.get_byte_size() < idx_elems * sizeof(int32_t)) {
+          throw std::runtime_error("npu ADC request tensor smaller than fixed batch");
+        }
+        float* lutp = tLut.data<float>();
+        int32_t* idxp = tIdx.data<int32_t>();
+        std::fill(lutp, lutp + lut_elems, 0.0f);
+        for (int32_t batch = 0; batch < capacity; ++batch) {
+          for (int32_t row = 0; row < bucket; ++row) {
+            int32_t* dst = idxp +
+                           (static_cast<size_t>(batch) * static_cast<size_t>(bucket) +
+                            static_cast<size_t>(row)) *
+                               static_cast<size_t>(pq_m);
+            for (int32_t m = 0; m < pq_m; ++m) dst[m] = m * ks;
+          }
+        }
+
+        int64_t request_rows = 0;
+        for (size_t batch = 0; batch < active; ++batch) {
+          const PqAdcChunk& chunk = chunks[group[base + batch]];
+          std::memcpy(lutp + batch * static_cast<size_t>(lut_n), chunk.tables,
+                      static_cast<size_t>(lut_n) * sizeof(float));
+          for (int32_t row = 0; row < chunk.valid_rows; ++row) {
+            const uint8_t* code =
+                chunk.codes + static_cast<size_t>(row) * static_cast<size_t>(pq_m);
+            int32_t* dst = idxp +
+                           (batch * static_cast<size_t>(bucket) + static_cast<size_t>(row)) *
+                               static_cast<size_t>(pq_m);
+            for (int32_t m = 0; m < pq_m; ++m) {
+              dst[m] = m * ks + static_cast<int32_t>(code[m]);
+            }
+          }
+          saturating_add_i64(request_rows, chunk.valid_rows);
+        }
+
+        slot.req.infer();
+        Tensor result = slot.req.get_output_tensor(0);
+        const size_t result_elems = static_cast<size_t>(capacity) * static_cast<size_t>(bucket);
+        if (result.get_byte_size() < result_elems * sizeof(float)) {
+          throw std::runtime_error("npu ADC output tensor smaller than fixed batch");
+        }
+        const float* result_data = result.data<const float>();
+        for (size_t batch = 0; batch < active; ++batch) {
+          const PqAdcChunk& chunk = chunks[group[base + batch]];
+          const float* src = result_data + batch * static_cast<size_t>(bucket);
+          if (!finite_below_npu_limit(src, chunk.valid_rows)) {
+            throw std::runtime_error("npu ADC output outside finite range");
+          }
+          std::memcpy(staged.data() + chunk.output_offset, src,
+                      static_cast<size_t>(chunk.valid_rows) * sizeof(float));
+        }
+        ++executed_requests;
+        saturating_add_i64(executed_rows, request_rows);
+        saturating_add_i64(executed_capacity_rows,
+                           static_cast<int64_t>(capacity) * bucket);
+        base += active;
+      }
+    }
+    for (int64_t ci = 0; ci < chunk_count; ++ci) {
+      const PqAdcChunk& chunk = chunks[ci];
+      std::memcpy(out + chunk.output_offset, staged.data() + chunk.output_offset,
+                  static_cast<size_t>(chunk.valid_rows) * sizeof(float));
+    }
+    record_npu_adc_execution(r, executed_requests, executed_rows, executed_capacity_rows);
     return true;
   } catch (...) {
-    ++r.npu_compile_fails;
+    record_npu_adc_execution(r, executed_requests, executed_rows, executed_capacity_rows);
+    int32_t& failure_counter = creating_request ? r.npu_compile_fails : r.npu_runtime_fails;
+    if (failure_counter < std::numeric_limits<int32_t>::max()) ++failure_counter;
     return false;
   }
 #else
   (void)r;
-  (void)tables;
+  (void)chunks;
+  (void)chunk_count;
   (void)pq_m;
   (void)ks;
-  (void)codes;
-  (void)ncodes;
   (void)out;
   return false;
 #endif

@@ -213,28 +213,190 @@ ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, in
   return OVVS_STATUS_SUCCESS;
 }
 
-ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
-                       const uint8_t* codes, int64_t ncodes, float* out) {
-  if (!tables || !codes || !out || pq_m <= 0 || ks <= 0 || ncodes <= 0) {
+int32_t pq_adc_bucket_rows(int64_t remaining) {
+  if (remaining <= 0) return 0;
+  if (remaining <= 128) return 128;
+  if (remaining <= 256) return 256;
+  if (remaining <= 512) return 512;
+  if (remaining <= 1024) return 1024;
+  return 2048;
+}
+
+ovvsStatus plan_pq_adc_chunks(const PqAdcTask* tasks, int64_t task_count,
+                              int32_t pq_m, int64_t output_rows,
+                              std::vector<PqAdcChunk>& chunks) {
+  chunks.clear();
+  if (!tasks || task_count <= 0 || pq_m <= 0 || output_rows <= 0) {
     return OVVS_STATUS_INVALID_ARGUMENT;
   }
-  /* There is no iGPU ADC backend. FORCE_GPU must not punch through to NPU. */
-  if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
-  if (r.policy != OVVS_POLICY_FORCE_CPU) {
-    if (npu_pq_adc(r, tables, pq_m, ks, codes, ncodes, out)) {
-      r.last_device = OVVS_DEVICE_NPU;
-      return OVVS_STATUS_SUCCESS;
+  try {
+    std::vector<PqAdcChunk> planned;
+    int64_t expected_output = 0;
+    for (int64_t task_index = 0; task_index < task_count; ++task_index) {
+      const PqAdcTask& task = tasks[task_index];
+      if (!task.tables || !task.codes || task.rows <= 0) {
+        return OVVS_STATUS_INVALID_ARGUMENT;
+      }
+      if (task.output_offset != expected_output || task.rows > output_rows - expected_output) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+      if (static_cast<uint64_t>(task.rows) >
+          static_cast<uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) /
+              static_cast<uint64_t>(pq_m)) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+      int64_t consumed = 0;
+      while (consumed < task.rows) {
+        const int64_t remaining = task.rows - consumed;
+        const int32_t bucket_rows = pq_adc_bucket_rows(remaining);
+        if (bucket_rows <= 0) return OVVS_STATUS_SHAPE_MISMATCH;
+        const int32_t valid_rows = static_cast<int32_t>(
+            std::min<int64_t>(remaining, static_cast<int64_t>(bucket_rows)));
+        if (planned.size() == planned.max_size()) return OVVS_STATUS_SHAPE_MISMATCH;
+        const size_t code_offset =
+            static_cast<size_t>(consumed) * static_cast<size_t>(pq_m);
+        planned.push_back({task.tables, task.codes + code_offset, valid_rows, bucket_rows,
+                           task.output_offset + consumed});
+        consumed += valid_rows;
+      }
+      expected_output += task.rows;
     }
-    if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+    if (expected_output != output_rows) return OVVS_STATUS_SHAPE_MISMATCH;
+    chunks.swap(planned);
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (const std::length_error&) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
   }
-  if (r.policy == OVVS_POLICY_FORCE_NPU || r.policy == OVVS_POLICY_FORCE_GPU) {
-    return finish_forced_fail(r);
+}
+
+namespace {
+
+void pq_adc_saturating_add(int64_t& value, int64_t delta) noexcept {
+  if (delta <= 0) return;
+  if (value > std::numeric_limits<int64_t>::max() - delta) {
+    value = std::numeric_limits<int64_t>::max();
+  } else {
+    value += delta;
   }
-  for (int64_t i = 0; i < ncodes; ++i) {
-    out[i] = ovvsShavePqAdc(tables, codes + i * pq_m, pq_m, ks);
+}
+
+void record_pq_adc_batch(ResourcesData& r, int64_t task_count, int64_t chunk_count,
+                         int64_t valid_rows, int64_t padded_rows) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(r.pq_adc_stats_mutex);
+    pq_adc_saturating_add(r.pq_adc_calls, 1);
+    pq_adc_saturating_add(r.pq_adc_logical_tasks, task_count);
+    pq_adc_saturating_add(r.pq_adc_chunks, chunk_count);
+    pq_adc_saturating_add(r.pq_adc_valid_rows, valid_rows);
+    pq_adc_saturating_add(r.pq_adc_padded_rows, padded_rows);
+  } catch (...) {
   }
-  r.last_device = OVVS_DEVICE_CPU;
-  return OVVS_STATUS_SUCCESS;
+}
+
+void record_pq_adc_cpu_rows(ResourcesData& r, int64_t rows) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(r.pq_adc_stats_mutex);
+    pq_adc_saturating_add(r.pq_adc_cpu_rows, rows);
+  } catch (...) {
+  }
+}
+
+}  // namespace
+
+ovvsStatus prim_pq_adc_batch(ResourcesData& r, const PqAdcTask* tasks, int64_t task_count,
+                             int32_t pq_m, int32_t ks, float* out, int64_t output_rows) {
+  if (!tasks || !out || task_count <= 0 || pq_m <= 0 || ks <= 0 || output_rows <= 0) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (pq_m > std::numeric_limits<int32_t>::max() / ks ||
+      static_cast<uint64_t>(pq_m) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(ks) ||
+      static_cast<uint64_t>(output_rows) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) / sizeof(float)) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+
+  try {
+    std::vector<PqAdcChunk> chunks;
+    ovvsStatus status = plan_pq_adc_chunks(tasks, task_count, pq_m, output_rows, chunks);
+    if (status != OVVS_STATUS_SUCCESS) return status;
+
+    int64_t padded_rows = 0;
+    for (int64_t task_index = 0; task_index < task_count; ++task_index) {
+      const PqAdcTask& task = tasks[task_index];
+      if (static_cast<uint64_t>(task.rows) >
+          static_cast<uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) /
+              static_cast<uint64_t>(pq_m)) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+      const size_t code_elements =
+          static_cast<size_t>(task.rows) * static_cast<size_t>(pq_m);
+      for (size_t element = 0; element < code_elements; ++element) {
+        if (static_cast<int32_t>(task.codes[element]) >= ks) {
+          return OVVS_STATUS_INVALID_ARGUMENT;
+        }
+      }
+    }
+    for (const PqAdcChunk& chunk : chunks) {
+      pq_adc_saturating_add(
+          padded_rows,
+          static_cast<int64_t>(chunk.bucket_rows) - static_cast<int64_t>(chunk.valid_rows));
+    }
+
+    std::vector<float> staged(static_cast<size_t>(output_rows));
+    record_pq_adc_batch(r, task_count, static_cast<int64_t>(chunks.size()), output_rows,
+                        padded_rows);
+
+    /* There is no iGPU ADC backend. FORCE_GPU must not punch through to NPU. */
+    if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+    if (r.policy != OVVS_POLICY_FORCE_CPU) {
+      if (npu_pq_adc_batch(r, chunks.data(), static_cast<int64_t>(chunks.size()), pq_m,
+                           ks, staged.data())) {
+        std::memcpy(out, staged.data(), staged.size() * sizeof(float));
+        r.last_device = OVVS_DEVICE_NPU;
+        return OVVS_STATUS_SUCCESS;
+      }
+      if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+    }
+    if (r.policy == OVVS_POLICY_FORCE_NPU || r.policy == OVVS_POLICY_FORCE_GPU) {
+      return finish_forced_fail(r);
+    }
+
+    for (int64_t task_index = 0; task_index < task_count; ++task_index) {
+      const PqAdcTask& task = tasks[task_index];
+      for (int64_t row = 0; row < task.rows; ++row) {
+        const uint8_t* code =
+            task.codes + static_cast<size_t>(row) * static_cast<size_t>(pq_m);
+        float score = 0.0f;
+        for (int32_t m = 0; m < pq_m; ++m) {
+          score += task.tables[static_cast<size_t>(m) * static_cast<size_t>(ks) +
+                               static_cast<size_t>(code[m])];
+        }
+        staged[static_cast<size_t>(task.output_offset + row)] = score;
+      }
+    }
+    record_pq_adc_cpu_rows(r, output_rows);
+    std::memcpy(out, staged.data(), staged.size() * sizeof(float));
+    r.last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (const std::length_error&) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+}
+
+ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
+                       const uint8_t* codes, int64_t ncodes, float* out) {
+  const PqAdcTask task{tables, codes, ncodes, 0};
+  return prim_pq_adc_batch(r, &task, 1, pq_m, ks, out, ncodes);
 }
 
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,

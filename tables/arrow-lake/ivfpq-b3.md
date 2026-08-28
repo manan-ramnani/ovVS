@@ -1,6 +1,6 @@
 # Arrow Lake IVF-PQ B3 evidence
 
-Status: **correctness guarded; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
+Status: **correctness guarded; persistent storage and synchronous fixed-bucket batching complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
 
 Local development artifacts are `out/bench/ivfpq-b3-baseline-smoke.json`, `out/bench/ivfpq-b3-guarded-smoke.json`, and three `ivfpq-b3-packed-smoke*.json` runs with sibling Markdown files. They are overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
 
@@ -45,14 +45,33 @@ Focused native telemetry validates the intended runtime behavior:
 
 A hand-authored 268-byte legacy `IPQ1` file round-trips byte-for-byte. Truncation and invalid/duplicate list IDs fail without publishing state; version 2 reports `UNSUPPORTED`. Extend now stages assignments, lists, row-major codes, and CSR before mutation, propagates primitive failures, then appends the preserved input rows and commits via no-throw swaps. A forced-NPU failure leaves serialized bytes, search results, and rebuild telemetry unchanged.
 
-Three repeated current-code smokes retained recall 0.6375 and 0.946875 at `nprobe=2/8`:
+Three repeated pre-batching smokes retained recall 0.6375 and 0.946875 at `nprobe=2/8`:
 
 | Search policy | nprobe 2 QPS, three-run median (range) | nprobe 8 QPS, three-run median (range) |
 |---|---:|---:|
 | AUTO | 12,910.5 (12,381.5–13,015.5) | 3,479.1 (3,389.5–3,513.9) |
 | FORCE_CPU | 74,888.8 (66,445.2–78,817.7) | 31,815.5 (25,153.3–32,245.1) |
 
-One earlier guarded run measured FORCE_CPU at 63,103.9/23,463.9 QPS, but that single before-run plus the current variance is not a controlled A/B. Direct persistent code spans and zero unfiltered host list-code scratch are proven; final candidate-ID aggregation and backend/request copies are not measured, and a stable end-to-end speedup is not established. AUTO remains 9.14× slower than FORCE_CPU at `nprobe=8` because safe-list NPU dispatch is still launch-bound. Forced NPU remains explicitly unavailable for the complete search. Raw FAISS results are retained in the local artifacts but are not refinement-equivalent.
+One earlier guarded run measured FORCE_CPU at 63,103.9/23,463.9 QPS, but that single run plus the observed variance is not a controlled A/B. Direct persistent code spans and zero unfiltered host list-code scratch are proven; final candidate-ID aggregation and backend/request copies are not measured. At this checkpoint AUTO was 9.14× slower than FORCE_CPU at `nprobe=8`, consistent with repeated per-list AUTO attempts plus allocation and dispatch overhead. The fixed-bucket checkpoint below supersedes it while retaining the result as negative history; no retained stage timing isolates one cause.
+
+## Batched descriptors and fixed buckets
+
+IVF-PQ search now plans ordered query/list work descriptors in bounded complete-query blocks, stores one LUT per nonempty query/list, writes ADC scores into dense candidate slices, and invokes one internal batch primitive per block. The block admits at most 32 queries and caps raw candidate rows at index `n`, so a full-probe query remains a one-query block while narrower probes combine multiple queries. Candidate IDs retain the prior query/probe/list-row order, refinement workspaces are reused, and the complete `nq*k` result is staged before caller publication. Filters compact only allowed IDs/codes into pre-sized storage.
+
+The NPU backend splits lists into fixed buckets `{128,256,512,1024,2048}` and packs equal buckets into capacity-bounded graph requests. A graph receives LUTs `[batch,M*Ks]` and flattened Gather indices `[batch,bucket,M]`, uses `Gather(axis=1,batch_dims=1)` and `ReduceSum(axis=2)`, fills padding with valid code-zero indices, and copies only real rows. The maximum capacity is the largest power of two not exceeding `min(32, 65536/(bucket*M))`; each request uses the smallest power-of-two capacity that fits its active group. Compilation and one request remain cached per `(M,Ks,bucket,capacity,latency)` shape. This checkpoint deliberately retains request depth one. An earlier latency-mode `[32,128]` direction probe reported one optimal request, but the adaptive production shapes have not been re-probed for their optimal count. Depth 2/4 remains a separate throughput bakeoff.
+
+Native telemetry proves the grouping rather than inferring it from `last_device`: a six-task fixture covering 1,152 real rows and 384 intra-bucket padded rows executed as exactly three NPU requests using capacities 2/4/1 for buckets 128/256/512. It submitted 1,792 capacity rows: 1,152 valid, 384 intra-bucket padding, and 256 inactive-slot padding, with zero CPU fallback. The test mutates LUTs between passes, checks an independent scalar oracle within 0.02, validates output canaries, and confirms invalid codes and forced-policy failures publish nothing. A second live fixture alternates bucket classes and splits a 2,049-row task; seven chunks and 2,823 valid rows execute in four requests covering buckets 128/256/512/2,048, with 3,840 capacity rows and exact dense output order. Bucket 1,024 remains planner-covered but lacks equivalent retained live execution evidence. These are primitive correctness and routing facts, not an end-to-end speed claim.
+
+Three independent pre-commit development runs (`git.dirty=true` at base `3c5f65d`, no recorded DLL hash) on a SIFT prefix (`n=2,000`, `dim=128`, `nq=32`, `k=10`, `nlist=32`, `pq_m=8`, `krefine=32`, one warmup, five measured passes) produced:
+
+| Search policy | nprobe 2 QPS, three-run median (range) | nprobe 8 QPS, three-run median (range) | Recall@10 at nprobe 2/8 | Peak process RSS range |
+|---|---:|---:|---:|---:|
+| AUTO | 62,573.3 (58,436.8–64,961.4) | 23,491.4 (23,054.8–24,013.2) | 0.6375 / 0.946875 | 140.9–141.0 MiB |
+| FORCE_CPU | 85,538.6 (83,703.9–85,883.0) | 32,533.6 (32,424.8–32,709.8) | 0.6375 / 0.946875 | 140.9–141.3 MiB |
+
+AUTO was 1.38× slower than FORCE_CPU at `nprobe=8`, versus 9.14× at the prior checkpoint. The ratio between checkpoint medians is 6.75× while recall stayed exact, but this is not a simultaneous isolated A/B and includes control-path/allocation changes as well as batching. Wide-range SIFT LUTs still fail the 65,504 bound, so FORCE_NPU remained explicitly unavailable in all three runs and AUTO attributed the final primitive to CPU. Per-LUT scaling remains unimplemented.
+
+Raw FAISS in the same current runs had median-of-run-median QPS 129,659.6/118,474.6 at `nprobe=2/8`, but recall was only 0.553125/0.6375 and timing varied widely. ovVS used `krefine=32`; FAISS was unrefined. This is retained as an unmatched competitor observation, not evidence that ovVS wins or loses at equal quality. The run artifacts are `out/bench/ivfpq-b3-batched-sift-smoke-r1.json` through `r3.json`; all remain partial because forced NPU is unavailable and package energy was disabled.
 
 ## Software-only direction probes
 
@@ -71,10 +90,10 @@ An isolated per-LUT scaling probe used a conservative 60,000 headroom, then de-s
 ## Remaining B3 gate
 
 1. Validate per-LUT scaling at production geometry before re-enabling unsafe-range NPU work.
-2. Batch query/list work descriptors and use fixed buckets 128/256/512/1,024/2,048 without allowing padded entries into selection.
-3. Bake off reusable request depths 1/2/4 with queue, cache, tail, copy, memory, and stage-device telemetry.
+2. Bake off reusable request depths 1/2/4 with queue, cache, tail, copy, memory, and stage-device telemetry; depth one remains the production default until end-to-end evidence says otherwise.
+3. Bound the compiled-request cache and include effective compile properties, runtime/compiler/driver identity, device ID, and performance mode in its key.
 4. Add the iGPU variable-length scan/select path and compare it with padded NPU execution per SKU.
 5. Compare raw ovVS and raw FAISS at identical `nlist`, `nprobe`, `pq_m`, `nbits`, and `krefine=k`; refined comparisons need an equivalent FAISS refinement lane.
 6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, and package-energy evidence before claiming a win.
 
-Latest checkpoint verification: 76/76 accelerator-enabled native tests, 6/6 CTest lanes, 57/57 benchmark-harness tests, and 6/6 SIFT-fetcher tests. CTest re-runs native subsets plus the two consumers, so its count is not additive.
+Latest checkpoint verification: 81/81 accelerator-enabled native tests with zero skips, 10/10 focused IVF-PQ/NPU tests, 6/6 CTest lanes, 57/57 benchmark-harness tests, and 6/6 SIFT-fetcher tests. CTest re-runs native subsets plus the two consumers, so its count is not additive.

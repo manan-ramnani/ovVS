@@ -67,7 +67,7 @@ Work the plan’s phases in sequence. **v0.2.0 already has C ABI symbols through
 
 1. B1 harness core and the current-code matched SIFT1M CAGRA gate are complete; full curves/energy and the real 100K×768 corpus remain open.
 2. B2/B5 pass the SIFT1M recall-closeness gate (0.9036 versus hnswlib 0.8915), but ≥0.95 recall, CAGRA QPS, NN-Descent convergence, and GPU prune remain open.
-3. **Next implementation:** IVF-PQ persistent list-major CSR is complete. Continue B3 with batched query/list descriptors, fixed ADC buckets, bounded reusable request pools, and iGPU scan/select; then RaBitQ packed binary GEMM (B4). Keep this software-only; do not require BIOS changes.
+3. **Next implementation:** IVF-PQ persistent list-major CSR, bounded query/list descriptors, and synchronous fixed ADC buckets are complete. Continue B3 with a bounded/versioned request cache, measured request depths 1/2/4, per-LUT scaling, and iGPU scan/select; then RaBitQ packed binary GEMM (B4). Keep this software-only; do not require BIOS changes.
 4. Continue CAGRA throughput work only from profiling evidence; never weaken hnswlib settings.
 5. HETERO stage overlap (B6); NPU L0 dataset-home experiment (B7); Lunar Lake bakeoff when hardware exists (B8)
 6. Then plan v1.0 polish (B9–B20). Vamana/ScaNN/SLINK/bindings are v1.1 (B21+) — do not start them ahead of B2
