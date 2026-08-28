@@ -138,15 +138,34 @@ Three sequential clean runs at commit `a23de6a` used the same bounded SIFT prefi
 
 CPU is 22.69×/13.65× faster at `nprobe=2/8`; FORCE_GPU reaches only 4.41%/7.33% of CPU throughput. The result is negative performance evidence, so no AUTO promotion is made. It is also bounded and energy-free. Raw FAISS reached lower recall because the harness comparator does not perform equivalent refinement; no competitor conclusion is drawn.
 
-The present structure explains where to measure next but does not attribute wall time yet. The inherited raw-candidate cap admits only about four smoke queries per fused call at `nprobe=8`. Each unfiltered block performs nine device allocations, multiple transfers, two kernels, three output waits, and queue drains during allocation destruction. Exact refinement remains a per-query Gather, distance GEMM/pairwise, and TopK sequence—roughly 96 synchronized primitive calls at batch 32. Validation also linearly searches all block plans for each shortlisted result and recomputes its ADC score. Complete-call stage telemetry must distinguish these costs before the next optimization claim.
+## Complete-call stage telemetry
+
+Commit `4fee489` adds the frozen additive `ovvsIvfPqSearchStatsV1` ABI. Its 200-byte resource-local snapshot is cumulative, saturating, mutex-coherent, and merged only after the complete caller output is published successfully. Nine non-overlapping stage counters sum to native function wall. GPU structural counters cover explicit library-visible allocations, queued copies, logical kernel submissions, and literal waits; they intentionally exclude shared-USM page migration and opaque oneMKL/OpenVINO internals. `candidate_rows` counts real index rows submitted or inspected: the fused GPU path includes raw rows before its in-kernel filter, while synthetic NPU bucket padding is excluded.
+
+The harness records warmup, timed, energy, and complete-point deltas separately. The primary record covers only the five timed passes and fails closed when a present record has the wrong ABI, moves backwards, is incomplete, disagrees with repeat/query counts, selects more rows than it scanned, or has a stage sum different from complete-call wall. Missing telemetry from an older library remains explicit and nonblocking.
+
+Three fresh sequential processes at clean commit `6a0f4c5` used the bounded SIFT prefix (`n=2,000`, `nq=32`, `dim=128`, `k=10`, `nlist=32`, `pq_m=8`, `krefine=32`), one warmup, five measured passes, and no energy pass. Artifacts are `out/bench/ivfpq-stage-clean-r1.json` through `r3.json`; every ovVS and FAISS lane completed.
+
+| Policy | nprobe | QPS, median of run medians | Recall@10 | Native wall/call, median run | Dominant median stage shares |
+|---|---:|---:|---:|---:|---|
+| FORCE_CPU | 2 | 79,820.4 | 0.6375 | 329.3 us | LUT 52.3%; shortlist 22.5%; ADC 8.2%; refine 10.2% |
+| FORCE_CPU | 8 | 32,073.8 | 0.946875 | 927.1 us | LUT 73.6%; shortlist 10.5%; ADC 8.7%; refine 3.9% |
+| FORCE_GPU | 2 | 2,807.2 | 0.6375 | 13,277.9 us | final TopK 62.6%; fused ADC 10.3%; gather 11.4%; distance 6.3% |
+| FORCE_GPU | 8 | 2,283.8 | 0.946875 | 17,908.0 us | fused ADC 45.5%; final TopK 40.0%; gather 6.6%; distance 4.4% |
+
+The native wall is the median of each run's cumulative timed delta divided by five calls; stage percentages are medians of per-run shares. Harness QPS includes the surrounding Python call boundary. One GPU `nprobe=8` run fell to 1,064.1 QPS and 30.06 ms batch p50, so the result supports bottleneck selection but not a speedup or regression claim. Against the earlier clean checkpoint, CPU median QPS changed by -1.05%/+0.59% at `nprobe=2/8`, within run variance. Raw FAISS remains lower recall because it lacks equivalent refinement.
+
+The raw-row cap produces 3/11 blocks per 32-query call at `nprobe=2/8`, inspecting 143.2/536.2 real candidates per query. FORCE_GPU issues 27/99 allocations, 104/120 logical kernel submissions, and 134/230 waits per call; explicit queued traffic is 514.6/2,058.2 KiB H2D and 4.1/4.2 KiB D2H. These counts make the next order evidence-based: factor CPU LUT work first; batch/fuse GPU exact refinement before treating allocation reuse as sufficient.
+
+Residual-PQ admits `||q-c_l-w||^2 = ||q-c_l||^2 - 2q·w + (||w||^2 + 2c_l·w)`, allowing one query term plus a derived persistent list term. The identity is exact over reals, but f32 reassociation and cancellation can change near ties. Promotion therefore requires a conservative score-error band smaller than the shortlist cutoff gap, followed by exact validation; otherwise the call must use the current direct LUT. Fixed oversampling is not a proof. Derived terms remain rebuildable from `IPQ1` v1 data, including after extend.
 
 ## Remaining B3 gate
 
-1. Add complete-call stage wall, launch, allocation, synchronization, and byte telemetry with transactional publication.
+1. Factor residual-PQ tables into persistent list terms plus one query term with a cutoff-gap certificate and direct-LUT fallback.
 2. Replace the raw-candidate block cap with an explicit descriptor/LUT/workspace byte budget so batch size is not coupled to list fanout.
-3. Factor residual-PQ tables into persistent list terms plus one query term, then reuse the stabilized layout through a bounded resource-owned GPU workspace. Batch exact refinement if telemetry confirms its launch tax.
+3. Batch or fuse exact GPU refinement, then reuse the stabilized layout through a bounded resource-owned GPU workspace.
 4. Validate the bounded affine NPU transform on production LUTs through shortlist survival and final recall. Bound/version the request cache before measuring depths 1/2/4; depth one stays default.
 5. Compare raw ovVS and raw FAISS at identical `nlist`, `nprobe`, `pq_m`, `nbits`, and `krefine=k`; refined comparisons need an equivalent FAISS refinement lane.
 6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, and package-energy evidence before claiming a win.
 
-Latest checkpoint verification: 88/88 accelerator-enabled native tests with zero skips, 7/7 CTest lanes, and 57/57 benchmark-harness tests. Three clean benchmark artifacts completed with FORCE_CPU, FORCE_GPU, and FAISS all successful; energy was disabled. CTest re-runs native subsets plus the two consumers, so its count is not additive.
+Latest checkpoint verification: 92/92 accelerator-enabled native tests with zero skips, 7/7 CTest lanes, and 66/66 benchmark-harness tests. Python compilation, a real Windows Python/FAISS/ovVS import, and diff checks also pass. Three clean benchmark artifacts completed with FORCE_CPU, FORCE_GPU, and FAISS all successful; energy was disabled. CTest re-runs native subsets plus the two consumers, so its count is not additive.
