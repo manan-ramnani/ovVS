@@ -7,7 +7,7 @@ Intel documents SHAVE as the DSP next to the MAC array. Custom unsigned ELF is
 
 OpenVINO NPU compile of Gather+ReduceSum (ovVS PQ ADC) lowers to Intel's
 prebuilt ActShave kernels (`gather.3720xx.elf`, `reduce_sum.3720xx.elf` in
-`npu_compiler/sw_runtime_kernels`). Profiling (`PERF_COUNT`):
+`<npu_compiler-checkout>/sw_runtime_kernels`). Profiling (`PERF_COUNT`):
 
 - `lut` → `Shave`
 - `Gather` → `Shave`
@@ -46,8 +46,10 @@ device execution. References: [custom operations](https://docs.openvino.ai/2026/
 
 1. SHAVE C in this directory (`adc.c`, `topk.c`) — host-linked oracles today.
 2. `npu_compiler` descrip + `moviCompile -mcpu=3720xx` → ELF32 with `.text` at
-   `0x1d000000` and `.arg.data` at `0x1e000000` (see `shave_kernel.ld`).
-3. Register as `VPU.SW.Kernel` (see `npu_compiler/src/vpux_compiler/docs/sw_layer_enabling.md`).
+   `0x1d000000` and `.arg.data` at `0x1e000000` (see the
+   [pinned linker script](https://github.com/openvinotoolkit/npu_compiler/blob/6761af885b8ff54ddf0da5bf8ad44e30746b2f62/sw_runtime_kernels/kernels/prebuild/shave_kernel.ld)).
+3. Register as `VPU.SW.Kernel` using the
+   [pinned SW-layer guide](https://github.com/openvinotoolkit/npu_compiler/blob/6761af885b8ff54ddf0da5bf8ad44e30746b2f62/src/vpux_compiler/docs/sw_layer_enabling.md).
 4. Compiler embeds `.text` into a graph ELF64; firmware loads the **graph**, not
    a loose ELF.
 
@@ -60,3 +62,14 @@ via OpenVINO graphs:
 
 `PERF_COUNT` shows ActShave + DPU on those graphs. A new SHAVE C ELF still needs
 MoviTools.
+
+`public_toolchain_gate.ps1` is the reproducible, fail-closed feasibility gate.
+It pins the public compiler/OpenVINO revisions, requires an unchanged
+Compiler-In-Plugin graph to run before custom work, inventories the MoviTools
+and source/descriptor boundary, and never treats `add_extension()` or host C as
+an NPU kernel. The current audited result is `BASELINE_BLOCKED`: the pinned
+public `npu_compiler` tree
+contains prebuilt Intel ELFs but no tracked custom kernel sources/descriptors,
+MoviTools is unavailable, and no isolated pinned OpenVINO/compiler build exists.
+See `PUBLIC_TOOLCHAIN_GATE.md`; this is retained negative evidence, not a custom
+ActShave success.

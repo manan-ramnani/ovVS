@@ -21,6 +21,9 @@ option(OVVS_WITH_SYCL "Build SYCL iGPU backend" OFF)
 option(OVVS_WITH_MKL "Link oneMKL for GPU GEMM and LAPACK gesvd/syev" OFF)
 option(OVVS_BUILD_TESTS "Build unit tests" ON)
 option(OVVS_BUILD_TOOLS "Build probe/bakeoff tools" ON)
+option(OVVS_BUILD_ESCAPE_EXPERIMENTS
+  "Enable eligible retained NPU/iGPU experiments (targets still require their SYCL/OpenVINO/platform dependencies)"
+  OFF)
 
 if(MSVC)
   add_compile_options(/W3 /EHsc /utf-8)
@@ -104,6 +107,67 @@ if(OVVS_BUILD_TOOLS)
   target_link_libraries(ovvs_probe PRIVATE ovvs)
   add_executable(ovvs_bakeoff tools/bakeoff/main.cpp)
   target_link_libraries(ovvs_bakeoff PRIVATE ovvs)
+endif()
+
+if(OVVS_BUILD_ESCAPE_EXPERIMENTS)
+  if(OVVS_WITH_SYCL AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
+    add_executable(ovvs_pq_gpu_fused_bench tools/pq_gpu_fused_bench/main.cpp)
+    target_compile_options(ovvs_pq_gpu_fused_bench PRIVATE -fsycl)
+    target_link_options(ovvs_pq_gpu_fused_bench PRIVATE -fsycl)
+
+    if(OVVS_WITH_OPENVINO)
+      add_executable(ovvs_hetero_ivfpq_bench tools/hetero_ivfpq_bench/main.cpp)
+      target_compile_options(ovvs_hetero_ivfpq_bench PRIVATE -fsycl)
+      target_link_options(ovvs_hetero_ivfpq_bench PRIVATE -fsycl)
+      target_link_libraries(ovvs_hetero_ivfpq_bench PRIVATE ovvs)
+    endif()
+  endif()
+
+  if(WIN32 AND OVVS_WITH_OPENVINO AND OVVS_WITH_SYCL AND
+     CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
+    add_executable(ovvs_pq_lut_factor_bench tools/pq_lut_factor_bench/main.cpp)
+    target_compile_options(ovvs_pq_lut_factor_bench PRIVATE -fsycl)
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+      target_compile_options(ovvs_pq_lut_factor_bench PRIVATE
+        /fp:precise
+        /clang:-fno-fast-math
+        /clang:-fno-associative-math
+        /clang:-ffp-contract=off)
+    else()
+      target_compile_options(ovvs_pq_lut_factor_bench PRIVATE
+        -ffp-model=precise
+        -fno-fast-math
+        -fno-associative-math
+        -ffp-contract=off)
+    endif()
+    target_link_options(ovvs_pq_lut_factor_bench PRIVATE -fsycl)
+    target_link_libraries(ovvs_pq_lut_factor_bench PRIVATE openvino::runtime psapi)
+  endif()
+
+  if(WIN32 AND OVVS_WITH_OPENVINO)
+    find_path(OVVS_LEVEL_ZERO_INCLUDE_DIR level_zero/ze_api.h
+      HINTS "$ENV{LEVEL_ZERO_V1_SDK_PATH}/include"
+      PATHS "C:/Program Files/LevelZeroSDK/1.32.0/include")
+    if(OVVS_LEVEL_ZERO_INCLUDE_DIR)
+      add_executable(ovvs_npu_l0_escape tools/npu_escape/main.cpp)
+      target_include_directories(ovvs_npu_l0_escape PRIVATE
+        ${OVVS_LEVEL_ZERO_INCLUDE_DIR})
+      target_link_libraries(ovvs_npu_l0_escape PRIVATE openvino::runtime psapi)
+      add_custom_command(TARGET ovvs_npu_l0_escape POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE:openvino::runtime>
+          $<TARGET_FILE_DIR:ovvs_npu_l0_escape>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE_DIR:openvino::runtime>/openvino_intel_npu_plugin.dll
+          $<TARGET_FILE_DIR:ovvs_npu_l0_escape>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE_DIR:openvino::runtime>/tbb12.dll
+          $<TARGET_FILE_DIR:ovvs_npu_l0_escape>
+        COMMENT "Copy OpenVINO runtime next to the direct Level Zero experiment")
+    else()
+      message(STATUS "Level Zero SDK headers not found; omitting ovvs_npu_l0_escape")
+    endif()
+  endif()
 endif()
 
 if(OVVS_BUILD_TESTS)
