@@ -4,7 +4,7 @@
 |---|---|---|
 | Host compiler | MSVC 14.44 (VS 2022 Build Tools) or clang-cl | GCC 11+ / clang 16+ |
 | CMake | 3.20+ (VS bundle or distro) | 3.20+ |
-| SYCL / iGPU | Intel oneAPI DPC++ **2025.1.1** after elevated Base Toolkit 2025.1.3.8. On Windows Ninja, use **`icx`** for both C and CXX (`icpx` is GNU-like and CMake feeds it MSVC flags). Start from `VsDevCmd.bat -arch=amd64`, then call `setvars.bat intel64`, then run `cmake -DOVVS_WITH_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx`. Both environments are required for Intel runtime and Windows SDK link libraries. Fallback: `intel/llvm` nightly `clang++ -fsycl` (`%USERPROFILE%\intel\sycl-nightly`). `sycl-ls` / ovVS tests see `Intel(R) Graphics` via Level Zero. | same + intel-compute-runtime |
+| SYCL / iGPU | Intel oneAPI DPC++ **2025.1.1** after elevated Base Toolkit 2025.1.3.8. On Windows Ninja, use **`icx`** for both C and CXX (`icpx` is GNU-like and CMake feeds it MSVC flags). In one `cmd.exe` session, call `VsDevCmd.bat -arch=amd64`, then `setvars.bat intel64`, then run `cmake -DOVVS_WITH_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx`. Both environments are required for Intel runtime and Windows SDK link libraries. Fallback: `intel/llvm` nightly `clang++ -fsycl` (`%USERPROFILE%\intel\sycl-nightly`). `sycl-ls` / ovVS tests see `Intel(R) Graphics` via Level Zero. | same + intel-compute-runtime |
 | NPU | OpenVINO with NPU plugin + Intel NPU driver | OpenVINO + linux-npu-driver |
 | Python | 3.10–3.13 | 3.10–3.13 |
 

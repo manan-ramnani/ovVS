@@ -42,7 +42,7 @@ ovvsDevice choose_device(ResourcesData& r, const char* op, int64_t flops_or_elem
 }
 
 static ovvsStatus finish_forced_fail(ResourcesData& r) {
-  ++r.npu_fallbacks;
+  if (r.policy == OVVS_POLICY_FORCE_NPU) ++r.npu_fallbacks;
   return OVVS_STATUS_DEVICE_UNAVAILABLE;
 }
 
@@ -239,14 +239,28 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances) {
-  if (r.policy != OVVS_POLICY_FORCE_CPU && r.policy != OVVS_POLICY_FORCE_NPU) {
+  /* The graph walk has no NPU implementation. A forced device must either run
+     the complete walk or fail; it must never cross into the scalar host path. */
+  if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+
+  const bool gpu_metric_supported = metric == OVVS_METRIC_L2_EXPANDED ||
+                                    metric == OVVS_METRIC_L2_SQRT_EXPANDED ||
+                                    metric == OVVS_METRIC_INNER_PRODUCT ||
+                                    metric == OVVS_METRIC_COSINE_EXPANDED;
+  const bool gpu_policy = r.policy == OVVS_POLICY_AUTO ||
+                          r.policy == OVVS_POLICY_GPU_IF_FASTER ||
+                          r.policy == OVVS_POLICY_HETERO ||
+                          r.policy == OVVS_POLICY_FORCE_GPU;
+  if (gpu_policy && gpu_metric_supported) {
     if (gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width,
                        bitset, neighbors, distances)) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;
     }
-    if (r.policy == OVVS_POLICY_FORCE_GPU && !gpu_available()) return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
+  if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+
+  r.last_device = OVVS_DEVICE_CPU;
 
   itopk = std::max(itopk, static_cast<int32_t>(k));
   search_width = std::max(1, search_width);

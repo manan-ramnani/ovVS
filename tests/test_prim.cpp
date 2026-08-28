@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <numeric>
 
 OVVS_TEST(gemm_matches_cpu_reference) {
@@ -171,6 +172,41 @@ OVVS_TEST(gemm_npu_matches_cpu_when_present) {
   }
 }
 
+OVVS_TEST(gemm_npu_rejects_unsafe_fp16_range_when_present) {
+  Res res;
+  int32_t npu = 0;
+  ovvsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+
+  const int64_t m = 8, n = 12, k = 16;
+  std::vector<float> A(static_cast<size_t>(m * k), 16.0f);
+  std::vector<float> B(static_cast<size_t>(n * k), 255.0f);
+  std::vector<float> out(static_cast<size_t>(m * n));
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  expect_status(ovvsGemm(res.r, A.data(), B.data(), out.data(), m, n, k, 1),
+                "npu finite-boundary gemm");
+  for (float value : out) {
+    expect(std::isfinite(value), "npu finite-boundary gemm finite");
+    expect(std::fabs(value - 65280.0f) <= 64.0f, "npu finite-boundary gemm value");
+  }
+
+  std::fill(B.begin(), B.end(), 256.0f);
+  expect(ovvsGemm(res.r, A.data(), B.data(), out.data(), m, n, k, 1) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "npu gemm must reject fp16 overflow bound");
+
+  std::fill(B.begin(), B.end(), 0.01f);
+  A[0] = 70000.0f;
+  expect(ovvsGemm(res.r, A.data(), B.data(), out.data(), m, n, k, 1) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "npu gemm must reject an out-of-range operand even when the dot bound is small");
+
+  A[0] = std::numeric_limits<float>::infinity();
+  expect(ovvsGemm(res.r, A.data(), B.data(), out.data(), m, n, k, 1) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "npu gemm must reject non-finite input");
+}
+
 OVVS_TEST(gemm_gpu_matches_cpu_when_present) {
   Res res;
   int32_t gpu = 0;
@@ -267,6 +303,40 @@ OVVS_TEST(topk_npu_matches_cpu_when_present) {
     expect(ic[static_cast<size_t>(i)] == in[static_cast<size_t>(i)], "npu topk idx");
     expect(std::fabs(vc[static_cast<size_t>(i)] - vn[static_cast<size_t>(i)]) < 2e-2f, "npu topk val");
   }
+}
+
+OVVS_TEST(topk_npu_rejects_unsafe_fp16_range_when_present) {
+  Res res;
+  int32_t npu = 0;
+  ovvsResourcesNpuAvailable(res.r, &npu);
+  if (!npu) return;
+
+  const int64_t rows = 4, cols = 16, k = 5;
+  std::vector<float> scores(static_cast<size_t>(rows * cols));
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t c = 0; c < cols; ++c) {
+      scores[static_cast<size_t>(r * cols + c)] = 64768.0f + static_cast<float>(c * 32);
+    }
+  }
+  std::vector<int64_t> indices(static_cast<size_t>(rows * k));
+  std::vector<float> values(static_cast<size_t>(rows * k));
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  expect_status(ovvsTopk(res.r, scores.data(), rows, cols, k, indices.data(), values.data(), 1),
+                "npu finite-boundary topk");
+  for (float value : values) {
+    expect(std::isfinite(value), "npu finite-boundary topk finite");
+    expect(std::fabs(value) < 65504.0f, "npu finite-boundary topk range");
+  }
+
+  scores[0] = 65536.0f;
+  expect(ovvsTopk(res.r, scores.data(), rows, cols, k, indices.data(), values.data(), 1) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "npu topk must reject fp16 overflow input");
+
+  scores[0] = std::numeric_limits<float>::quiet_NaN();
+  expect(ovvsTopk(res.r, scores.data(), rows, cols, k, indices.data(), values.data(), 1) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "npu topk must reject non-finite input");
 }
 
 OVVS_TEST(topk_gpu_matches_cpu_when_present) {

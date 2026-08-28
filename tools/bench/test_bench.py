@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import bench
+from _worker import exception_point_status
 from _common import (
     ALGORITHM_ORDER,
     POLICY_ORDER,
@@ -20,6 +21,7 @@ from _common import (
     parse_selection,
     percentile,
     point_failure_reason,
+    prepare_dataset,
     resolved_profile,
     sha256_file,
     summarize_samples,
@@ -38,6 +40,7 @@ def successful_lane(lane_id: str = "faiss-cpu.brute") -> dict:
                 "status": "success",
                 "validation": {"status": "success"},
                 "recall": {"status": "success", "value": 1.0},
+                "energy": {"status": "success", "microjoules_per_query": 10.0},
                 "measurement": {
                     "pass_latency_ms": {"summary": {"count": 3}},
                     "qps": {"summary": {"median": 123.0}},
@@ -77,6 +80,8 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(parse_selection("all", ALGORITHM_ORDER, "algorithm"), list(ALGORITHM_ORDER))
         with self.assertRaises(ValueError):
             parse_selection("cuda", POLICY_ORDER, "policy")
+        with self.assertRaises(ValueError):
+            parse_selection(" , ", POLICY_ORDER, "policy")
 
     def test_hash_helper_is_content_stable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -101,6 +106,12 @@ class PureHelperTests(unittest.TestCase):
             ]
         )
         self.assertEqual(reason, "[nprobe=8] non-finite distances")
+
+    def test_device_unavailable_status_is_not_mislabeled_failed(self) -> None:
+        exc = RuntimeError("forced device unavailable")
+        exc.status = 7
+        self.assertEqual(exception_point_status(exc), "unavailable")
+        self.assertEqual(exception_point_status(RuntimeError("numeric corruption")), "failed")
 
 
 class CliAndLaneSemanticsTests(unittest.TestCase):
@@ -180,6 +191,38 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_full_profile_requires_package_energy_evidence(self) -> None:
+        lane = successful_lane()
+        lane["points"][0]["energy"] = {"status": "skipped", "reason": "disabled by --no-energy"}
+        issues = completion_issues(
+            "sift1m",
+            {"status": "success"},
+            {"status": "success", "exact": True},
+            [lane],
+        )
+        self.assertTrue(any("package-energy" in issue for issue in issues))
+
+    def test_malformed_custom_dataset_is_explicitly_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            base = directory / "base.npy"
+            queries = directory / "queries.npy"
+            base.write_bytes(b"not a numpy file")
+            queries.write_bytes(b"not a numpy file")
+            result = prepare_dataset(
+                SimpleNamespace(
+                    profile="embedding-100k",
+                    base=str(base),
+                    queries=str(queries),
+                    sift="unused",
+                    seed=7,
+                ),
+                resolved_profile("embedding-100k"),
+                directory,
+            )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("could not read custom NumPy inputs", result["reason"])
 
     def test_synthetic_embedding_is_provisional_and_temp_paths_are_not_published(self) -> None:
         artifact = bench._artifact(

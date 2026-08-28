@@ -28,6 +28,10 @@ from _common import (
 )
 
 
+def exception_point_status(exc: Exception) -> str:
+    return "unavailable" if getattr(exc, "status", None) == 7 else "failed"
+
+
 def compute_ground_truth(spec: dict[str, Any]) -> dict[str, Any]:
     """Write exact IDs; official HDF5 neighbors are used only for the complete base."""
     import numpy as np
@@ -232,8 +236,20 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
             except Exception as exc:
-                points.append({"status": "failed", "parameters": point, "reason": str(exc), "error_type": type(exc).__name__})
-        lane_status = "success" if all(point["status"] == "success" for point in points) else "failed"
+                points.append(
+                    {
+                        "status": exception_point_status(exc),
+                        "parameters": point,
+                        "reason": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+        if all(point["status"] == "success" for point in points):
+            lane_status = "success"
+        elif points and all(point["status"] == "unavailable" for point in points):
+            lane_status = "unavailable"
+        else:
+            lane_status = "failed"
         return {
             **lane,
             "status": lane_status,

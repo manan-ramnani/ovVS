@@ -44,6 +44,8 @@ def _load():
 
 _lib = _load()
 _lib.ovvsGetVersion.restype = c_char_p
+_lib.ovvsStatusString.argtypes = [c_int32]
+_lib.ovvsStatusString.restype = c_char_p
 _lib.ovvsResourcesCreate.argtypes = [POINTER(c_void_p)]
 _lib.ovvsResourcesDestroy.argtypes = [c_void_p]
 _lib.ovvsBruteForceBuild.argtypes = [
@@ -279,6 +281,20 @@ METRIC_HAMMING = 4
 METRIC_LP = 5
 
 
+class OvvsError(RuntimeError):
+    def __init__(self, operation: str, status: int):
+        self.operation = operation
+        self.status = int(status)
+        raw = _lib.ovvsStatusString(c_int32(status))
+        detail = raw.decode(errors="replace") if raw else "unknown"
+        super().__init__(f"{operation} failed: {detail} (status={status})")
+
+
+def _check_status(status: int, operation: str) -> None:
+    if status != 0:
+        raise OvvsError(operation, status)
+
+
 def _as_f32(arr):
     try:
         import numpy as np
@@ -437,8 +453,7 @@ class BruteIndex(_Index):
         rc = _lib.ovvsBruteForceSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), bsp, nb, ds
         )
-        if rc != 0:
-            raise RuntimeError("search failed")
+        _check_status(rc, "brute-force search")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
 
@@ -460,8 +475,7 @@ class CagraIndex(_Index):
             nb,
             ds,
         )
-        if rc != 0:
-            raise RuntimeError("cagra search failed")
+        _check_status(rc, "CAGRA search")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
 
@@ -474,8 +488,7 @@ class IvfFlatIndex(_Index):
         rc = _lib.ovvsIvfFlatSearch(
             self._res._h, self._h, qptr, c_int64(nq), c_int64(k), c_int32(nprobe), bsp, nb, ds
         )
-        if rc != 0:
-            raise RuntimeError("ivf search failed")
+        _check_status(rc, "IVF-Flat search")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
 
@@ -497,8 +510,7 @@ class IvfPqIndex(_Index):
             nb,
             ds,
         )
-        if rc != 0:
-            raise RuntimeError("ivf-pq search failed")
+        _check_status(rc, "IVF-PQ search")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
     def serialize(self, path):
@@ -533,8 +545,7 @@ class IvfRabitqIndex(_Index):
             nb,
             ds,
         )
-        if rc != 0:
-            raise RuntimeError("ivf-rabitq search failed")
+        _check_status(rc, "IVF-RaBitQ search")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
 
     def serialize(self, path):

@@ -659,23 +659,232 @@ OVVS_TEST(cagra_force_gpu_last_device) {
   Res res;
   int32_t gpu = 0;
   ovvsResourcesGpuAvailable(res.r, &gpu);
-  if (!gpu) return;
-  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
   const int64_t n = 24, dim = 8, k = 3;
   auto data = make_data(n, dim, 440);
   auto q = make_data(2, dim, 441);
   ovvsCagraIndex_t ix = nullptr;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
   expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 6, 12, &ix), "b");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
   std::vector<int64_t> nb(static_cast<size_t>(2 * k));
   std::vector<float> ds(static_cast<size_t>(2 * k));
-  expect_status(ovvsCagraSearch(res.r, ix, q.data(), 2, k, 12, 2, nullptr, nb.data(), ds.data()), "s");
+  std::vector<uint8_t> bits((n + 7) / 8, 0);
+  for (int64_t id = 0; id < n; id += 2) bits[static_cast<size_t>(id >> 3)] |= 1u << (id & 7);
+  const ovvsStatus search_status =
+      ovvsCagraSearch(res.r, ix, q.data(), 2, k, 12, 2, bits.data(), nb.data(), ds.data());
+  if (!gpu || !ovvsSyclEnabled()) {
+    expect(search_status == OVVS_STATUS_DEVICE_UNAVAILABLE, "absent GPU walk must be unavailable");
+    ovvsCagraDestroy(ix);
+    return;
+  }
+  expect_status(search_status, "s");
   ovvsDevice last = OVVS_DEVICE_CPU;
   ovvsResourcesLastDevice(res.r, &last);
-  if (ovvsSyclEnabled()) {
-    expect(last == OVVS_DEVICE_GPU, "sycl walk last_device");
-  } else {
-    expect(last == OVVS_DEVICE_GPU, "openvino-gpu walk last_device");
+  expect(last == OVVS_DEVICE_GPU, "GPU walk last_device");
+  for (size_t i = 0; i < nb.size(); ++i) {
+    expect(nb[i] >= 0 && nb[i] < n, "GPU walk ID range");
+    expect((bits[static_cast<size_t>(nb[i] >> 3)] & (1u << (nb[i] & 7))) != 0,
+           "GPU walk bitset filter");
+    expect(std::isfinite(ds[i]), "GPU walk finite distance");
   }
+  ovvsCagraDestroy(ix);
+}
+
+OVVS_TEST(cagra_force_gpu_l2_sqrt_supported) {
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "GPU availability");
+  const int64_t n = 24, dim = 8, nq = 2, k = 3;
+  auto data = make_data(n, dim, 446);
+  auto q = make_data(nq, dim, 447);
+  ovvsCagraIndex_t ix = nullptr;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(
+      ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_SQRT_EXPANDED, 6, 12, &ix),
+      "L2 sqrt build");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  std::vector<int64_t> nb(static_cast<size_t>(nq * k));
+  std::vector<float> ds(static_cast<size_t>(nq * k));
+  const ovvsStatus status =
+      ovvsCagraSearch(res.r, ix, q.data(), nq, k, 12, 2, nullptr, nb.data(), ds.data());
+  if (!gpu || !ovvsSyclEnabled()) {
+    expect(status == OVVS_STATUS_DEVICE_UNAVAILABLE, "absent GPU walk must be unavailable");
+  } else {
+    expect_status(status, "L2 sqrt FORCE_GPU search");
+    ovvsDevice last = OVVS_DEVICE_CPU;
+    expect_status(ovvsResourcesLastDevice(res.r, &last), "L2 sqrt last device");
+    expect(last == OVVS_DEVICE_GPU, "L2 sqrt walk last_device");
+    expect(std::all_of(ds.begin(), ds.end(), [](float d) { return std::isfinite(d) && d >= 0.f; }),
+           "L2 sqrt walk finite non-negative distances");
+  }
+  ovvsCagraDestroy(ix);
+}
+
+OVVS_TEST(cagra_force_gpu_cosine_near_zero_matches_oracle) {
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "GPU availability");
+  if (!gpu || !ovvsSyclEnabled()) return;
+
+  const int64_t n = 4, dim = 2, k = 4;
+  const float data[] = {1.f, 0.f, 0.f, 1.f, 1e-8f, 0.f, -1.f, 0.f};
+  const float query[] = {1e-8f, 0.f};
+  ovvsCagraIndex_t ix = nullptr;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(ovvsCagraBuild(res.r, data, n, dim, OVVS_METRIC_COSINE_EXPANDED, 3, 3, &ix),
+                "cosine build");
+
+  int64_t got[k] = {};
+  float distances[k] = {};
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  expect_status(ovvsCagraSearch(res.r, ix, query, 1, k, 4, 1, nullptr, got, distances),
+                "cosine FORCE_GPU search");
+
+  int64_t truth[k] = {};
+  float scores[k] = {};
+  rank_oracle(data, n, dim, query, k, truth, scores, false);
+  for (int64_t i = 0; i < k; ++i) {
+    expect(got[i] == truth[i], "near-zero cosine neighbor order");
+    expect(std::fabs(distances[i] - (1.f - scores[i])) < 1e-5f,
+           "near-zero cosine distance matches CPU contract");
+  }
+  ovvsCagraDestroy(ix);
+}
+
+OVVS_TEST(cagra_forced_policy_does_not_host_fallback) {
+  Res res;
+  const int64_t n = 24, dim = 8, nq = 2, k = 3;
+  auto data = make_data(n, dim, 444);
+  auto q = make_data(nq, dim, 445);
+  ovvsCagraIndex_t ix = nullptr;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_LP_UNEXPANDED, 6, 12, &ix),
+                "Lp build");
+
+  std::vector<int64_t> nb(static_cast<size_t>(nq * k), -77);
+  std::vector<float> ds(static_cast<size_t>(nq * k), -123.f);
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO);
+  expect_status(ovvsCagraSearch(res.r, ix, q.data(), nq, k, 12, 2, nullptr, nb.data(), ds.data()),
+                "AUTO host fallback");
+  ovvsDevice last = OVVS_DEVICE_GPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "AUTO last");
+  expect(last == OVVS_DEVICE_CPU, "AUTO unsupported GPU metric must attribute CPU fallback");
+  std::vector<int64_t> truth(static_cast<size_t>(nq * k));
+  std::vector<float> truth_dist(static_cast<size_t>(nq * k));
+  brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), truth_dist.data());
+  expect(recall_at_k(nb.data(), truth.data(), nq, k) > 0.99f, "AUTO host fallback recall");
+
+  std::fill(nb.begin(), nb.end(), -77);
+  std::fill(ds.begin(), ds.end(), -123.f);
+  int32_t npu_fallbacks_before = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &npu_fallbacks_before),
+                "fallback count before FORCE_GPU");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  const ovvsStatus gpu_status =
+      ovvsCagraSearch(res.r, ix, q.data(), nq, k, 12, 2, nullptr, nb.data(), ds.data());
+  expect(gpu_status == OVVS_STATUS_DEVICE_UNAVAILABLE, "FORCE_GPU must not host-fallback");
+  expect(std::all_of(nb.begin(), nb.end(), [](int64_t id) { return id == -77; }),
+         "FORCE_GPU rejection must not write IDs");
+  expect(std::all_of(ds.begin(), ds.end(), [](float d) { return d == -123.f; }),
+         "FORCE_GPU rejection must not write distances");
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "FORCE_GPU last");
+  expect(last == OVVS_DEVICE_CPU, "FORCE_GPU rejection must not claim a device");
+  int32_t npu_fallbacks_after_gpu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &npu_fallbacks_after_gpu),
+                "fallback count after FORCE_GPU");
+  expect(npu_fallbacks_after_gpu == npu_fallbacks_before,
+         "FORCE_GPU rejection must not increment NPU fallback telemetry");
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  const ovvsStatus npu_status =
+      ovvsCagraSearch(res.r, ix, q.data(), nq, k, 12, 2, nullptr, nb.data(), ds.data());
+  expect(npu_status == OVVS_STATUS_DEVICE_UNAVAILABLE, "FORCE_NPU must not host-fallback");
+  expect(std::all_of(nb.begin(), nb.end(), [](int64_t id) { return id == -77; }),
+         "FORCE_NPU rejection must not write IDs");
+  expect(std::all_of(ds.begin(), ds.end(), [](float d) { return d == -123.f; }),
+         "FORCE_NPU rejection must not write distances");
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "FORCE_NPU last");
+  expect(last == OVVS_DEVICE_CPU, "FORCE_NPU rejection must not claim a device");
+  int32_t npu_fallbacks_after_npu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &npu_fallbacks_after_npu),
+                "fallback count after FORCE_NPU");
+  expect(npu_fallbacks_after_npu == npu_fallbacks_before + 1,
+         "FORCE_NPU rejection must increment NPU fallback telemetry once");
+  ovvsCagraDestroy(ix);
+}
+
+OVVS_TEST(cagra_q_forced_policy_does_not_host_fallback) {
+  Res res;
+  const int64_t n = 32, dim = 8, nq = 2, k = 3;
+  auto data = make_data(n, dim, 448);
+  auto queries = make_data(nq, dim, 449);
+  ovvsCagraIndex_t ix = nullptr;
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 8, 16, &ix),
+                "CAGRA-Q build");
+  expect_status(ovvsCagraQuantize(res.r, ix, 4, 8), "CAGRA-Q quantize");
+
+  std::vector<int64_t> neighbors(static_cast<size_t>(nq * k), -77);
+  std::vector<float> distances(static_cast<size_t>(nq * k), -123.f);
+  expect_status(ovvsCagraSearch(res.r, ix, queries.data(), nq, k, 16, 2, nullptr,
+                                neighbors.data(), distances.data()),
+                "CAGRA-Q FORCE_CPU search");
+
+  ovvsDevice preserved_device = OVVS_DEVICE_CPU;
+  int32_t gpu_available = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu_available), "CAGRA-Q GPU availability");
+  if (gpu_available) {
+    auto a = make_data(8, 8, 450);
+    auto b = make_data(8, 8, 451);
+    std::vector<float> c(64);
+    ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+    expect_status(ovvsGemm(res.r, a.data(), b.data(), c.data(), 8, 8, 8, 1),
+                  "stamp prior GPU attribution");
+    expect_status(ovvsResourcesLastDevice(res.r, &preserved_device), "prior GPU attribution");
+    expect(preserved_device == OVVS_DEVICE_GPU, "GPU stamp must use GPU");
+  }
+
+  int32_t fallback_count = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallback_count), "CAGRA-Q fallback count");
+  std::fill(neighbors.begin(), neighbors.end(), -77);
+  std::fill(distances.begin(), distances.end(), -123.f);
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  expect(ovvsCagraSearch(res.r, ix, queries.data(), nq, k, 16, 2, nullptr, neighbors.data(),
+                         distances.data()) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA-Q FORCE_GPU must not host-fallback");
+  expect(std::all_of(neighbors.begin(), neighbors.end(), [](int64_t id) { return id == -77; }),
+         "CAGRA-Q FORCE_GPU rejection must not write IDs");
+  expect(std::all_of(distances.begin(), distances.end(), [](float d) { return d == -123.f; }),
+         "CAGRA-Q FORCE_GPU rejection must not write distances");
+  int32_t after_gpu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_gpu), "CAGRA-Q count after FORCE_GPU");
+  expect(after_gpu == fallback_count, "CAGRA-Q FORCE_GPU must not increment NPU fallback count");
+  ovvsDevice last = OVVS_DEVICE_AUTO;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "CAGRA-Q FORCE_GPU last device");
+  expect(last == preserved_device, "CAGRA-Q FORCE_GPU rejection must preserve prior attribution");
+
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  expect(ovvsCagraSearch(res.r, ix, queries.data(), nq, k, 16, 2, nullptr, neighbors.data(),
+                         distances.data()) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA-Q FORCE_NPU must not host-fallback");
+  expect(std::all_of(neighbors.begin(), neighbors.end(), [](int64_t id) { return id == -77; }),
+         "CAGRA-Q FORCE_NPU rejection must not write IDs");
+  expect(std::all_of(distances.begin(), distances.end(), [](float d) { return d == -123.f; }),
+         "CAGRA-Q FORCE_NPU rejection must not write distances");
+  int32_t after_npu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu), "CAGRA-Q count after FORCE_NPU");
+  expect(after_npu == fallback_count + 1,
+         "CAGRA-Q FORCE_NPU must increment NPU fallback count once");
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "CAGRA-Q forced failure last device");
+  expect(last == preserved_device, "CAGRA-Q FORCE_NPU rejection must preserve prior attribution");
+
+  expect_status(ovvsCagraDetachDataset(ix), "detach CAGRA-Q dataset");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO);
+  expect_status(ovvsCagraSearch(res.r, ix, queries.data(), nq, k, 16, 2, nullptr,
+                                neighbors.data(), distances.data()),
+                "detached CAGRA-Q adaptive host search");
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "detached CAGRA-Q last device");
+  expect(last == OVVS_DEVICE_CPU, "executed CAGRA-Q host walk must report CPU");
   ovvsCagraDestroy(ix);
 }
 
@@ -702,6 +911,11 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   for (int64_t i = 0; i < nq * k; ++i) {
     expect(got[static_cast<size_t>(i)] >= 0 && got[static_cast<size_t>(i)] < n, "id range");
+    expect(std::isfinite(gd[static_cast<size_t>(i)]), "finite distance");
+  }
+  for (int64_t qi = 0; qi < nq; ++qi) {
+    std::set<int64_t> unique(got.begin() + qi * k, got.begin() + (qi + 1) * k);
+    expect(static_cast<int64_t>(unique.size()) == k, "unique result IDs");
   }
   const float rec = recall_at_k(got.data(), truth.data(), nq, k);
   expect(rec >= 0.2f, "sycl n>4096 recall vs independent L2 " + std::to_string(rec));

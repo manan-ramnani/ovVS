@@ -24,10 +24,10 @@ Evidence: `tables/arrow-lake/bench-recall-qps.md`, `gemm_large.json`, `docs/hw-s
 | Path (SIFT n=2000 dim=128 nq=32 k=10) | Result |
 |---|---|
 | ovVS brute CPU | 0.89 ms / 36k QPS (beats FAISS brute) |
-| ovVS brute NPU / GPU | 607 ms / 82 ms |
+| ovVS brute NPU / GPU | NPU **invalid** (non-finite distances) / GPU 82 ms |
 | ovVS IVF-Flat / IVF-PQ | slower than FAISS at same nprobe |
-| ovVS CAGRA | ~2.0 ms vs hnswlib 0.40 ms (recall vs brute 0.99) |
-| Package µJ/query brute | CPU 1049; NPU 4638; GPU 17893 |
+| ovVS CAGRA | legacy CPU ~2.0 ms; B2 GPU 4.3 ms vs hnswlib 0.44 ms at the 32-query smoke point (recall vs brute about 0.99) |
+| Package µJ/query brute | CPU 1049; NPU invalid output; GPU 17893 |
 
 v1.0 (plan §16) still requires Lunar Lake accelerated paths, published FAISS/hnswlib benches, and mixer tables for that SKU. v0.2 API completeness is not that gate.
 
@@ -42,7 +42,7 @@ Priority: P0 = objective is blocked without it; P1 = v1.0 quality; P2 = v1.1 / p
 | ID | Item | Plan | Notes |
 |---|---|---|---|
 | B1 | SIFT1M / 1e5×768 recall–QPS harness vs FAISS-CPU and hnswlib; AUTO + FORCE_*; µJ/query | T22.1–T22.2, §8–§9 | **PARTIAL:** strict CLI/JSON harness and bounded smoke validation are complete. SIFT1M is locally fetchable with a pinned hash, not committed. Full SIFT1M and a real 100K×768 corpus report remain open; CAGRA-at-SIFT1M is blocked by B5. |
-| B2 | CAGRA search kernel T13.4: one **work-group** per query, SLM itopk, bounded hashmap (not `Seen[nq×n]`), graph-aware seeds, subgroup distance | T13.4, then T13.5–T13.6 | Current `gpu_cagra_walk` is `parallel_for(nq)` one WI/query, hash seeds `(s*9973+qi*13)%n`, scalar L2, linear heap. FORCE_GPU can be honest and still lose to hnswlib. Gate: SIFT1M recall within 2% of hnswlib at similar M/ef **before** chasing QPS. |
+| B2 | CAGRA search kernel T13.4: one **work-group** per query, SLM itopk, bounded hashmap (not `Seen[nq×n]`), graph-aware seeds, subgroup distance | T13.4, then T13.5–T13.6 | **PARTIAL:** work-group/query, cooperative distance, SLM candidates, and a bounded visited hash are implemented. Hash seeds, leader-serial selection/sort, and per-search dataset/graph copies remain. The 2K smoke keeps recall but is roughly 10× slower than hnswlib at `itopk=32/search_width=1` and farther behind at `64/2`. SIFT1M recall gate remains blocked by B5. |
 | B3 | IVF-PQ search rewrite: persistent list codes, ADC tables batched over `nq×nprobe`, iGPU variable-length scan; padded-list NPU bakeoff | T10.2–T10.4, T9.3 | `prim_pq_adc` on NPU is real. `ovvsIvfPqSearch` rebuilds residual + tables + packed codes **on the host per query per list**. That is why FAISS is ~6× faster on 2k points. |
 | B4 | IVF-RaBitQ packed binary/INT GEMM (or SHAVE popcount), not scalar `rabitq_ip` | T11 | Plan: this is the NPU-native ANN, not a consolation prize. |
 | B5 | NN-Descent iGPU local-join + bloom for n≫4096 | T12 | n≤4096 is exact kNN via `prim_pairwise`. Else a host nested loop. CAGRA IVF-PQ init uses `nlist = min(8, n/4)` — will not build 1e6 graphs. |
@@ -55,7 +55,7 @@ Priority: P0 = objective is blocked without it; P1 = v1.0 quality; P2 = v1.1 / p
 | B7 | NPU index home: dataset / codebook as L0 tensor (`create_l0_host_tensor` or non-regressing Constant). Close wall vs DPU (5.3 vs ~45 ms on 1e5×32×768) | NPU contract, `npu-gemm-dpu-vs-wall.md` | Sticky Parameter + memcpy is current. Baking B as Constant made DPU faster and wall slower. Arrow Lake AUTO GEMM stays CPU until a SKU table flips. |
 | B8 | Lunar Lake mixer tables (`tables/<sku>/`). Do not copy Arrow Lake numbers | T2, §3.4, §16 | v1.0 is defined on Lunar Lake. Meteor Lake / Panther Lake still required when hardware exists. |
 | B9 | CAGRA knobs: `min/max_iterations`, `team_size`, hashmap mode, `filtering_rate` → itopk; NPU candidate-slab dist offload bakeoff | T13.5–T13.8 | Search ABI today: `itopk_size`, `search_width` only. |
-| B10 | CAGRA-Q: codes in the iGPU walk + optional refine | T13.11 | API + host PQ-ADC walk; recall floor in tests is 0.35 on n=32. |
+| B10 | CAGRA-Q: codes in the iGPU walk + optional refine | T13.11 | API + host PQ-ADC walk; recall floor in tests is 0.35 on n=32. FORCE_GPU/FORCE_NPU reject this host-only walk instead of claiming accelerated success. |
 | B11 | CAGRA extend: iGPU local repair; recall vs rebuild at n≥1e5 | T13.9 | Host insert + `robust_prune`. Test is n=40. |
 | B12 | IVF-Flat iGPU fused list scan; FAISS same `nlist/nprobe` recall within 1% on SIFT1M | T9.2–T9.6 | Search is host gather + `prim_pairwise` per query. |
 | B13 | IVF-PQ polar-quant / by-residual FAISS flags; FAISS blob import/export | T10.5 | Custom `IPQ1` / `RQB1` / `IVF1` only. |
@@ -126,11 +126,19 @@ Nothing from the 2026-08-28 assessment is closed as v1.0 “Accelerated.” Alre
 
 ### 2026-08-28 — B1 benchmark harness checkpoint
 
-`tools/bench/bench.py` now runs isolated, timeout-bounded ovVS, FAISS-CPU, and hnswlib lanes; uses one exact oracle; validates IDs, duplicates, and finite distances; records warm/repeated latency, QPS, build time, final primitive attribution, and package energy; and writes versioned JSON plus generated Markdown. Required full profiles fail closed on incomplete evidence unless `--allow-partial` is explicit. Benchmark dependencies and a checksum/schema-validated HTTPS SIFT fetcher are included.
+`tools/bench/bench.py` now runs isolated, timeout-bounded ovVS, FAISS-CPU, and hnswlib lanes; uses one exact oracle; validates IDs, duplicates, and finite distances; records warm/repeated latency, QPS, build time, final primitive attribution, and package energy; and writes versioned JSON plus generated Markdown. Required full profiles fail closed on incomplete recall, timing, policy, or energy evidence unless `--allow-partial` is explicit. Benchmark dependencies and an HTTPS SIFT fetcher with pinned size/hash (plus schema validation when h5py is installed) are included.
 
-Bounded Arrow Lake smoke validation completed for every algorithm on FORCE_CPU and for brute-force across AUTO, FORCE_CPU, FORCE_NPU, FORCE_GPU, and HETERO. The harness exposed a real negative result: FORCE_NPU brute returned non-finite distances and is recorded as failed; it is not filtered or treated as a timing result. These runs validate the harness, not SIFT1M performance.
+Bounded Arrow Lake smoke validation completed for every algorithm on FORCE_CPU and for brute-force across AUTO, FORCE_CPU, FORCE_NPU, FORCE_GPU, and HETERO. The harness exposed a real negative result: FORCE_NPU brute returned non-finite distances. A range guard now fails that lane closed as `DEVICE_UNAVAILABLE`; the legacy timing is invalid evidence. These runs validate the harness, not SIFT1M performance.
 
 B1 remains partial. No full SIFT1M or real 100K×768 report is published, the synthetic embedding profile is explicitly provisional, and CAGRA construction above 4,096 rows remains resource-gated by B5.
+
+### 2026-08-28 — B2 CAGRA work-group checkpoint and NPU range guard
+
+The iGPU CAGRA walk now assigns one SYCL work-group per query, cooperatively reduces dimensions, stores candidates/expansion state in SLM, and uses a traversal-budget-sized global visited hash instead of `Seen[nq×n]`. Device allocations are strict RAII USM, oversized local/hash shapes reject explicitly, and asynchronous failures propagate. FORCE_GPU never crosses into the host walk; FORCE_NPU graph search returns `DEVICE_UNAVAILABLE`; adaptive host fallback records CPU.
+
+Bounded SIFT-prefix evidence (`n=2000`, `nq=32`, `k=10`) is a correctness check only: FORCE_GPU recall@10 was 0.990625 at `itopk=32/search_width=1` and 1.0 at `64/2`, versus hnswlib 0.99375/1.0. Median QPS was about 7.4K/2.9K versus 71.7K/49.2K, and the batch-size-one lane exposed the cost of copying dataset/graph buffers per search. B2 remains partial; graph-aware seeds, parallel candidate selection, persistent index buffers, B5 scale, and the SIFT1M gate are open. Reproducible details are in `tables/arrow-lake/bench-recall-qps.md`.
+
+The B1 failure was traced separately to Arrow Lake NPU FP16-range behavior behind f32 tensors: large SIFT dot products clipped near 65,504 and TopK returned `+inf`. NPU GEMM/TopK now reject unsafe/non-finite ranges and validate outputs, so forced execution fails closed instead of returning corrupt success. Range-scaled execution remains future work.
 
 ### 2026-08-28 — Deep assessment vs cuVS-equivalent objective
 
@@ -142,7 +150,7 @@ Shipped: C ABI 0.2.0, prim mixer, NPU OpenVINO path that obeys the NPU contract,
 
 Not shipped relative to plan §5 “Accelerated” and §16 v1.0:
 
-- CAGRA walk is not T13.4 (see B2). `docs/devices.md` previously claimed SLM itopk + 256-slot hashmap; the kernel uses USM heaps and `Seen[nq×n]`.
+- At assessment time, CAGRA walk was not T13.4: it used USM heaps and `Seen[nq×n]`. The bounded work-group/SLM/hash checkpoint above supersedes that implementation; B2 remains open for quality and performance.
 - IVF-PQ/RaBitQ/IVF-Flat search control planes are host loops (B3, B4, B12).
 - NN-Descent / CAGRA init do not scale (B5).
 - HETERO not wired (B6).

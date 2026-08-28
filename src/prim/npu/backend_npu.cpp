@@ -33,6 +33,38 @@
 namespace ovvs {
 namespace impl {
 
+namespace {
+
+constexpr float kNpuFp16FiniteMax = 65504.0f;
+
+bool finite_below_npu_limit(const float* values, int64_t count) {
+  for (int64_t i = 0; i < count; ++i) {
+    if (!std::isfinite(values[i]) || std::fabs(values[i]) >= kNpuFp16FiniteMax) return false;
+  }
+  return true;
+}
+
+bool npu_gemm_range_safe(const float* a, int64_t na, const float* b, int64_t nb, int64_t k) {
+  float amax = 0.0f;
+  float bmax = 0.0f;
+  for (int64_t i = 0; i < na; ++i) {
+    const float magnitude = std::fabs(a[i]);
+    if (!std::isfinite(a[i]) || magnitude >= kNpuFp16FiniteMax) return false;
+    amax = std::max(amax, magnitude);
+  }
+  for (int64_t i = 0; i < nb; ++i) {
+    const float magnitude = std::fabs(b[i]);
+    if (!std::isfinite(b[i]) || magnitude >= kNpuFp16FiniteMax) return false;
+    bmax = std::max(bmax, magnitude);
+  }
+
+  const double dot_bound = static_cast<double>(amax) * static_cast<double>(bmax) *
+                           static_cast<double>(k);
+  return std::isfinite(dot_bound) && dot_bound < static_cast<double>(kNpuFp16FiniteMax);
+}
+
+}  // namespace
+
 #if defined(OVVS_WITH_OPENVINO)
 static ov::Core& ov_core() {
   static ov::Core& core = *new ov::Core();
@@ -170,6 +202,10 @@ bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float
                int64_t m, int64_t n, int64_t k, bool trans_b) {
 #if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device(device)) return false;
+  const bool npu = std::strcmp(device, "NPU") == 0;
+  const int64_t na_elems = m * k;
+  const int64_t nb_elems = trans_b ? n * k : k * n;
+  if (npu && !npu_gemm_range_safe(a, na_elems, b, nb_elems, k)) return false;
   try {
     using namespace ov;
     std::ostringstream key;
@@ -192,6 +228,7 @@ bool ov_matmul(ResourcesData& r, const char* device, const float* a, const float
     fill_in(slot, 1, b, nb);
     slot.req.infer();
     read_out(slot, 0, c, nc);
+    if (npu && !finite_below_npu_limit(c, m * n)) return false;
     return true;
   } catch (...) {
     ++r.npu_compile_fails;
@@ -267,6 +304,10 @@ bool ov_matmul_compute(ResourcesData& r, const char* device, ovvsDType compute, 
   }
 #if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device(device)) return false;
+  const bool npu = std::strcmp(device, "NPU") == 0;
+  const int64_t na_elems = m * k;
+  const int64_t nb_elems = trans_b ? n * k : k * n;
+  if (npu && !npu_gemm_range_safe(a, na_elems, b, nb_elems, k)) return false;
   try {
     using namespace ov;
     const Shape sa{static_cast<size_t>(m), static_cast<size_t>(k)};
@@ -317,6 +358,7 @@ bool ov_matmul_compute(ResourcesData& r, const char* device, ovvsDType compute, 
     }
     slot.req.infer();
     read_out(slot, 0, c, nc);
+    if (npu && !finite_below_npu_limit(c, m * n)) return false;
     r.last_compute_dtype = compute;
     return true;
   } catch (...) {
@@ -405,6 +447,8 @@ bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t 
 #if defined(OVVS_WITH_OPENVINO)
   if (!ov_has_device(device)) return false;
   k = std::min(k, cols);
+  const bool npu = std::strcmp(device, "NPU") == 0;
+  if (npu && !finite_below_npu_limit(scores, rows * cols)) return false;
   try {
     using namespace ov;
     std::ostringstream key;
@@ -432,6 +476,12 @@ bool ov_topk(ResourcesData& r, const char* device, const float* scores, int64_t 
       std::memcpy(indices, tI.data<int64_t>(), static_cast<size_t>(rows * k) * sizeof(int64_t));
     } else {
       return false;
+    }
+    if (npu) {
+      if (!finite_below_npu_limit(values, rows * k)) return false;
+      for (int64_t i = 0; i < rows * k; ++i) {
+        if (indices[i] < 0 || indices[i] >= cols) return false;
+      }
     }
     return true;
   } catch (...) {

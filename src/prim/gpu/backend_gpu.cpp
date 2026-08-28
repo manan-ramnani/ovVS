@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 
 #if defined(OVVS_WITH_SYCL)
@@ -45,6 +46,56 @@ static float* usm_f(size_t n) { return usm_scratch<float>(n); }
 static int64_t* usm_i64(size_t n) { return usm_scratch<int64_t>(n); }
 static sycl::half* usm_h(size_t n) { return usm_scratch<sycl::half>(n); }
 static std::int8_t* usm_i8(size_t n) { return usm_scratch<std::int8_t>(n); }
+
+template <typename T>
+class ScopedDeviceUsm {
+ public:
+  ScopedDeviceUsm(sycl::queue& q, size_t count) : q_(&q) {
+    if (count != 0) {
+      ptr_ = sycl::malloc_device<T>(count, q);
+      if (!ptr_) throw std::bad_alloc();
+    }
+  }
+
+  ScopedDeviceUsm(const ScopedDeviceUsm&) = delete;
+  ScopedDeviceUsm& operator=(const ScopedDeviceUsm&) = delete;
+
+  ~ScopedDeviceUsm() noexcept {
+    if (!ptr_) return;
+    try {
+      sycl::free(ptr_, *q_);
+    } catch (...) {
+    }
+  }
+
+  T* get() const { return ptr_; }
+
+ private:
+  sycl::queue* q_ = nullptr;
+  T* ptr_ = nullptr;
+};
+
+static bool gpu_pointer_accessible(sycl::queue& q, const void* ptr) {
+  if (!ptr) return false;
+  try {
+    return sycl::get_pointer_type(const_cast<void*>(ptr), q.get_context()) != sycl::usm::alloc::unknown;
+  } catch (...) {
+    return false;
+  }
+}
+
+static bool checked_product(size_t a, size_t b, size_t& product) {
+  if (a != 0 && b > std::numeric_limits<size_t>::max() / a) return false;
+  product = a * b;
+  return true;
+}
+
+static size_t next_power_of_two(size_t value) {
+  if (value <= 1) return 1;
+  --value;
+  for (size_t shift = 1; shift < sizeof(size_t) * 8; shift <<= 1) value |= value >> shift;
+  return value + 1;
+}
 
 static void pack_f16(sycl::queue& q, const float* src, sycl::half* dst, size_t n) {
   if (ovvs_usm_is_shared(src)) {
@@ -521,16 +572,19 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances) {
 #if defined(OVVS_WITH_SYCL)
-  /* Fused iGPU walk: one work-item per query, global itopk heap + per-vertex seen[n], in-kernel L2.
-     Heaps and seen are sized to the real itopk and n (not 64 / 4096). Host prim walk if they cannot fit. */
   if (!gpu_available()) return false;
+  if (!dataset || !graph || !queries || !neighbors || !distances) return false;
   if (n <= 0 || nq <= 0 || k <= 0 || dim <= 0 || degree <= 0) return false;
+  if (n > std::numeric_limits<int32_t>::max() || k > std::numeric_limits<int32_t>::max()) return false;
+  if (metric != OVVS_METRIC_L2_EXPANDED && metric != OVVS_METRIC_L2_SQRT_EXPANDED &&
+      metric != OVVS_METRIC_INNER_PRODUCT && metric != OVVS_METRIC_COSINE_EXPANDED) {
+    return false;
+  }
   itopk = std::max(itopk, static_cast<int32_t>(k));
   search_width = std::max(1, search_width);
-  constexpr int64_t kMaxItopk = 4096;
-  constexpr int64_t kMaxSeenBytes = 64 * 1024 * 1024;
-  if (itopk > kMaxItopk) return false;
-  if (nq > 0 && n > kMaxSeenBytes / nq) return false;
+  if (itopk > std::numeric_limits<int>::max() / 6) return false;
+  constexpr size_t kMaxVisitedBytesPerQuery = 8u * 1024u * 1024u;
+  constexpr size_t kVisitedAllocationTarget = 64u * 1024u * 1024u;
   try {
     auto& q = gpu_queue();
     const size_t N = static_cast<size_t>(n);
@@ -543,156 +597,277 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t SW = static_cast<size_t>(search_width);
     const int met = static_cast<int>(metric);
     const int max_iters = std::max(24, itopk * 6);
-    float* DS = ovvs_usm_is_shared(dataset) ? const_cast<float*>(dataset)
-                                           : static_cast<float*>(ovvs_usm_malloc(N * D * sizeof(float)));
-    int32_t* G = ovvs_usm_is_shared(graph) ? const_cast<int32_t*>(graph)
-                                          : static_cast<int32_t*>(ovvs_usm_malloc(N * DEG * sizeof(int32_t)));
-    float* Q = ovvs_usm_is_shared(queries) ? const_cast<float*>(queries)
-                                          : static_cast<float*>(ovvs_usm_malloc(NQ * D * sizeof(float)));
-    int64_t* OUTI = ovvs_usm_is_shared(neighbors) ? neighbors
-                                                 : static_cast<int64_t*>(ovvs_usm_malloc(NQ * KK * sizeof(int64_t)));
-    float* OUTD = ovvs_usm_is_shared(distances) ? distances
-                                               : static_cast<float*>(ovvs_usm_malloc(NQ * KK * sizeof(float)));
-    if (!DS || !G || !Q || !OUTI || !OUTD) throw std::bad_alloc();
-    if (!ovvs_usm_is_shared(dataset)) std::memcpy(DS, dataset, N * D * sizeof(float));
-    if (!ovvs_usm_is_shared(graph)) std::memcpy(G, graph, N * DEG * sizeof(int32_t));
-    if (!ovvs_usm_is_shared(queries)) std::memcpy(Q, queries, NQ * D * sizeof(float));
-    const uint8_t* bits = bitset;
-    std::vector<uint8_t> all_one;
-    if (!bits) {
-      all_one.assign((N + 7) / 8, 0xff);
-      bits = all_one.data();
+    if (BEAM < IT || SW > std::numeric_limits<int32_t>::max()) return false;
+
+    size_t ds_count = 0, graph_count = 0, query_count = 0, output_count = 0;
+    if (!checked_product(N, D, ds_count) || !checked_product(N, DEG, graph_count) ||
+        !checked_product(NQ, D, query_count) || !checked_product(NQ, KK, output_count)) {
+      return false;
     }
-    uint8_t* BS = ovvs_usm_is_shared(bits) ? const_cast<uint8_t*>(bits)
-                                          : static_cast<uint8_t*>(ovvs_usm_malloc(((N + 7) / 8)));
-    if (!BS) throw std::bad_alloc();
-    if (!ovvs_usm_is_shared(bits)) std::memcpy(BS, bits, (N + 7) / 8);
-    uint8_t* Seen = static_cast<uint8_t*>(ovvs_usm_malloc(NQ * N));
-    int64_t* HID = static_cast<int64_t*>(ovvs_usm_malloc(NQ * BEAM * sizeof(int64_t)));
-    float* HD = static_cast<float*>(ovvs_usm_malloc(NQ * BEAM * sizeof(float)));
-    if (!Seen || !HID || !HD) throw std::bad_alloc();
-    q.parallel_for(sycl::range<1>(NQ), [=](sycl::id<1> qiid) {
-        const size_t qi = qiid[0];
-        const size_t sbase = qi * N;
-        const size_t hbase = qi * BEAM;
-        for (size_t i = 0; i < N; ++i) Seen[sbase + i] = 0;
-        auto dist_one = [&](size_t id) {
-          float s = 0.f;
-          float ip = 0.f, nx = 0.f, ny = 0.f;
-          for (size_t d = 0; d < D; ++d) {
-            const float a = Q[qi * D + d];
-            const float b = DS[id * D + d];
-            const float t = a - b;
-            s += t * t;
-            ip += a * b;
-            nx += a * a;
-            ny += b * b;
-          }
-          if (met == 2) return -ip;
-          if (met == 3) {
-            const float den = sycl::sqrt(nx) * sycl::sqrt(ny);
-            return 1.f - ip / (den > 1e-12f ? den : 1e-12f);
-          }
-          return s;
-        };
-        auto allowed_id = [&](size_t id) { return (BS[id >> 3] >> (id & 7)) & 1; };
-        int nkeep = 0;
-        auto consider = [&](int64_t id, float dv) {
-          if (id < 0 || static_cast<size_t>(id) >= N) return;
-          if (Seen[sbase + static_cast<size_t>(id)] != 0) return;
-          Seen[sbase + static_cast<size_t>(id)] = 1;
-          if (nkeep < static_cast<int>(BEAM)) {
-            HID[hbase + static_cast<size_t>(nkeep)] = id;
-            HD[hbase + static_cast<size_t>(nkeep)] = dv;
-            ++nkeep;
-            return;
-          }
-          int wi = 0;
-          float wv = HD[hbase];
-          for (int i = 1; i < nkeep; ++i) {
-            if (HD[hbase + static_cast<size_t>(i)] > wv) {
-              wv = HD[hbase + static_cast<size_t>(i)];
-              wi = i;
-            }
-          }
-          if (dv < wv) {
-            HID[hbase + static_cast<size_t>(wi)] = id;
-            HD[hbase + static_cast<size_t>(wi)] = dv;
-          }
-        };
-        size_t nseeds = static_cast<size_t>(itopk) * 16u;
-        {
-          const size_t from_sw = SW * 32u;
-          if (from_sw > nseeds) nseeds = from_sw;
-        }
-        if (nseeds < 512u) nseeds = 512u;
-        if (nseeds > N) nseeds = N;
-        for (size_t s = 0; s < nseeds; ++s) {
-          const int64_t id = static_cast<int64_t>((s * 9973 + qi * 13) % N);
-          if (!allowed_id(static_cast<size_t>(id))) continue;
-          consider(id, dist_one(static_cast<size_t>(id)));
-        }
-        for (int iter = 0; iter < max_iters; ++iter) {
-          int nexp = 0;
-          for (size_t s = 0; s < SW; ++s) {
-            int pick = -1;
-            float best = 1e30f;
-            for (int i = 0; i < nkeep; ++i) {
-              const int64_t id = HID[hbase + static_cast<size_t>(i)];
-              if (id < 0 || static_cast<size_t>(id) >= N) continue;
-              if (Seen[sbase + static_cast<size_t>(id)] != 2 && HD[hbase + static_cast<size_t>(i)] < best) {
-                best = HD[hbase + static_cast<size_t>(i)];
-                pick = i;
-              }
-            }
-            if (pick < 0) break;
-            const int64_t pid = HID[hbase + static_cast<size_t>(pick)];
-            Seen[sbase + static_cast<size_t>(pid)] = 2;
-            ++nexp;
-            for (size_t e = 0; e < DEG; ++e) {
-              const int32_t nb = G[static_cast<size_t>(pid) * DEG + e];
-              if (nb < 0 || static_cast<size_t>(nb) >= N) continue;
-              if (!allowed_id(static_cast<size_t>(nb))) continue;
-              consider(nb, dist_one(static_cast<size_t>(nb)));
-            }
-          }
-          if (nexp == 0) break;
-        }
-        for (int a = 0; a < nkeep; ++a) {
-          int best = a;
-          for (int b = a + 1; b < nkeep; ++b)
-            if (HD[hbase + static_cast<size_t>(b)] < HD[hbase + static_cast<size_t>(best)]) best = b;
-          const float td = HD[hbase + static_cast<size_t>(a)];
-          const int64_t ti = HID[hbase + static_cast<size_t>(a)];
-          HD[hbase + static_cast<size_t>(a)] = HD[hbase + static_cast<size_t>(best)];
-          HID[hbase + static_cast<size_t>(a)] = HID[hbase + static_cast<size_t>(best)];
-          HD[hbase + static_cast<size_t>(best)] = td;
-          HID[hbase + static_cast<size_t>(best)] = ti;
-        }
-        for (size_t t = 0; t < KK; ++t) {
-          if (t < static_cast<size_t>(nkeep)) {
-            OUTI[qi * KK + t] = HID[hbase + t];
-            float d = HD[hbase + t];
-            if (met == 2) d = -d;
-            OUTD[qi * KK + t] = d;
-          } else {
-            OUTI[qi * KK + t] = -1;
-            OUTD[qi * KK + t] = 3.4e38f;
-          }
-        }
-      });
-    q.wait();
-    if (!ovvs_usm_is_shared(neighbors)) std::memcpy(neighbors, OUTI, NQ * KK * sizeof(int64_t));
-    if (!ovvs_usm_is_shared(distances)) std::memcpy(distances, OUTD, NQ * KK * sizeof(float));
-    if (!ovvs_usm_is_shared(dataset)) ovvs_usm_free(DS);
-    if (!ovvs_usm_is_shared(graph)) ovvs_usm_free(G);
-    if (!ovvs_usm_is_shared(queries)) ovvs_usm_free(Q);
-    if (!ovvs_usm_is_shared(neighbors)) ovvs_usm_free(OUTI);
-    if (!ovvs_usm_is_shared(distances)) ovvs_usm_free(OUTD);
-    if (!ovvs_usm_is_shared(bits)) ovvs_usm_free(BS);
-    ovvs_usm_free(Seen);
-    ovvs_usm_free(HID);
-    ovvs_usm_free(HD);
+    if (ds_count > std::numeric_limits<size_t>::max() / sizeof(float) ||
+        graph_count > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
+        query_count > std::numeric_limits<size_t>::max() / sizeof(float) ||
+        output_count > std::numeric_limits<size_t>::max() / sizeof(int64_t)) {
+      return false;
+    }
+
+    const auto device = q.get_device();
+    const size_t max_wg = device.get_info<sycl::info::device::max_work_group_size>();
+    size_t work_group_size = 1;
+    while (work_group_size <= max_wg / 2 && work_group_size < 128) work_group_size <<= 1;
+
+    size_t local_bytes = 0;
+    if (!checked_product(BEAM, sizeof(int32_t) + sizeof(float) + sizeof(uint8_t), local_bytes)) return false;
+    size_t pick_bytes = 0;
+    if (!checked_product(SW, sizeof(int32_t), pick_bytes) ||
+        local_bytes > std::numeric_limits<size_t>::max() - pick_bytes - 64u) {
+      return false;
+    }
+    local_bytes += pick_bytes + 64u;
+    const size_t local_mem = device.get_info<sycl::info::device::local_mem_size>();
+    if (local_bytes > local_mem) return false;
+
+    if (IT > std::numeric_limits<size_t>::max() / 16u || SW > std::numeric_limits<size_t>::max() / 32u) {
+      return false;
+    }
+    size_t nseeds = std::max(IT * 16u, SW * 32u);
+    nseeds = std::max<size_t>(nseeds, 512u);
+    nseeds = std::min(nseeds, N);
+
+    if (SW > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(max_iters)) return false;
+    const uint64_t expansion_budget = static_cast<uint64_t>(max_iters) * static_cast<uint64_t>(SW);
+    if (DEG != 0 && expansion_budget > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(DEG)) {
+      return false;
+    }
+    const uint64_t edge_budget = expansion_budget * static_cast<uint64_t>(DEG);
+    const uint64_t visit_budget = std::min<uint64_t>(N, static_cast<uint64_t>(nseeds) + edge_budget);
+    if (visit_budget > std::numeric_limits<size_t>::max() / 2u) return false;
+    const size_t visited_capacity =
+        next_power_of_two(std::max<size_t>(2u, static_cast<size_t>(visit_budget) * 2u));
+    if (visited_capacity == 0 || visited_capacity > kMaxVisitedBytesPerQuery / sizeof(int32_t)) return false;
+
+    const bool ds_direct = gpu_pointer_accessible(q, dataset);
+    const bool graph_direct = gpu_pointer_accessible(q, graph);
+    const bool query_direct = gpu_pointer_accessible(q, queries);
+    const bool out_i_direct = gpu_pointer_accessible(q, neighbors);
+    const bool out_d_direct = gpu_pointer_accessible(q, distances);
+    const bool bitset_direct = bitset && gpu_pointer_accessible(q, bitset);
+    const size_t bitset_bytes = (N + 7u) / 8u;
+
+    ScopedDeviceUsm<float> ds_copy(q, ds_direct ? 0u : ds_count);
+    ScopedDeviceUsm<int32_t> graph_copy(q, graph_direct ? 0u : graph_count);
+    ScopedDeviceUsm<float> query_copy(q, query_direct ? 0u : query_count);
+    ScopedDeviceUsm<int64_t> out_i_copy(q, out_i_direct ? 0u : output_count);
+    ScopedDeviceUsm<float> out_d_copy(q, out_d_direct ? 0u : output_count);
+    ScopedDeviceUsm<uint8_t> bitset_copy(q, !bitset || bitset_direct ? 0u : bitset_bytes);
+
+    const float* DS = ds_direct ? dataset : ds_copy.get();
+    const int32_t* G = graph_direct ? graph : graph_copy.get();
+    const float* Q = query_direct ? queries : query_copy.get();
+    int64_t* OUTI = out_i_direct ? neighbors : out_i_copy.get();
+    float* OUTD = out_d_direct ? distances : out_d_copy.get();
+    const uint8_t* BS = !bitset ? nullptr : (bitset_direct ? bitset : bitset_copy.get());
+
+    if (!ds_direct) q.memcpy(ds_copy.get(), dataset, ds_count * sizeof(float));
+    if (!graph_direct) q.memcpy(graph_copy.get(), graph, graph_count * sizeof(int32_t));
+    if (!query_direct) q.memcpy(query_copy.get(), queries, query_count * sizeof(float));
+    if (bitset && !bitset_direct) q.memcpy(bitset_copy.get(), bitset, bitset_bytes);
+    q.wait_and_throw();
+
+    const size_t visited_bytes_per_query = visited_capacity * sizeof(int32_t);
+    size_t queries_per_launch = std::max<size_t>(1u, kVisitedAllocationTarget / visited_bytes_per_query);
+    queries_per_launch = std::min(queries_per_launch, NQ);
+    size_t visited_count = 0;
+    if (!checked_product(queries_per_launch, visited_capacity, visited_count)) return false;
+    const size_t max_alloc = device.get_info<sycl::info::device::max_mem_alloc_size>();
+    if (visited_count > max_alloc / sizeof(int32_t)) return false;
+    ScopedDeviceUsm<int32_t> visited(q, visited_count);
+    int32_t* VISITED = visited.get();
+
+    for (size_t query_offset = 0; query_offset < NQ; query_offset += queries_per_launch) {
+      const size_t launch_queries = std::min(queries_per_launch, NQ - query_offset);
+      q.submit([&](sycl::handler& h) {
+         sycl::local_accessor<int32_t, 1> candidate_ids(sycl::range<1>(BEAM), h);
+         sycl::local_accessor<float, 1> candidate_distances(sycl::range<1>(BEAM), h);
+         sycl::local_accessor<uint8_t, 1> candidate_expanded(sycl::range<1>(BEAM), h);
+         sycl::local_accessor<int32_t, 1> picks(sycl::range<1>(SW), h);
+         sycl::local_accessor<int32_t, 1> state(sycl::range<1>(4), h);
+         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(launch_queries * work_group_size),
+                                         sycl::range<1>(work_group_size)),
+                        [=](sycl::nd_item<1> item) {
+           const size_t lid = item.get_local_linear_id();
+           const size_t qi = query_offset + item.get_group_linear_id();
+           const size_t visited_base = item.get_group_linear_id() * visited_capacity;
+           auto group = item.get_group();
+
+           for (size_t i = lid; i < visited_capacity; i += work_group_size) {
+             VISITED[visited_base + i] = -1;
+           }
+           if (lid == 0) state[0] = 0;
+           item.barrier(sycl::access::fence_space::global_and_local);
+
+           auto allowed_id = [&](int32_t id) {
+             return BS == nullptr || ((BS[static_cast<size_t>(id) >> 3] >> (id & 7)) & 1u) != 0;
+           };
+           auto visit_once = [&](int32_t id) {
+             const size_t mask = visited_capacity - 1u;
+             size_t slot = (static_cast<uint32_t>(id) * 2654435761u) & mask;
+             for (size_t probe = 0; probe < visited_capacity; ++probe) {
+               int32_t& entry = VISITED[visited_base + slot];
+               if (entry == id) return false;
+               if (entry == -1) {
+                 entry = id;
+                 return true;
+               }
+               slot = (slot + 1u) & mask;
+             }
+             return false;
+           };
+           auto cooperative_distance = [&](int32_t id) {
+             float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
+             const bool needs_ip = met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT) ||
+                                   met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED);
+             for (size_t d = lid; d < D; d += work_group_size) {
+               const float a = Q[qi * D + d];
+               const float b = DS[static_cast<size_t>(id) * D + d];
+               const float delta = a - b;
+               if (!needs_ip) l2 += delta * delta;
+               if (needs_ip) ip += a * b;
+               if (met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED)) {
+                 nx += a * a;
+                 ny += b * b;
+               }
+             }
+             if (!needs_ip) {
+               l2 = sycl::reduce_over_group(group, l2, sycl::plus<float>());
+               if (met == static_cast<int>(OVVS_METRIC_L2_SQRT_EXPANDED)) return sycl::sqrt(l2);
+               return l2;
+             }
+             ip = sycl::reduce_over_group(group, ip, sycl::plus<float>());
+             if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) return -ip;
+             if (met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED)) {
+               nx = sycl::reduce_over_group(group, nx, sycl::plus<float>());
+               ny = sycl::reduce_over_group(group, ny, sycl::plus<float>());
+               const float safe_nx = nx > 1e-12f ? nx : 1e-12f;
+               const float safe_ny = ny > 1e-12f ? ny : 1e-12f;
+               return 1.f - ip / (sycl::sqrt(safe_nx) * sycl::sqrt(safe_ny));
+             }
+             return 0.f;
+           };
+           auto consider = [&](int32_t id, float distance, size_t capacity) {
+             int32_t count = state[0];
+             if (count < static_cast<int32_t>(capacity)) {
+               candidate_ids[static_cast<size_t>(count)] = id;
+               candidate_distances[static_cast<size_t>(count)] = distance;
+               candidate_expanded[static_cast<size_t>(count)] = 0;
+               state[0] = count + 1;
+               return;
+             }
+             int32_t worst = 0;
+             for (int32_t i = 1; i < count; ++i) {
+               if (candidate_distances[static_cast<size_t>(i)] >
+                   candidate_distances[static_cast<size_t>(worst)]) {
+                 worst = i;
+               }
+             }
+             if (distance < candidate_distances[static_cast<size_t>(worst)]) {
+               candidate_ids[static_cast<size_t>(worst)] = id;
+               candidate_distances[static_cast<size_t>(worst)] = distance;
+               candidate_expanded[static_cast<size_t>(worst)] = 0;
+             }
+           };
+
+           for (size_t seed = 0; seed < nseeds; ++seed) {
+             if (lid == 0) {
+               const uint64_t mixed = static_cast<uint64_t>(seed) * 9973u + static_cast<uint64_t>(qi) * 13u;
+               const int32_t id = static_cast<int32_t>(mixed % N);
+               state[1] = allowed_id(id) && visit_once(id) ? id : -1;
+             }
+             item.barrier(sycl::access::fence_space::local_space);
+             const int32_t id = state[1];
+             const float score = id >= 0 ? cooperative_distance(id) : 0.f;
+             if (lid == 0 && id >= 0) consider(id, score, IT);
+             item.barrier(sycl::access::fence_space::local_space);
+           }
+
+           for (int iter = 0; iter < max_iters; ++iter) {
+             if (lid == 0) {
+               int32_t npicks = 0;
+               for (size_t s = 0; s < SW; ++s) {
+                 int32_t best = -1;
+                 float best_distance = std::numeric_limits<float>::max();
+                 for (int32_t i = 0; i < state[0]; ++i) {
+                   if (!candidate_expanded[static_cast<size_t>(i)] &&
+                       candidate_distances[static_cast<size_t>(i)] < best_distance) {
+                     best = i;
+                     best_distance = candidate_distances[static_cast<size_t>(i)];
+                   }
+                 }
+                 if (best < 0) break;
+                 candidate_expanded[static_cast<size_t>(best)] = 1;
+                 picks[static_cast<size_t>(npicks++)] = candidate_ids[static_cast<size_t>(best)];
+               }
+               state[2] = npicks;
+             }
+             item.barrier(sycl::access::fence_space::local_space);
+             const int32_t npicks = state[2];
+             if (npicks == 0) break;
+
+             for (int32_t pi = 0; pi < npicks; ++pi) {
+               const int32_t picked = picks[static_cast<size_t>(pi)];
+               for (size_t edge = 0; edge < DEG; ++edge) {
+                 if (lid == 0) {
+                   const int32_t neighbor = G[static_cast<size_t>(picked) * DEG + edge];
+                   state[1] = neighbor >= 0 && static_cast<size_t>(neighbor) < N && allowed_id(neighbor) &&
+                                      visit_once(neighbor)
+                                  ? neighbor
+                                  : -1;
+                 }
+                 item.barrier(sycl::access::fence_space::local_space);
+                 const int32_t neighbor = state[1];
+                 const float score = neighbor >= 0 ? cooperative_distance(neighbor) : 0.f;
+                 if (lid == 0 && neighbor >= 0) consider(neighbor, score, BEAM);
+                 item.barrier(sycl::access::fence_space::local_space);
+               }
+             }
+           }
+
+           if (lid == 0) {
+             const int32_t count = state[0];
+             for (int32_t a = 0; a < count; ++a) {
+               int32_t best = a;
+               for (int32_t b = a + 1; b < count; ++b) {
+                 if (candidate_distances[static_cast<size_t>(b)] <
+                     candidate_distances[static_cast<size_t>(best)]) {
+                   best = b;
+                 }
+               }
+               const float saved_distance = candidate_distances[static_cast<size_t>(a)];
+               const int32_t saved_id = candidate_ids[static_cast<size_t>(a)];
+               candidate_distances[static_cast<size_t>(a)] = candidate_distances[static_cast<size_t>(best)];
+               candidate_ids[static_cast<size_t>(a)] = candidate_ids[static_cast<size_t>(best)];
+               candidate_distances[static_cast<size_t>(best)] = saved_distance;
+               candidate_ids[static_cast<size_t>(best)] = saved_id;
+             }
+             for (size_t t = 0; t < KK; ++t) {
+               if (t < static_cast<size_t>(count)) {
+                 OUTI[qi * KK + t] = candidate_ids[t];
+                 float distance = candidate_distances[t];
+                 if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) distance = -distance;
+                 OUTD[qi * KK + t] = distance;
+               } else {
+                 OUTI[qi * KK + t] = -1;
+                 OUTD[qi * KK + t] = std::numeric_limits<float>::max();
+               }
+             }
+           }
+         });
+       }).wait_and_throw();
+    }
+
+    if (!out_i_direct) q.memcpy(neighbors, out_i_copy.get(), output_count * sizeof(int64_t));
+    if (!out_d_direct) q.memcpy(distances, out_d_copy.get(), output_count * sizeof(float));
+    q.wait_and_throw();
     (void)r;
     return true;
   } catch (...) {

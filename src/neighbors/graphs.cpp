@@ -773,9 +773,15 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
   if (!res || !index || !queries || !neighbors || !distances) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
   if (ix->pq_m > 0 && !ix->codes.empty()) {
+    auto* resources = rd(res);
+    if (resources->policy == OVVS_POLICY_FORCE_GPU || resources->policy == OVVS_POLICY_FORCE_NPU) {
+      if (resources->policy == OVVS_POLICY_FORCE_NPU) ++resources->npu_fallbacks;
+      return OVVS_STATUS_DEVICE_UNAVAILABLE;
+    }
     graph_search_pq(ix->ds.x.empty() ? nullptr : ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->graph.data(),
                     ix->degree, ix->codes.data(), ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
                     queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
+    resources->last_device = OVVS_DEVICE_CPU;
     if (ix->has_dataset && !ix->ds.x.empty()) {
       const int64_t dim = ix->ds.dim;
       for (int64_t q = 0; q < nq; ++q) {

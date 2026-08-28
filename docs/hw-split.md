@@ -52,7 +52,7 @@ IVF-PQ / RaBitQ
   refine              → CPU
 
 CAGRA search
-  graph walk          → iGPU SYCL v0 (one work-item/query; T13.4/B2 is open)
+  graph walk          → iGPU SYCL (work-group/query checkpoint; B2 quality/perf gate open)
   candidate scoring inside the walk → fused in the SYCL kernel
 
 Vamana / NN-Descent
@@ -77,6 +77,7 @@ Arrow Lake dense GEMM is an AVX-512 / AMX problem that oneMKL already owns. Ship
 4. Do not bake B as an IR Constant. DPU got faster; wall got slower.
 5. INT8 on NPU is NNCF FakeQuantize+Constant weights, not raw `si8`. Until that IR exists for a given op, AUTO I8 is iGPU XMX.
 6. Compile: `NPU_TURBO`, `PERFORMANCE_HINT=LATENCY`, `optimization-level=2 performance-hint-override=latency`.
+7. Fail closed when conservative GEMM/TopK bounds or outputs reach FP16 range (65,504); scaled execution is not implemented yet.
 
 Remaining NPU gap: cold wall vs DPU (`54 ms` vs `5.3 ms` on 1e5×32×768) is the first memcpy of A into L0. Closing it means the **canonical dataset lives in an NPU L0 tensor** (remote `create_l0_host_tensor`), not a second copy. Unsigned SHAVE ELF inject is still unsupported; ActShave already runs inside compiler graphs.
 

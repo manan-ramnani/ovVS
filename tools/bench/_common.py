@@ -254,6 +254,8 @@ def parse_selection(raw: str | None, allowed: Sequence[str], label: str) -> list
     if raw is None or raw.strip().lower() == "all":
         return list(allowed)
     values = [part.strip().lower().replace("_", "-") for part in raw.split(",") if part.strip()]
+    if not values:
+        raise ValueError(f"at least one {label} must be selected")
     aliases = {"force-cpu": "cpu", "force-npu": "npu", "force-gpu": "gpu"}
     values = [aliases.get(value, value) for value in values]
     unknown = [value for value in values if value not in allowed]
@@ -527,7 +529,13 @@ def _custom(base_path: Path, query_path: Path, profile: dict[str, Any]) -> dict[
     for path in (base_path, query_path):
         if not path.exists() or path.suffix.lower() != ".npy":
             raise UnavailableError(f"custom input must be an existing .npy file: {path}")
-    base, queries = np.load(base_path, mmap_mode="r", allow_pickle=False), np.load(query_path, mmap_mode="r", allow_pickle=False)
+    try:
+        base = np.load(base_path, mmap_mode="r", allow_pickle=False)
+        queries = np.load(query_path, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError, EOFError) as exc:
+        raise UnavailableError(
+            f"could not read custom NumPy inputs: {type(exc).__name__}: {exc}"
+        ) from exc
     n, dim, nq = profile["expected_n"], profile["expected_dim"], profile["nq"]
     if base.ndim != 2 or queries.ndim != 2 or base.shape[0] < n or base.shape[1] != dim or queries.shape[0] < nq or queries.shape[1] != dim:
         raise UnavailableError(f"embedding-100k requires base >=({n},{dim}), queries >=({nq},{dim}); found {base.shape}, {queries.shape}")
@@ -565,10 +573,18 @@ def prepare_dataset(args: Any, profile: dict[str, Any], directory: Path) -> dict
     if args.profile in ("smoke", "sift1m"):
         try:
             return _hdf5(Path(args.sift).expanduser(), args.profile, profile)
-        except UnavailableError as exc:
+        except (UnavailableError, OSError, ValueError) as exc:
             if args.profile == "sift1m":
                 return {"status": "unavailable", "reason": str(exc), "requested_path": args.sift}
-            result = _synthetic(directory, profile["expected_n"], 32, profile["nq"], args.seed, "smoke")
+            try:
+                result = _synthetic(
+                    directory, profile["expected_n"], 32, profile["nq"], args.seed, "smoke"
+                )
+            except (OSError, ValueError, MemoryError) as synth_exc:
+                return {
+                    "status": "unavailable",
+                    "reason": f"could not prepare smoke fallback: {type(synth_exc).__name__}: {synth_exc}",
+                }
             result["fallback"] = {
                 "status": "explicit",
                 "reason": str(exc),
@@ -580,9 +596,22 @@ def prepare_dataset(args: Any, profile: dict[str, Any], directory: Path) -> dict
     if args.base:
         try:
             return _custom(Path(args.base).expanduser(), Path(args.queries).expanduser(), profile)
-        except UnavailableError as exc:
+        except (UnavailableError, OSError, ValueError) as exc:
             return {"status": "unavailable", "reason": str(exc)}
-    return _synthetic(directory, profile["expected_n"], profile["expected_dim"], profile["nq"], args.seed, "embedding-100k")
+    try:
+        return _synthetic(
+            directory,
+            profile["expected_n"],
+            profile["expected_dim"],
+            profile["nq"],
+            args.seed,
+            "embedding-100k",
+        )
+    except (OSError, ValueError, MemoryError) as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"could not prepare synthetic dataset: {type(exc).__name__}: {exc}",
+        }
 
 
 def load_dataset(dataset: dict[str, Any]):
@@ -648,7 +677,7 @@ def measure_search(search_batch: Callable[[Any], tuple[Any, Any]], queries: Any,
         "query_batch_size": batch_size,
         "pass_latency_ms": {"samples": pass_ms, "summary": summarize_samples(pass_ms)},
         "batch_latency_ms": {"summary": summarize_samples(batch_ms)},
-        "per_query_latency_ms": {"summary": summarize_samples(per_query_ms)},
+        "amortized_per_query_latency_ms": {"summary": summarize_samples(per_query_ms)},
         "qps": {"samples": qps, "summary": summarize_samples(qps)},
     }
     return measurement, np.concatenate(final_ids), np.concatenate(final_distances)
@@ -790,6 +819,12 @@ def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: 
                 issues.append(f"{lane_id}: successful point has incomplete/invalid repeat statistics")
             if ground_truth.get("status") == "success" and point.get("recall", {}).get("status") != "success":
                 issues.append(f"{lane_id}: successful point has no exact-recall result")
+            energy = point.get("energy", {})
+            if full_profile and energy.get("status") != "success":
+                issues.append(
+                    f"{lane_id}: full-profile point has no package-energy result - "
+                    f"{energy.get('reason', energy.get('status', 'missing'))}"
+                )
             contract = point.get("policy_contract", {})
             if contract.get("conforming") is False and lane.get("policy_key") in ("cpu", "npu", "gpu"):
                 issues.append(f"{lane_id}: policy contract {contract.get('status')}")

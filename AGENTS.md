@@ -53,6 +53,7 @@ Intel added an **inference engine** (compiled graph, weight-stationary, ~4 MB sc
 4. **INT8 is NNCF Low Precision IR** (FakeQuantize on activations **and Constant weights**). Raw `si8` MatMul is illegal. Two live fp32 Parameters will not light INT8 MACs. TOPS on this SKU are INT8; FP16 is half-rate. Compile with `NPU_TURBO` + `optimization-level=2 performance-hint-override=latency`.
 5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (18 ms vs NPU 45 ms vs GPU 221 ms at 1e5×32×768). Graph walk → iGPU. ADC → NPU. NPU DPU is still 5.3 ms; Parameter DMA is why wall loses to MKL.
 6. **Do not bake B as an IR Constant just to be clever.** That made DPU 10× faster and wall 10× *slower* (UMD/constant reload). Sticky Parameter + reused request + L0 `get_tensor` is the path.
+7. **Fail closed on numeric range.** Arrow Lake f32 graph IO can exhibit FP16-range saturation. GEMM/TopK must reject non-finite inputs, unsafe conservative bounds, or invalid outputs; FORCE_NPU returns `DEVICE_UNAVAILABLE` until a measured scaling path exists.
 
 If a change “uses the NPU” but creates a request per call, `set_tensor`s host pointers, or DMA’s the dataset every query, it is a defect.
 
@@ -94,7 +95,7 @@ Phase 23 (npu_compiler / SHAVE) is a **parallel** track, not a reason to stall i
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DOVVS_WITH_SYCL=ON
 cmake --build build
 ctest --test-dir build -L cpu
-# Windows oneAPI: initialize VS (`VsDevCmd.bat -arch=amd64`), then call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" and use icx (MSVC-like). icpx is GNU-like and breaks Ninja+MSVC flags.
+# Windows oneAPI: in one `cmd.exe` session, call `VsDevCmd.bat -arch=amd64`, then "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" and use icx (MSVC-like). icpx is GNU-like and breaks Ninja+MSVC flags.
 # Fallback: intel/llvm nightly clang++ -fsycl at %USERPROFILE%\intel\sycl-nightly
 tools/probe > probe.json
 tools/bakeoff gemm --sku auto

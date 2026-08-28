@@ -27,7 +27,7 @@ Tiny and large GEMM on this SKU both win on **CPU oneMKL** (`cblas_sgemm`): 64×
 
 ## CAGRA walk
 
-Search is `prim_graph_walk`. With `OVVS_WITH_SYCL=ON` that is a fused iGPU kernel: **one work-item per query**, USM itopk heap, per-vertex `Seen[nq×n]`, hash seeds, in-kernel L2. It is **not** cuVS-style work-group CAGRA (SLM itopk, bloom hashmap, subgroup teams) — that is plan T13.4 / backlog B2. Build the SYCL path with oneAPI `icx` or intel/llvm nightly `clang++ -fsycl`. Without SYCL, a host walk whose gather/pairwise go through OpenVINO GPU (or NPU) under FORCE_*. `ovvsSyclEnabled()` reports the compile-time path. Refuse the SYCL kernel if `itopk>4096` or seen bytes would exceed 64 MiB, then host prim walk.
+Search is `prim_graph_walk`. With `OVVS_WITH_SYCL=ON`, the current iGPU checkpoint assigns one work-group per query, cooperatively computes distance, keeps candidates/expansion state in SLM, and uses a traversal-budget-sized global visited hash. Query chunks bound hash allocation near 64 MiB. Hash seeds, leader-serial selection/sort, and per-search dataset/graph copies remain backlog B2; SIFT1M closure also depends on B5. Oversized shapes reject explicitly. FORCE_GPU returns `DEVICE_UNAVAILABLE` rather than crossing into the host walk; FORCE_NPU graph search is unavailable because the NPU has no graph-walk implementation. CAGRA-Q remains a host PQ-ADC walk (B10), so both forced accelerator policies reject it as unavailable. Adaptive policies may use host walks and report CPU. `ovvsSyclEnabled()` reports the compiled device path.
 
 ## FP16 / INT8 / FP8 / FP4
 
@@ -37,6 +37,7 @@ Search is `prim_graph_walk`. With `OVVS_WITH_SYCL=ON` that is a fused iGPU kerne
 - **FP16 (iGPU):** Xe Matrix Extensions (XMX/DPAS) do FP16 and INT8. `ovvsGemmEx(..., F16)` AUTO/FORCE_GPU uses oneMKL `sycl::half` GEMM (XMX), then a SYCL-half loop, then OpenVINO GPU.
 - **INT8 (iGPU):** oneMKL `int8×int8→float` GEMM (XMX, 2× FP16 issue rate on Xe-core). AUTO I8 prefers this; FORCE_NPU still runs FakeQuantize.
 - **FP16 (NPU):** still available via `ovvsGemmEx(..., F16)` FORCE_NPU (`Convert→f16 MatMul`). Not the AUTO large-GEMM default.
+- **NPU range safety:** Arrow Lake NPU f32 graph IO can still exhibit FP16-range saturation. GEMM/TopK reject non-finite inputs, conservative bounds at or above 65,504, and invalid outputs. FORCE_NPU returns `DEVICE_UNAVAILABLE` for such shapes until range-scaled execution exists.
 - **FP8 e4m3 / FP4 e2m1:** probed (`npu_matmul_f8e4m3`, `npu_matmul_f4e2m1`). Arrow Lake 3720 `compile_fail`.
 
 `ovvsResourcesLastComputeDtype` reports the type that actually ran. I8 search ids on `BuildTyped` still match an independent L2 oracle on integer-valued floats. F16 `BuildTyped` ids match an L2 oracle on IEEE-decoded binary16 (atol **2e-2**).
@@ -47,7 +48,7 @@ ScaNN-like indexes train IVF-PQ in anisotropic (per-dim std) space and **re-rank
 
 `ovvsBitsetFromAllowList(n, ids, nids, bitset)` fills a `(n+7)/8` bitset for filtered search. IVF-PQ and IVF-RaBitQ support serialize/deserialize/extend like IVF-Flat.
 
-When `OVVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Dataset/graph allocations use shared USM so iGPU GEMM/TopK/Gather/CAGRA skip a host memcpy when the pointer is already shared. NPU still binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest) and an OpenVINO NPU graph (FORCE_NPU is honest): Hamming is GreaterEqual→LogicalXor→ReduceSum; Lp is Subtract→Abs→Power→ReduceSum→Power. Those lower to Intel ActShave (`eltwise_logical_xor`, `activation_abs`, …) plus DPU ReduceSum. PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes; `PERF_COUNT` shows those tiles run as ActShave + DPU (`shave_silicon_load: compiler_actshave`). A raw SHAVE ELF32 is not a firmware load object (`invalid_native_binary`); the compiler embeds kernel `.text` in a graph ELF64. See `compiler/shave/README.md`.
+When `OVVS_WITH_SYCL=ON`, GEMM tries oneMKL GPU then hand SYCL USM (winner cached at first call), then OpenVINO GPU. Device-accessible inputs avoid an extra copy; ordinary host-backed CAGRA indexes are still copied into device USM per search, which is an open B2 performance cost. NPU binds host-visible tiles. Hamming and Lp pairwise have a SYCL kernel (FORCE_GPU is honest) and an OpenVINO NPU graph (FORCE_NPU is honest): Hamming is GreaterEqual→LogicalXor→ReduceSum; Lp is Subtract→Abs→Power→ReduceSum→Power. Those lower to Intel ActShave (`eltwise_logical_xor`, `activation_abs`, …) plus DPU ReduceSum. PQ ADC on NPU is OpenVINO Gather+ReduceSum in tiles of 128 codes; `PERF_COUNT` shows those tiles run as ActShave + DPU (`shave_silicon_load: compiler_actshave`). A raw SHAVE ELF32 is not a firmware load object (`invalid_native_binary`); the compiler embeds kernel `.text` in a graph ELF64. See `compiler/shave/README.md`.
 
 NPU Gather/TopK HostCompile tiles rows (32) and gather indices (128) when a full-shape compile fails.
 

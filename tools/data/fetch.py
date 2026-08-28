@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2] / "data"
 SIFT_FILENAME = "sift-128-euclidean.hdf5"
 SIFT_URL = "https://ann-benchmarks.com/sift-128-euclidean.hdf5"
 SIFT_SHA256 = "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984"
+SIFT_SIZE_BYTES = 525_128_288
 SIFT_SCHEMA = (
     ("train", (1_000_000, 128)),
     ("test", (10_000, 128)),
@@ -84,6 +85,7 @@ def verify_sift(
     path: Path,
     *,
     expected_sha256: str = SIFT_SHA256,
+    expected_size: int | None = SIFT_SIZE_BYTES,
     h5py_module: Any = _AUTO_H5PY,
 ) -> tuple[bool, str]:
     """Verify the pinned checksum and, when possible, the HDF5 schema."""
@@ -92,6 +94,8 @@ def verify_sift(
         return False, f"missing file: {path}"
     if not path.is_file():
         return False, f"not a regular file: {path}"
+    if expected_size is not None and path.stat().st_size != expected_size:
+        return False, f"size mismatch: expected {expected_size}, got {path.stat().st_size}"
 
     try:
         actual_sha256 = sha256_file(path)
@@ -118,6 +122,7 @@ def download_sift(
     *,
     url: str = SIFT_URL,
     expected_sha256: str = SIFT_SHA256,
+    expected_size: int | None = SIFT_SIZE_BYTES,
     h5py_module: Any = _AUTO_H5PY,
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> tuple[bool, str]:
@@ -134,6 +139,16 @@ def download_sift(
             final_url = response.geturl()
             if urlparse(final_url).scheme.lower() != "https":
                 raise RuntimeError(f"refusing HTTPS downgrade redirect to {final_url}")
+            content_length = getattr(response, "headers", {}).get("Content-Length")
+            if expected_size is not None and content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(f"invalid Content-Length: {content_length!r}") from exc
+                if declared_size != expected_size:
+                    raise RuntimeError(
+                        f"download size mismatch: expected {expected_size}, server declared {declared_size}"
+                    )
 
             with tempfile.NamedTemporaryFile(
                 mode="wb",
@@ -143,10 +158,16 @@ def download_sift(
                 delete=False,
             ) as stream:
                 temp_path = Path(stream.name)
+                received = 0
                 while True:
                     chunk = response.read(1 << 20)
                     if not chunk:
                         break
+                    received += len(chunk)
+                    if expected_size is not None and received > expected_size:
+                        raise RuntimeError(
+                            f"download exceeded pinned size {expected_size}; refusing further data"
+                        )
                     stream.write(chunk)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -157,6 +178,7 @@ def download_sift(
         valid, detail = verify_sift(
             temp_path,
             expected_sha256=expected_sha256,
+            expected_size=expected_size,
             h5py_module=h5py_module,
         )
         if not valid:
@@ -179,6 +201,7 @@ def ensure_sift(
     dest: Path,
     *,
     expected_sha256: str = SIFT_SHA256,
+    expected_size: int | None = SIFT_SIZE_BYTES,
     h5py_module: Any = _AUTO_H5PY,
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> tuple[bool, str]:
@@ -188,6 +211,7 @@ def ensure_sift(
         valid, detail = verify_sift(
             dest,
             expected_sha256=expected_sha256,
+            expected_size=expected_size,
             h5py_module=h5py_module,
         )
         if not valid:
@@ -197,6 +221,7 @@ def ensure_sift(
     return download_sift(
         dest,
         expected_sha256=expected_sha256,
+        expected_size=expected_size,
         h5py_module=h5py_module,
         opener=opener,
     )

@@ -66,7 +66,7 @@ class FetchTests(unittest.TestCase):
             path.write_bytes(payload)
 
             valid, detail = fetch.verify_sift(
-                path, expected_sha256=expected, h5py_module=None
+                path, expected_sha256=expected, expected_size=len(payload), h5py_module=None
             )
 
         self.assertTrue(valid)
@@ -80,7 +80,7 @@ class FetchTests(unittest.TestCase):
             path.write_bytes(payload)
 
             valid, detail = fetch.verify_sift(
-                path, expected_sha256="0" * 64, h5py_module=None
+                path, expected_sha256="0" * 64, expected_size=len(payload), h5py_module=None
             )
 
             self.assertFalse(valid)
@@ -113,12 +113,35 @@ class FetchTests(unittest.TestCase):
             valid, detail = fetch.download_sift(
                 dest,
                 expected_sha256=expected,
+                expected_size=len(payload),
                 h5py_module=None,
                 opener=opener,
             )
 
             self.assertTrue(valid, detail)
             self.assertEqual(dest.read_bytes(), payload)
+            self.assertEqual(list(dest.parent.glob("*.part")), [])
+
+    def test_download_refuses_data_beyond_pinned_size(self) -> None:
+        payload = b"oversized payload"
+
+        def opener(request: object, timeout: int) -> _Response:
+            del request, timeout
+            return _Response(payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / "sift.hdf5"
+            valid, detail = fetch.download_sift(
+                dest,
+                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                expected_size=4,
+                h5py_module=None,
+                opener=opener,
+            )
+
+            self.assertFalse(valid)
+            self.assertIn("exceeded pinned size", detail)
+            self.assertFalse(dest.exists())
             self.assertEqual(list(dest.parent.glob("*.part")), [])
 
     def test_corrupt_existing_file_is_not_replaced_or_downloaded(self) -> None:
@@ -133,6 +156,7 @@ class FetchTests(unittest.TestCase):
             valid, detail = fetch.ensure_sift(
                 dest,
                 expected_sha256="0" * 64,
+                expected_size=len(payload),
                 h5py_module=None,
                 opener=opener,
             )
