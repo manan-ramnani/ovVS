@@ -218,6 +218,8 @@ ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int3
   if (!tables || !codes || !out || pq_m <= 0 || ks <= 0 || ncodes <= 0) {
     return OVVS_STATUS_INVALID_ARGUMENT;
   }
+  /* There is no iGPU ADC backend. FORCE_GPU must not punch through to NPU. */
+  if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
   if (r.policy != OVVS_POLICY_FORCE_CPU) {
     if (npu_pq_adc(r, tables, pq_m, ks, codes, ncodes, out)) {
       r.last_device = OVVS_DEVICE_NPU;
@@ -233,6 +235,38 @@ ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int3
   }
   r.last_device = OVVS_DEVICE_CPU;
   return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                                 ovvsMetric metric, int32_t degree, int32_t iterations,
+                                 int32_t* graph) {
+  if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+
+  const bool gpu_metric_supported = metric == OVVS_METRIC_L2_EXPANDED ||
+                                    metric == OVVS_METRIC_L2_SQRT_EXPANDED ||
+                                    metric == OVVS_METRIC_INNER_PRODUCT ||
+                                    metric == OVVS_METRIC_COSINE_EXPANDED;
+  const bool gpu_policy = r.policy == OVVS_POLICY_AUTO ||
+                          r.policy == OVVS_POLICY_GPU_IF_FASTER ||
+                          r.policy == OVVS_POLICY_HETERO ||
+                          r.policy == OVVS_POLICY_FORCE_GPU;
+  const bool gpu_ready = gpu_policy && gpu_metric_supported && sycl_gpu_available();
+  if (gpu_ready) {
+    const ovvsStatus gpu_status =
+        gpu_nndescent_build(r, dataset, n, dim, metric, degree, iterations, graph);
+    if (gpu_status == OVVS_STATUS_SUCCESS) {
+      r.last_device = OVVS_DEVICE_GPU;
+      return OVVS_STATUS_SUCCESS;
+    }
+    /* A present, supported GPU path that fails preflight or execution must not
+       silently enter the O(n*degree^2) host loop at production scale. */
+    return gpu_status;
+  }
+  if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+
+  /* The algorithm owns the existing CPU reference loop. UNSUPPORTED is an
+     internal adaptive-fallback signal and is never returned through the C ABI. */
+  return OVVS_STATUS_UNSUPPORTED;
 }
 
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
@@ -399,9 +433,20 @@ ovvsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, 
   return OVVS_STATUS_SUCCESS;
 }
 
-void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
-                     int32_t iters, std::vector<float>& centroids) {
+ovvsStatus kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
+                           int32_t iters, std::vector<float>& centroids) {
+  if (!x || n <= 0 || dim <= 0 || k <= 0 || iters < 0 ||
+      n > std::numeric_limits<int32_t>::max()) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
   k = std::max(1, std::min(k, static_cast<int32_t>(n)));
+  const size_t max_float_elements = std::numeric_limits<size_t>::max() / sizeof(float);
+  if (static_cast<uint64_t>(k) >
+          static_cast<uint64_t>(max_float_elements) / static_cast<uint64_t>(dim) ||
+      static_cast<uint64_t>(n) >
+          static_cast<uint64_t>(max_float_elements) / static_cast<uint64_t>(k)) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
   centroids.assign(static_cast<size_t>(k) * static_cast<size_t>(dim), 0.f);
   auto rng = rng_from(42);
   std::uniform_int_distribution<int64_t> pick(0, n - 1);
@@ -417,8 +462,13 @@ void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, i
   std::vector<float> dist(static_cast<size_t>(n));
   std::vector<float> scores(static_cast<size_t>(n) * static_cast<size_t>(k));
   for (int it = 0; it < iters; ++it) {
-    prim_pairwise(r, OVVS_METRIC_L2_EXPANDED, x, n, centroids.data(), k, dim, scores.data(), 2.f);
-    prim_topk(r, scores.data(), n, k, 1, labels.data(), dist.data(), false);
+    const ovvsStatus pairwise_status =
+        prim_pairwise(r, OVVS_METRIC_L2_EXPANDED, x, n, centroids.data(), k, dim,
+                      scores.data(), 2.f);
+    if (pairwise_status != OVVS_STATUS_SUCCESS) return pairwise_status;
+    const ovvsStatus topk_status =
+        prim_topk(r, scores.data(), n, k, 1, labels.data(), dist.data(), false);
+    if (topk_status != OVVS_STATUS_SUCCESS) return topk_status;
     std::vector<float> sum(static_cast<size_t>(k) * static_cast<size_t>(dim), 0.f);
     std::vector<int32_t> cnt(static_cast<size_t>(k), 0);
     for (int64_t i = 0; i < n; ++i) {
@@ -437,6 +487,7 @@ void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, i
       for (int64_t d = 0; d < dim; ++d) dst[d] = src[d] * inv;
     }
   }
+  return OVVS_STATUS_SUCCESS;
 }
 
 }  // namespace impl

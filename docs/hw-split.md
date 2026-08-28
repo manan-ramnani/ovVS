@@ -55,9 +55,13 @@ CAGRA search
   graph walk          → iGPU SYCL (work-group/query checkpoint; B2 quality/perf gate open)
   candidate scoring inside the walk → fused in the SYCL kernel
 
+CAGRA build
+  NN-Descent init n>4096 → iGPU SYCL under AUTO
+  prune               → CPU until T13.3 (full FORCE_GPU build is unavailable)
+
 Vamana / NN-Descent
-  current build/walk  → host control path
-  accelerated kernels→ iGPU SYCL after B21 / B5 respectively
+  NN-Descent n>4096  → iGPU SYCL sampled local join (B5 bounded checkpoint)
+  Vamana prune/walk  → host control path (B21 remains open)
 
 k-means
   assign              → CPU oneMKL GEMM

@@ -35,7 +35,7 @@ struct IvfRabitq {
 };
 
 struct NnGraph {
-  Dataset ds;
+  int64_t n = 0;
   int32_t degree = 0;
   std::vector<int32_t> ids;
 };
@@ -85,6 +85,13 @@ struct ScannIndex {
   std::vector<float> aniso;
 };
 
+struct IvfPqGuard {
+  ovvsIvfPqIndex_t value = nullptr;
+  ~IvfPqGuard() {
+    if (value) (void)ovvsIvfPqDestroy(value);
+  }
+};
+
 int64_t nbytes_bits(int64_t dim) { return (dim + 7) / 8; }
 
 void pack_signs(const float* v, int64_t dim, const uint8_t* rand_sign, uint8_t* out) {
@@ -118,33 +125,41 @@ void build_ivf_lists(const int32_t* assign, int64_t n, int32_t nlist,
   }
 }
 
-void knn_graph_brute(ResourcesData& r, const float* x, int64_t n, int64_t dim, ovvsMetric metric,
-                     int32_t degree, std::vector<int32_t>& graph) {
+ovvsStatus knn_graph_brute(ResourcesData& r, const float* x, int64_t n, int64_t dim,
+                           ovvsMetric metric, int32_t degree, std::vector<int32_t>& graph) {
   degree = std::min(degree, static_cast<int32_t>(std::max<int64_t>(1, n - 1)));
   graph.assign(static_cast<size_t>(n) * static_cast<size_t>(degree), -1);
   std::vector<float> scores(static_cast<size_t>(n) * static_cast<size_t>(n));
-  prim_pairwise(r, metric, x, n, x, n, dim, scores.data(), 2.f);
+  const ovvsStatus pairwise_status = prim_pairwise(r, metric, x, n, x, n, dim, scores.data(), 2.f);
+  if (pairwise_status != OVVS_STATUS_SUCCESS) return pairwise_status;
   for (int64_t i = 0; i < n; ++i) scores[static_cast<size_t>(i * n + i)] = kInf;
   std::vector<int64_t> idx(static_cast<size_t>(n) * static_cast<size_t>(degree));
   std::vector<float> val(static_cast<size_t>(n) * static_cast<size_t>(degree));
-  prim_topk(r, scores.data(), n, n, degree, idx.data(), val.data(), false);
+  const ovvsStatus topk_status = prim_topk(r, scores.data(), n, n, degree, idx.data(), val.data(), false);
+  if (topk_status != OVVS_STATUS_SUCCESS) return topk_status;
   for (int64_t i = 0; i < n; ++i) {
     for (int32_t t = 0; t < degree; ++t) {
       graph[static_cast<size_t>(i * degree + t)] =
           static_cast<int32_t>(idx[static_cast<size_t>(i * degree + t)]);
     }
   }
+  return OVVS_STATUS_SUCCESS;
 }
 
-void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, ovvsMetric metric,
-                     int32_t degree, int32_t iters, std::vector<int32_t>& graph) {
+ovvsStatus nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim,
+                            ovvsMetric metric, int32_t degree, int32_t iters,
+                            std::vector<int32_t>& graph) {
   degree = std::min(degree, static_cast<int32_t>(std::max<int64_t>(1, n - 1)));
   /* Exact kNN is cheap through prim_pairwise while n^2 scores fit in ~64MiB. */
   if (n <= 4096) {
-    knn_graph_brute(r, x, n, dim, metric, degree, graph);
-    return;
+    return knn_graph_brute(r, x, n, dim, metric, degree, graph);
   }
   graph.assign(static_cast<size_t>(n) * static_cast<size_t>(degree), -1);
+  const ovvsStatus accelerated =
+      prim_nndescent_build(r, x, n, dim, metric, degree, iters, graph.data());
+  if (accelerated == OVVS_STATUS_SUCCESS) return accelerated;
+  if (accelerated != OVVS_STATUS_UNSUPPORTED) return accelerated;
+
   auto rng = rng_from(7);
   std::uniform_int_distribution<int64_t> pick(0, n - 1);
   for (int64_t i = 0; i < n; ++i) {
@@ -157,7 +172,6 @@ void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, o
     }
     std::memcpy(graph.data() + i * degree, row.data(), static_cast<size_t>(degree) * sizeof(int32_t));
   }
-  iters = std::max(iters, 10);
   for (int it = 0; it < iters; ++it) {
     for (int64_t i = 0; i < n; ++i) {
       std::vector<int64_t> cands;
@@ -177,13 +191,20 @@ void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, o
       if (cands.empty()) continue;
       std::vector<float> gathered(cands.size() * static_cast<size_t>(dim));
       std::vector<float> sc(cands.size());
-      prim_gather_rows(r, x, n, dim, cands.data(), static_cast<int64_t>(cands.size()), gathered.data());
-      prim_pairwise(r, metric, x + i * dim, 1, gathered.data(), static_cast<int64_t>(cands.size()), dim,
-                    sc.data(), 2.f);
+      const ovvsStatus gather_status =
+          prim_gather_rows(r, x, n, dim, cands.data(), static_cast<int64_t>(cands.size()),
+                           gathered.data());
+      if (gather_status != OVVS_STATUS_SUCCESS) return gather_status;
+      const ovvsStatus pairwise_status =
+          prim_pairwise(r, metric, x + i * dim, 1, gathered.data(),
+                        static_cast<int64_t>(cands.size()), dim, sc.data(), 2.f);
+      if (pairwise_status != OVVS_STATUS_SUCCESS) return pairwise_status;
       const int64_t kk = std::min(static_cast<int64_t>(degree), static_cast<int64_t>(cands.size()));
       std::vector<int64_t> ti(static_cast<size_t>(kk));
       std::vector<float> tv(static_cast<size_t>(kk));
-      prim_topk(r, sc.data(), 1, static_cast<int64_t>(cands.size()), kk, ti.data(), tv.data(), false);
+      const ovvsStatus topk_status =
+          prim_topk(r, sc.data(), 1, static_cast<int64_t>(cands.size()), kk, ti.data(), tv.data(), false);
+      if (topk_status != OVVS_STATUS_SUCCESS) return topk_status;
       for (int64_t t = 0; t < degree; ++t) {
         if (t < kk) {
           graph[static_cast<size_t>(i * degree + t)] =
@@ -194,6 +215,8 @@ void nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim, o
       }
     }
   }
+  r.last_device = OVVS_DEVICE_CPU;
+  return OVVS_STATUS_SUCCESS;
 }
 
 void prune_graph(const float* x, int64_t n, int64_t dim, ovvsMetric metric, const int32_t* in,
@@ -231,12 +254,13 @@ void prune_graph(const float* x, int64_t n, int64_t dim, ovvsMetric metric, cons
   }
 }
 
-void graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
-                  const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
-                  int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
-                  float* distances) {
-  prim_graph_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width, bitset,
-                  neighbors, distances);
+ovvsStatus graph_search(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                        ovvsMetric metric, const int32_t* graph, int32_t degree,
+                        const float* queries, int64_t nq, int64_t k, int32_t itopk,
+                        int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
+                        float* distances) {
+  return prim_graph_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk,
+                         search_width, bitset, neighbors, distances);
 }
 
 void pq_encode_rows(const float* x, int64_t n, int64_t dim, int32_t pq_m, int32_t ks, int32_t dsub,
@@ -359,9 +383,9 @@ void graph_search_pq(const float* query_ds, int64_t n, int64_t dim, const int32_
   (void)query_ds;
 }
 
-void cagra_init_ivfpq(ResourcesData& r, const float* x, int64_t n, int64_t dim, ovvsMetric metric,
-                      int32_t degree, std::vector<int32_t>& graph) {
-  ovvsIvfPqIndex_t pq = nullptr;
+ovvsStatus cagra_init_ivfpq(ResourcesData& r, const float* x, int64_t n, int64_t dim,
+                            ovvsMetric metric, int32_t degree, std::vector<int32_t>& graph) {
+  IvfPqGuard pq;
   const int32_t nlist = std::max(2, std::min(8, static_cast<int32_t>(n / 4)));
   int32_t pq_m = 1;
   for (int32_t c = std::min(4, static_cast<int32_t>(dim)); c >= 1; --c) {
@@ -371,16 +395,17 @@ void cagra_init_ivfpq(ResourcesData& r, const float* x, int64_t n, int64_t dim, 
     }
   }
   auto* res = reinterpret_cast<ovvsResources_t>(&r);
-  if (ovvsIvfPqBuild(res, x, n, dim, metric, nlist, pq_m, 8, &pq) != OVVS_STATUS_SUCCESS) {
-    nndescent_build(r, x, n, dim, metric, degree, 6, graph);
-    return;
-  }
+  const ovvsStatus build_status =
+      ovvsIvfPqBuild(res, x, n, dim, metric, nlist, pq_m, 8, &pq.value);
+  if (build_status != OVVS_STATUS_SUCCESS) return build_status;
   graph.assign(static_cast<size_t>(n) * static_cast<size_t>(degree), -1);
   std::vector<int64_t> nb(static_cast<size_t>(degree) + 1);
   std::vector<float> ds(static_cast<size_t>(degree) + 1);
   for (int64_t i = 0; i < n; ++i) {
-    ovvsIvfPqSearch(res, pq, x + i * dim, 1, degree + 1, nlist, static_cast<int32_t>(degree) + 1, nullptr,
-                    nb.data(), ds.data());
+    const ovvsStatus search_status =
+        ovvsIvfPqSearch(res, pq.value, x + i * dim, 1, degree + 1, nlist,
+                        static_cast<int32_t>(degree) + 1, nullptr, nb.data(), ds.data());
+    if (search_status != OVVS_STATUS_SUCCESS) return search_status;
     int filled = 0;
     for (int32_t t = 0; t < degree + 1 && filled < degree; ++t) {
       if (nb[static_cast<size_t>(t)] == i || nb[static_cast<size_t>(t)] < 0) continue;
@@ -388,19 +413,23 @@ void cagra_init_ivfpq(ResourcesData& r, const float* x, int64_t n, int64_t dim, 
       ++filled;
     }
   }
-  ovvsIvfPqDestroy(pq);
+  return OVVS_STATUS_SUCCESS;
 }
 
-void cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int64_t dim, ovvsMetric metric,
-                          int32_t degree, std::vector<int32_t>& graph) {
-  nndescent_build(r, x, n, dim, metric, degree, 4, graph);
+ovvsStatus cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int64_t dim,
+                                ovvsMetric metric, int32_t degree,
+                                std::vector<int32_t>& graph) {
+  const ovvsStatus init_status = nndescent_build(r, x, n, dim, metric, degree, 4, graph);
+  if (init_status != OVVS_STATUS_SUCCESS) return init_status;
   std::vector<int32_t> next = graph;
   std::vector<int64_t> nb(static_cast<size_t>(degree));
   std::vector<float> ds(static_cast<size_t>(degree));
   for (int it = 0; it < 2; ++it) {
     for (int64_t i = 0; i < n; ++i) {
-      graph_search(r, x, n, dim, metric, graph.data(), degree, x + i * dim, 1, degree, degree * 2, 2,
-                   nullptr, nb.data(), ds.data());
+      const ovvsStatus search_status =
+          graph_search(r, x, n, dim, metric, graph.data(), degree, x + i * dim, 1, degree,
+                       degree * 2, 2, nullptr, nb.data(), ds.data());
+      if (search_status != OVVS_STATUS_SUCCESS) return search_status;
       int filled = 0;
       for (int32_t t = 0; t < degree && filled < degree; ++t) {
         if (nb[static_cast<size_t>(t)] == i || nb[static_cast<size_t>(t)] < 0) continue;
@@ -414,20 +443,24 @@ void cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int64_t d
     }
     graph.swap(next);
   }
+  return OVVS_STATUS_SUCCESS;
 }
 
 void robust_prune(const float* x, int64_t dim, ovvsMetric metric, int64_t p, std::vector<int32_t>& cand,
                   int32_t degree, float alpha, int32_t* out_row);
 
-void cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec) {
+ovvsStatus cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec) {
   const int64_t old_n = ix->ds.n;
   const int64_t dim = ix->ds.dim;
-  ix->ds.x.insert(ix->ds.x.end(), vec, vec + dim);
-  ix->ds.n = old_n + 1;
   std::vector<int64_t> nb(static_cast<size_t>(ix->degree));
   std::vector<float> ds(static_cast<size_t>(ix->degree));
-  graph_search(r, ix->ds.x.data(), old_n, dim, ix->ds.metric, ix->graph.data(), ix->degree, vec, 1,
-               ix->degree, ix->degree * 2, 2, nullptr, nb.data(), ds.data());
+  const ovvsStatus search_status =
+      graph_search(r, ix->ds.x.data(), old_n, dim, ix->ds.metric, ix->graph.data(),
+                   ix->degree, vec, 1, ix->degree, ix->degree * 2, 2, nullptr, nb.data(),
+                   ds.data());
+  if (search_status != OVVS_STATUS_SUCCESS) return search_status;
+  ix->ds.x.insert(ix->ds.x.end(), vec, vec + dim);
+  ix->ds.n = old_n + 1;
   ix->graph.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree), -1);
   for (int32_t t = 0; t < ix->degree; ++t) {
     ix->graph[static_cast<size_t>(old_n * ix->degree + t)] =
@@ -445,6 +478,7 @@ void cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec) {
     robust_prune(ix->ds.x.data(), dim, ix->ds.metric, u, cand, ix->degree, 1.2f,
                  ix->graph.data() + static_cast<int64_t>(u) * ix->degree);
   }
+  return OVVS_STATUS_SUCCESS;
 }
 
 void robust_prune(const float* x, int64_t dim, ovvsMetric metric, int64_t p, std::vector<int32_t>& cand,
@@ -709,15 +743,32 @@ ovvsStatus ovvsIvfRabitqExtend(ovvsResources_t res, ovvsIvfRabitqIndex_t index, 
 ovvsStatus ovvsNnDescentBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
                               ovvsMetric metric, int32_t graph_degree, int32_t iterations,
                               ovvsNnDescentGraph_t* graph) {
-  if (!res || !dataset || !graph || n <= 1 || dim <= 0 || graph_degree <= 0) {
+  if (!graph) return OVVS_STATUS_INVALID_ARGUMENT;
+  *graph = nullptr;
+  if (!res || !dataset || n <= 1 || dim <= 0 || graph_degree <= 0) {
     return OVVS_STATUS_INVALID_ARGUMENT;
   }
-  auto* g = new NnGraph();
-  copy_ds(g->ds, dataset, n, dim, metric);
-  g->degree = std::min(graph_degree, static_cast<int32_t>(n - 1));
-  nndescent_build(*rd(res), dataset, n, dim, metric, g->degree, std::max(1, iterations), g->ids);
-  *graph = reinterpret_cast<ovvsNnDescentGraph_t>(g);
-  return OVVS_STATUS_SUCCESS;
+  if (n > std::numeric_limits<int32_t>::max() || dim > std::numeric_limits<int64_t>::max() / n) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  if (metric < OVVS_METRIC_L2_EXPANDED || metric > OVVS_METRIC_LP_UNEXPANDED) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  try {
+    auto g = std::make_unique<NnGraph>();
+    g->n = n;
+    g->degree = std::min(graph_degree, static_cast<int32_t>(n - 1));
+    const ovvsStatus status =
+        nndescent_build(*rd(res), dataset, n, dim, metric, g->degree,
+                        std::max(1, iterations), g->ids);
+    if (status != OVVS_STATUS_SUCCESS) return status;
+    *graph = reinterpret_cast<ovvsNnDescentGraph_t>(g.release());
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }
 
 ovvsStatus ovvsNnDescentNeighbors(ovvsNnDescentGraph_t graph, const int32_t** ids, int64_t* n,
@@ -725,7 +776,7 @@ ovvsStatus ovvsNnDescentNeighbors(ovvsNnDescentGraph_t graph, const int32_t** id
   if (!graph || !ids || !n || !degree) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* g = reinterpret_cast<NnGraph*>(graph);
   *ids = g->ids.data();
-  *n = g->ds.n;
+  *n = g->n;
   *degree = g->degree;
   return OVVS_STATUS_SUCCESS;
 }
@@ -738,26 +789,57 @@ ovvsStatus ovvsNnDescentDestroy(ovvsNnDescentGraph_t graph) {
 ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
                             ovvsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
                             ovvsCagraBuildAlgo algo, ovvsCagraIndex_t* index) {
-  if (!res || !dataset || !index || n <= 1 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
+  *index = nullptr;
+  if (!res || !dataset || n <= 1 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (n > std::numeric_limits<int32_t>::max() || dim > std::numeric_limits<int64_t>::max() / n) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  if (metric < OVVS_METRIC_L2_EXPANDED || metric > OVVS_METRIC_LP_UNEXPANDED ||
+      algo < OVVS_CAGRA_BUILD_NN_DESCENT || algo > OVVS_CAGRA_BUILD_ITERATIVE) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  auto* resources = rd(res);
+  if (resources->policy == OVVS_POLICY_FORCE_NPU) {
+    ++resources->npu_fallbacks;
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if (resources->policy == OVVS_POLICY_FORCE_GPU) {
+    /* The build still ends in host pruning until T13.3 lands. */
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  }
   graph_degree = std::max(1, std::min(graph_degree, static_cast<int32_t>(n - 1)));
   intermediate_degree = std::max(graph_degree, std::min(intermediate_degree, static_cast<int32_t>(n - 1)));
-  auto* ix = new CagraIndex();
-  copy_ds(ix->ds, dataset, n, dim, metric);
-  ix->degree = graph_degree;
-  ix->has_dataset = true;
-  std::vector<int32_t> init;
-  if (algo == OVVS_CAGRA_BUILD_IVF_PQ) {
-    cagra_init_ivfpq(*rd(res), dataset, n, dim, metric, intermediate_degree, init);
-  } else if (algo == OVVS_CAGRA_BUILD_ITERATIVE) {
-    cagra_init_iterative(*rd(res), dataset, n, dim, metric, intermediate_degree, init);
-  } else {
-    nndescent_build(*rd(res), dataset, n, dim, metric, intermediate_degree, 6, init);
+  try {
+    auto ix = std::make_unique<CagraIndex>();
+    copy_ds(ix->ds, dataset, n, dim, metric);
+    ix->degree = graph_degree;
+    ix->has_dataset = true;
+    std::vector<int32_t> init;
+    ovvsStatus status = OVVS_STATUS_SUCCESS;
+    if (algo == OVVS_CAGRA_BUILD_IVF_PQ) {
+      status = cagra_init_ivfpq(*rd(res), ix->ds.x.data(), n, dim, metric,
+                                intermediate_degree, init);
+    } else if (algo == OVVS_CAGRA_BUILD_ITERATIVE) {
+      status = cagra_init_iterative(*rd(res), ix->ds.x.data(), n, dim, metric,
+                                    intermediate_degree, init);
+    } else {
+      status = nndescent_build(*rd(res), ix->ds.x.data(), n, dim, metric,
+                               intermediate_degree, 6, init);
+    }
+    if (status != OVVS_STATUS_SUCCESS) return status;
+    std::vector<int32_t> pruned;
+    prune_graph(ix->ds.x.data(), n, dim, metric, init.data(), intermediate_degree,
+                graph_degree, pruned);
+    ix->graph.assign(pruned.begin(), pruned.end());
+    resources->last_device = OVVS_DEVICE_CPU;
+    *index = reinterpret_cast<ovvsCagraIndex_t>(ix.release());
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
   }
-  std::vector<int32_t> pruned;
-  prune_graph(dataset, n, dim, metric, init.data(), intermediate_degree, graph_degree, pruned);
-  ix->graph.assign(pruned.begin(), pruned.end());
-  *index = reinterpret_cast<ovvsCagraIndex_t>(ix);
-  return OVVS_STATUS_SUCCESS;
 }
 
 ovvsStatus ovvsCagraBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
@@ -770,9 +852,14 @@ ovvsStatus ovvsCagraBuild(ovvsResources_t res, const float* dataset, int64_t n, 
 ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk_size, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances) {
-  if (!res || !index || !queries || !neighbors || !distances) return OVVS_STATUS_INVALID_ARGUMENT;
-  auto* ix = reinterpret_cast<CagraIndex*>(index);
-  if (ix->pq_m > 0 && !ix->codes.empty()) {
+  if (!res || !index || !queries || !neighbors || !distances || nq <= 0 || k <= 0 ||
+      k > std::numeric_limits<int32_t>::max()) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (nq > std::numeric_limits<int64_t>::max() / k) return OVVS_STATUS_SHAPE_MISMATCH;
+  try {
+    auto* ix = reinterpret_cast<CagraIndex*>(index);
+    if (ix->pq_m > 0 && !ix->codes.empty()) {
     auto* resources = rd(res);
     if (resources->policy == OVVS_POLICY_FORCE_GPU || resources->policy == OVVS_POLICY_FORCE_NPU) {
       if (resources->policy == OVVS_POLICY_FORCE_NPU) ++resources->npu_fallbacks;
@@ -792,16 +879,23 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
         }
         if (nc == 0) continue;
         std::vector<float> gathered(static_cast<size_t>(nc) * static_cast<size_t>(dim));
-        prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim, cand.data(), nc, gathered.data());
+        ovvsStatus status = prim_gather_rows(*rd(res), ix->ds.x.data(), ix->ds.n, dim,
+                                             cand.data(), nc, gathered.data());
+        if (status != OVVS_STATUS_SUCCESS) return status;
         std::vector<float> sc(static_cast<size_t>(nc));
-        prim_pairwise(*rd(res), ix->ds.metric, queries + q * dim, 1, gathered.data(), nc, dim, sc.data(),
-                      2.f);
+        status = prim_pairwise(*rd(res), ix->ds.metric, queries + q * dim, 1,
+                               gathered.data(), nc, dim, sc.data(), 2.f);
+        if (status != OVVS_STATUS_SUCCESS) return status;
         std::vector<int64_t> fi(static_cast<size_t>(nc));
         std::vector<float> fv(static_cast<size_t>(nc));
-        prim_topk(*rd(res), sc.data(), 1, nc, nc, fi.data(), fv.data(), metric_largest(ix->ds.metric));
+        status = prim_topk(*rd(res), sc.data(), 1, nc, nc, fi.data(), fv.data(),
+                           metric_largest(ix->ds.metric));
+        if (status != OVVS_STATUS_SUCCESS) return status;
         for (int64_t t = 0; t < k; ++t) {
           if (t < nc) {
-            neighbors[q * k + t] = cand[static_cast<size_t>(fi[static_cast<size_t>(t)])];
+            const int64_t selected = fi[static_cast<size_t>(t)];
+            if (selected < 0 || selected >= nc) return OVVS_STATUS_ERROR;
+            neighbors[q * k + t] = cand[static_cast<size_t>(selected)];
             float d = fv[static_cast<size_t>(t)];
             if (ix->ds.metric == OVVS_METRIC_INNER_PRODUCT) d = -d;
             distances[q * k + t] = d;
@@ -812,12 +906,17 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
         }
       }
     }
-    return OVVS_STATUS_SUCCESS;
+      return OVVS_STATUS_SUCCESS;
+    }
+    if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+    return prim_graph_walk(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim,
+                           ix->ds.metric, ix->graph.data(), ix->degree, queries, nq, k,
+                           itopk_size, search_width, bitset, neighbors, distances);
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
   }
-  if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
-  return prim_graph_walk(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
-                         ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors,
-                         distances);
 }
 
 ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_t include_dataset) {
@@ -911,14 +1010,38 @@ ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const fl
   if (!res || !index || !extra || nextra <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
   if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
-  const int64_t dim = ix->ds.dim;
-  for (int64_t i = 0; i < nextra; ++i) cagra_insert_one(ix, *rd(res), extra + i * dim);
-  if (ix->pq_m > 0) {
-    ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
-    pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
-                   ix->codes.data());
+  auto* resources = rd(res);
+  if (resources->policy == OVVS_POLICY_FORCE_NPU) {
+    ++resources->npu_fallbacks;
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
-  return OVVS_STATUS_SUCCESS;
+  if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  const int64_t dim = ix->ds.dim;
+  if (nextra > std::numeric_limits<int32_t>::max() - ix->ds.n ||
+      dim > std::numeric_limits<int64_t>::max() / nextra) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  try {
+    CagraIndex staged = *ix;
+    for (int64_t i = 0; i < nextra; ++i) {
+      const ovvsStatus status =
+          cagra_insert_one(&staged, *rd(res), extra + i * dim);
+      if (status != OVVS_STATUS_SUCCESS) return status;
+    }
+    if (staged.pq_m > 0) {
+      staged.codes.resize(static_cast<size_t>(staged.ds.n) *
+                          static_cast<size_t>(staged.pq_m));
+      pq_encode_rows(staged.ds.x.data(), staged.ds.n, dim, staged.pq_m, staged.pq_ks,
+                     staged.dsub, staged.codebooks.data(), staged.codes.data());
+    }
+    *ix = std::move(staged);
+    resources->last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }
 
 ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_t pq_m, int32_t pq_nbits) {
@@ -926,25 +1049,60 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
   auto* ix = reinterpret_cast<CagraIndex*>(index);
   if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
   if (ix->ds.dim % pq_m != 0) return OVVS_STATUS_SHAPE_MISMATCH;
-  ix->pq_m = pq_m;
-  ix->pq_ks = 1 << std::min(std::max(pq_nbits, 4), 8);
-  ix->dsub = static_cast<int32_t>(ix->ds.dim / pq_m);
-  ix->codebooks.assign(static_cast<size_t>(ix->pq_m) * ix->pq_ks * ix->dsub, 0.f);
-  std::vector<float> sub(static_cast<size_t>(ix->ds.n) * ix->dsub);
-  for (int32_t m = 0; m < ix->pq_m; ++m) {
-    for (int64_t i = 0; i < ix->ds.n; ++i) {
-      std::memcpy(sub.data() + i * ix->dsub, ix->ds.x.data() + i * ix->ds.dim + static_cast<int64_t>(m) * ix->dsub,
-                  static_cast<size_t>(ix->dsub) * sizeof(float));
-    }
-    std::vector<float> cents;
-    kmeans_fit_impl(*rd(res), sub.data(), ix->ds.n, ix->dsub, ix->pq_ks, 8, cents);
-    std::memcpy(ix->codebooks.data() + static_cast<size_t>(m) * ix->pq_ks * ix->dsub, cents.data(),
-                cents.size() * sizeof(float));
+  auto* resources = rd(res);
+  if (resources->policy == OVVS_POLICY_FORCE_NPU) {
+    ++resources->npu_fallbacks;
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
-  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
-  pq_encode_rows(ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->pq_m, ix->pq_ks, ix->dsub, ix->codebooks.data(),
-                 ix->codes.data());
-  return OVVS_STATUS_SUCCESS;
+  if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  const int32_t pq_ks = 1 << std::min(std::max(pq_nbits, 4), 8);
+  if (static_cast<uint64_t>(ix->ds.dim) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(pq_ks) ||
+      static_cast<uint64_t>(ix->ds.n) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(pq_m)) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  try {
+    CagraIndex staged = *ix;
+    staged.pq_m = pq_m;
+    staged.pq_ks = pq_ks;
+    staged.dsub = static_cast<int32_t>(staged.ds.dim / pq_m);
+    staged.codebooks.assign(static_cast<size_t>(staged.pq_m) * staged.pq_ks *
+                                static_cast<size_t>(staged.dsub),
+                            0.f);
+    std::vector<float> sub(static_cast<size_t>(staged.ds.n) *
+                           static_cast<size_t>(staged.dsub));
+    for (int32_t m = 0; m < staged.pq_m; ++m) {
+      for (int64_t i = 0; i < staged.ds.n; ++i) {
+        std::memcpy(sub.data() + i * staged.dsub,
+                    staged.ds.x.data() + i * staged.ds.dim +
+                        static_cast<int64_t>(m) * staged.dsub,
+                    static_cast<size_t>(staged.dsub) * sizeof(float));
+      }
+      std::vector<float> cents;
+      const ovvsStatus status =
+          kmeans_fit_impl(*resources, sub.data(), staged.ds.n, staged.dsub,
+                          staged.pq_ks, 8, cents);
+      if (status != OVVS_STATUS_SUCCESS) return status;
+      std::memcpy(staged.codebooks.data() +
+                      static_cast<size_t>(m) * staged.pq_ks * staged.dsub,
+                  cents.data(), cents.size() * sizeof(float));
+    }
+    staged.codes.resize(static_cast<size_t>(staged.ds.n) *
+                        static_cast<size_t>(staged.pq_m));
+    pq_encode_rows(staged.ds.x.data(), staged.ds.n, staged.ds.dim, staged.pq_m,
+                   staged.pq_ks, staged.dsub, staged.codebooks.data(),
+                   staged.codes.data());
+    *ix = std::move(staged);
+    resources->last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }
 
 ovvsStatus ovvsCagraDetachDataset(ovvsCagraIndex_t index) {
@@ -971,38 +1129,57 @@ ovvsStatus ovvsCagraDestroy(ovvsCagraIndex_t index) {
 }
 
 ovvsStatus ovvsHnswFromCagra(ovvsResources_t res, ovvsCagraIndex_t cagra, ovvsHnswIndex_t* index) {
-  if (!res || !cagra || !index) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
+  *index = nullptr;
+  if (!res || !cagra) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* cg = reinterpret_cast<CagraIndex*>(cagra);
-  auto* hx = new HnswIndex();
-  hx->ds = cg->ds;
-  hx->degree = cg->degree;
-  hx->graph.assign(cg->graph.begin(), cg->graph.end());
-  hx->level.assign(static_cast<size_t>(cg->ds.n), 0);
-  auto rng = rng_from(3);
-  std::uniform_real_distribution<float> u(0.f, 1.f);
-  const float ml = 1.f / std::log(static_cast<float>(std::max(2, cg->degree)));
-  hx->max_level = 0;
-  hx->enter = 0;
-  for (int64_t i = 0; i < cg->ds.n; ++i) {
-    int lvl = static_cast<int>(-std::log(std::max(u(rng), 1e-6f)) * ml);
-    hx->level[static_cast<size_t>(i)] = lvl;
-    if (lvl > hx->max_level) {
-      hx->max_level = lvl;
-      hx->enter = i;
+  if (!cg->has_dataset || cg->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+  try {
+    auto hx = std::make_unique<HnswIndex>();
+    hx->ds = cg->ds;
+    hx->degree = cg->degree;
+    hx->graph.assign(cg->graph.begin(), cg->graph.end());
+    hx->level.assign(static_cast<size_t>(cg->ds.n), 0);
+    auto rng = rng_from(3);
+    std::uniform_real_distribution<float> u(0.f, 1.f);
+    const float ml = 1.f / std::log(static_cast<float>(std::max(2, cg->degree)));
+    hx->max_level = 0;
+    hx->enter = 0;
+    for (int64_t i = 0; i < cg->ds.n; ++i) {
+      int lvl = static_cast<int>(-std::log(std::max(u(rng), 1e-6f)) * ml);
+      hx->level[static_cast<size_t>(i)] = lvl;
+      if (lvl > hx->max_level) {
+        hx->max_level = lvl;
+        hx->enter = i;
+      }
     }
+    *index = reinterpret_cast<ovvsHnswIndex_t>(hx.release());
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
   }
-  *index = reinterpret_cast<ovvsHnswIndex_t>(hx);
-  return OVVS_STATUS_SUCCESS;
 }
 
 ovvsStatus ovvsHnswSearch(ovvsResources_t res, ovvsHnswIndex_t index, const float* queries, int64_t nq,
                           int64_t k, int32_t ef, int64_t* neighbors, float* distances) {
-  if (!res || !index || !queries || !neighbors || !distances) return OVVS_STATUS_INVALID_ARGUMENT;
-  auto* hx = reinterpret_cast<HnswIndex*>(index);
-  graph_search(*rd(res), hx->ds.x.data(), hx->ds.n, hx->ds.dim, hx->ds.metric, hx->graph.data(),
-               hx->degree, queries, nq, k, std::max(ef, static_cast<int32_t>(k)), 1, nullptr, neighbors,
-               distances);
-  return OVVS_STATUS_SUCCESS;
+  if (!res || !index || !queries || !neighbors || !distances || nq <= 0 || k <= 0 ||
+      k > std::numeric_limits<int32_t>::max()) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (nq > std::numeric_limits<int64_t>::max() / k) return OVVS_STATUS_SHAPE_MISMATCH;
+  try {
+    auto* hx = reinterpret_cast<HnswIndex*>(index);
+    return graph_search(*rd(res), hx->ds.x.data(), hx->ds.n, hx->ds.dim,
+                        hx->ds.metric, hx->graph.data(), hx->degree, queries, nq, k,
+                        std::max(ef, static_cast<int32_t>(k)), 1, nullptr, neighbors,
+                        distances);
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }
 
 namespace {
@@ -1135,37 +1312,79 @@ ovvsStatus ovvsHnswDestroy(ovvsHnswIndex_t index) {
 ovvsStatus ovvsVamanaBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, int32_t graph_degree, float alpha,
                            ovvsVamanaIndex_t* index) {
-  if (!res || !dataset || !index || n <= 1) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
+  *index = nullptr;
+  if (!res || !dataset || n <= 1 || dim <= 0 || graph_degree <= 0) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (n > std::numeric_limits<int32_t>::max() || dim > std::numeric_limits<int64_t>::max() / n) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  if (metric < OVVS_METRIC_L2_EXPANDED || metric > OVVS_METRIC_LP_UNEXPANDED) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  auto* resources = rd(res);
+  if (resources->policy == OVVS_POLICY_FORCE_NPU) {
+    ++resources->npu_fallbacks;
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if (resources->policy == OVVS_POLICY_FORCE_GPU) {
+    /* Robust prune remains a host stage until the Vamana GPU phase. */
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  }
   graph_degree = std::max(1, std::min(graph_degree, static_cast<int32_t>(n - 1)));
   if (alpha <= 0.f) alpha = 1.2f;
-  auto* ix = new VamanaIndex();
-  copy_ds(ix->ds, dataset, n, dim, metric);
-  ix->degree = graph_degree;
-  std::vector<int32_t> init;
-  nndescent_build(*rd(res), dataset, n, dim, metric, graph_degree * 2, 5, init);
-  ix->graph.assign(static_cast<size_t>(n) * static_cast<size_t>(graph_degree), -1);
-  for (int64_t i = 0; i < n; ++i) {
-    std::vector<int32_t> cand;
-    for (int32_t t = 0; t < graph_degree * 2; ++t) {
-      const int32_t nb = init[static_cast<size_t>(i * (graph_degree * 2) + t)];
-      if (nb >= 0) cand.push_back(nb);
+  try {
+    auto ix = std::make_unique<VamanaIndex>();
+    copy_ds(ix->ds, dataset, n, dim, metric);
+    ix->degree = graph_degree;
+    std::vector<int32_t> init;
+    const int32_t init_degree = static_cast<int32_t>(
+        std::min<int64_t>(n - 1, static_cast<int64_t>(graph_degree) * 2));
+    const ovvsStatus status =
+        nndescent_build(*rd(res), ix->ds.x.data(), n, dim, metric, init_degree, 5, init);
+    if (status != OVVS_STATUS_SUCCESS) return status;
+    ix->graph.assign(static_cast<size_t>(n) * static_cast<size_t>(graph_degree), -1);
+    for (int64_t i = 0; i < n; ++i) {
+      std::vector<int32_t> cand;
+      for (int32_t t = 0; t < init_degree; ++t) {
+        const int32_t nb = init[static_cast<size_t>(i * init_degree + t)];
+        if (nb >= 0) cand.push_back(nb);
+      }
+      robust_prune(ix->ds.x.data(), dim, metric, i, cand, graph_degree, alpha,
+                   ix->graph.data() + i * graph_degree);
     }
-    robust_prune(dataset, dim, metric, i, cand, graph_degree, alpha,
-                 ix->graph.data() + i * graph_degree);
+    resources->last_device = OVVS_DEVICE_CPU;
+    *index = reinterpret_cast<ovvsVamanaIndex_t>(ix.release());
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
   }
-  *index = reinterpret_cast<ovvsVamanaIndex_t>(ix);
-  return OVVS_STATUS_SUCCESS;
 }
 
 ovvsStatus ovvsVamanaSearch(ovvsResources_t res, ovvsVamanaIndex_t index, const float* queries,
                             int64_t nq, int64_t k, int32_t beam, const uint8_t* bitset,
                             int64_t* neighbors, float* distances) {
-  if (!res || !index || !queries || !neighbors || !distances) return OVVS_STATUS_INVALID_ARGUMENT;
-  auto* ix = reinterpret_cast<VamanaIndex*>(index);
-  const float* x = ix->x_view ? ix->x_view : ix->ds.x.data();
-  const int32_t* g = ix->graph_view ? ix->graph_view : ix->graph.data();
-  return prim_graph_walk(*rd(res), x, ix->ds.n, ix->ds.dim, ix->ds.metric, g, ix->degree, queries, nq, k,
-                         std::max(beam, static_cast<int32_t>(k)), 1, bitset, neighbors, distances);
+  if (!res || !index || !queries || !neighbors || !distances || nq <= 0 || k <= 0 ||
+      k > std::numeric_limits<int32_t>::max()) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (nq > std::numeric_limits<int64_t>::max() / k) return OVVS_STATUS_SHAPE_MISMATCH;
+  try {
+    auto* ix = reinterpret_cast<VamanaIndex*>(index);
+    const float* x = ix->x_view ? ix->x_view : ix->ds.x.data();
+    const int32_t* g = ix->graph_view ? ix->graph_view : ix->graph.data();
+    return prim_graph_walk(*rd(res), x, ix->ds.n, ix->ds.dim, ix->ds.metric, g,
+                           ix->degree, queries, nq, k,
+                           std::max(beam, static_cast<int32_t>(k)), 1, bitset,
+                           neighbors, distances);
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }
 
 constexpr uint32_t kVamanaMagic = 0x314D4156u; /* 'VAM1' */

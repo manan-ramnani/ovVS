@@ -213,6 +213,9 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out);
 bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n);
+ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
+                               int64_t dim, ovvsMetric metric, int32_t degree,
+                               int32_t iters, int32_t* graph);
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
@@ -224,6 +227,7 @@ bool npu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
 bool npu_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks, const uint8_t* codes,
                 int64_t ncodes, float* out);
 int32_t sycl_enabled();
+bool sycl_gpu_available();
 bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components);
 bool mkl_syev_smallest(float* a, int64_t n, int32_t ncomp, float* embed);
 
@@ -250,6 +254,9 @@ ovvsStatus prim_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, in
                          const float* y, int64_t ny, int64_t dim, float* out, float metric_arg);
 ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int32_t ks,
                        const uint8_t* codes, int64_t ncodes, float* out);
+ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
+                                 ovvsMetric metric, int32_t degree, int32_t iterations,
+                                 int32_t* graph);
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
@@ -331,8 +338,8 @@ ovvsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, 
                              const float* queries, int64_t nq, ovvsMetric metric, int64_t k,
                              const uint8_t* bitset, int64_t* neighbors, float* distances);
 
-void kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
-                     int32_t iters, std::vector<float>& centroids);
+ovvsStatus kmeans_fit_impl(ResourcesData& r, const float* x, int64_t n, int64_t dim, int32_t k,
+                           int32_t iters, std::vector<float>& centroids);
 
 int64_t brute_force_dim(ovvsBruteForceIndex_t index);
 

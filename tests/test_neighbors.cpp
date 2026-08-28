@@ -1,6 +1,7 @@
 #include "test_harness.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -73,6 +74,40 @@ static void brute_oracle(const float* data, int64_t n, int64_t dim, const float*
       dist[qi * k + t] = sc[static_cast<size_t>(order[static_cast<size_t>(t)])];
     }
   }
+}
+
+static float sampled_graph_l2_overlap(const float* data, int64_t n, int64_t dim,
+                                      const int32_t* graph, int32_t degree,
+                                      int32_t sample_rows) {
+  int64_t hits = 0;
+  for (int32_t sample = 0; sample < sample_rows; ++sample) {
+    const int64_t row = (static_cast<int64_t>(sample) * 104729 + 17) % n;
+    std::vector<int64_t> order(static_cast<size_t>(n));
+    std::iota(order.begin(), order.end(), 0);
+    std::vector<float> scores(static_cast<size_t>(n));
+    const float* query = data + row * dim;
+    for (int64_t candidate = 0; candidate < n; ++candidate) {
+      float score = 0.f;
+      for (int64_t d = 0; d < dim; ++d) {
+        const float delta = query[d] - data[candidate * dim + d];
+        score += delta * delta;
+      }
+      scores[static_cast<size_t>(candidate)] = candidate == row ? std::numeric_limits<float>::max()
+                                                                : score;
+    }
+    std::partial_sort(order.begin(), order.begin() + degree, order.end(),
+                      [&](int64_t a, int64_t b) {
+                        if (scores[static_cast<size_t>(a)] != scores[static_cast<size_t>(b)]) {
+                          return scores[static_cast<size_t>(a)] < scores[static_cast<size_t>(b)];
+                        }
+                        return a < b;
+                      });
+    std::set<int64_t> truth(order.begin(), order.begin() + degree);
+    for (int32_t edge = 0; edge < degree; ++edge) {
+      if (truth.count(graph[row * degree + edge])) ++hits;
+    }
+  }
+  return static_cast<float>(hits) / static_cast<float>(sample_rows * degree);
 }
 
 OVVS_TEST(brute_force_recall_one) {
@@ -469,21 +504,237 @@ OVVS_TEST(nndescent_graph_overlap) {
   int32_t d = 0;
   expect_status(ovvsNnDescentNeighbors(g, &ids, &nn, &d), "nndn");
   expect(nn == n && d == deg, "nnd shape");
-  std::vector<int64_t> truth(static_cast<size_t>(n * deg));
-  std::vector<float> td(static_cast<size_t>(n * deg));
-  expect_status(ovvsAllNeighbors(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, deg, truth.data(),
-                                 td.data()),
-                "alln");
-  int hit = 0;
-  for (int64_t i = 0; i < n; ++i) {
-    std::set<int64_t> tset(truth.begin() + i * deg, truth.begin() + (i + 1) * deg);
-    for (int32_t t = 0; t < deg; ++t) {
-      if (tset.count(ids[i * deg + t])) ++hit;
-    }
-  }
-  const float ov = static_cast<float>(hit) / static_cast<float>(n * deg);
-  expect(ov >= 0.6f, "nnd overlap " + std::to_string(ov));
+  const float overlap = sampled_graph_l2_overlap(data.data(), n, dim, ids, deg,
+                                                  static_cast<int32_t>(n));
+  expect(overlap == 1.f, "small exact NN-Descent overlap " + std::to_string(overlap));
   ovvsNnDescentDestroy(g);
+}
+
+OVVS_TEST(nndescent_gpu_n_over_4096) {
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "NN-Descent GPU availability");
+  if (!gpu) skip_test("GPU device unavailable");
+
+  const int64_t n = 4097, dim = 8;
+  const int32_t degree = 8, iterations = 6;
+  auto data = make_data(n, dim, 302);
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  ovvsNnDescentGraph_t graph = nullptr;
+  const auto build_started = std::chrono::steady_clock::now();
+  expect_status(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                                   degree, iterations, &graph),
+                "large GPU NN-Descent build");
+  const double build_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - build_started)
+                              .count();
+  ovvsDevice last = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "large NN-Descent last device");
+  expect(last == OVVS_DEVICE_GPU, "large NN-Descent must run on GPU");
+
+  const int32_t* ids = nullptr;
+  int64_t graph_n = 0;
+  int32_t graph_degree = 0;
+  expect_status(ovvsNnDescentNeighbors(graph, &ids, &graph_n, &graph_degree),
+                "large NN-Descent neighbors");
+  expect(graph_n == n && graph_degree == degree, "large NN-Descent shape");
+  for (int64_t row = 0; row < n; ++row) {
+    std::set<int32_t> unique;
+    for (int32_t edge = 0; edge < degree; ++edge) {
+      const int32_t id = ids[row * degree + edge];
+      expect(id >= 0 && static_cast<int64_t>(id) < n, "large NN-Descent ID range");
+      expect(id != row, "large NN-Descent self edge");
+      unique.insert(id);
+    }
+    expect(static_cast<int32_t>(unique.size()) == degree, "large NN-Descent unique row");
+  }
+  const float overlap = sampled_graph_l2_overlap(data.data(), n, dim, ids, degree, 64);
+  std::printf("    nndescent_gpu_n_over_4096 build_ms=%.3f sampled_overlap=%.4f\n", build_ms,
+              static_cast<double>(overlap));
+  expect(overlap >= 0.60f, "large NN-Descent sampled exact overlap " + std::to_string(overlap));
+
+  std::vector<int32_t> first(ids, ids + n * degree);
+  ovvsNnDescentDestroy(graph);
+  graph = nullptr;
+  expect_status(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                                   degree, iterations, &graph),
+                "deterministic GPU NN-Descent rebuild");
+  expect_status(ovvsNnDescentNeighbors(graph, &ids, &graph_n, &graph_degree),
+                "deterministic NN-Descent neighbors");
+  expect(std::equal(first.begin(), first.end(), ids), "GPU NN-Descent deterministic graph");
+  ovvsNnDescentDestroy(graph);
+}
+
+OVVS_TEST(nndescent_gpu_bounded_scale) {
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "scale NN-Descent GPU availability");
+  if (!gpu) skip_test("GPU device unavailable");
+
+  const int64_t n = 16384, dim = 16;
+  const int32_t degree = 16, iterations = 4;
+  auto data = make_data(n, dim, 306);
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  ovvsNnDescentGraph_t graph = nullptr;
+  const auto build_started = std::chrono::steady_clock::now();
+  expect_status(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                                   degree, iterations, &graph),
+                "bounded-scale GPU NN-Descent build");
+  const double build_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - build_started)
+                              .count();
+  ovvsDevice last = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "scale NN-Descent last device");
+  expect(last == OVVS_DEVICE_GPU, "bounded-scale NN-Descent must run on GPU");
+
+  const int32_t* ids = nullptr;
+  int64_t graph_n = 0;
+  int32_t graph_degree = 0;
+  expect_status(ovvsNnDescentNeighbors(graph, &ids, &graph_n, &graph_degree),
+                "bounded-scale NN-Descent neighbors");
+  expect(graph_n == n && graph_degree == degree, "bounded-scale NN-Descent shape");
+  for (int64_t row = 0; row < n; ++row) {
+    std::set<int32_t> unique;
+    for (int32_t edge = 0; edge < degree; ++edge) {
+      const int32_t id = ids[row * degree + edge];
+      expect(id >= 0 && static_cast<int64_t>(id) < n, "bounded-scale NN-Descent ID range");
+      expect(id != row, "bounded-scale NN-Descent self edge");
+      unique.insert(id);
+    }
+    expect(static_cast<int32_t>(unique.size()) == degree,
+           "bounded-scale NN-Descent unique row");
+  }
+  const float overlap = sampled_graph_l2_overlap(data.data(), n, dim, ids, degree, 32);
+  std::printf("    nndescent_gpu_bounded_scale build_ms=%.3f sampled_overlap=%.4f\n", build_ms,
+              static_cast<double>(overlap));
+  expect(overlap >= 0.25f,
+         "bounded-scale NN-Descent sampled exact overlap " + std::to_string(overlap));
+  ovvsNnDescentDestroy(graph);
+}
+
+OVVS_TEST(nndescent_large_forced_policy_contract) {
+  Res res;
+  const int64_t n = 4097, dim = 2;
+  auto data = make_data(n, dim, 303);
+  auto a = make_data(4, 4, 304);
+  auto b = make_data(4, 4, 305);
+  std::vector<float> c(16);
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  expect_status(ovvsGemm(res.r, a.data(), b.data(), c.data(), 4, 4, 4, 1),
+                "stamp CPU attribution");
+  ovvsDevice last = OVVS_DEVICE_AUTO;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "prior NN-Descent attribution");
+  expect(last == OVVS_DEVICE_CPU, "CPU stamp");
+  int32_t fallback_count = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallback_count), "NN-Descent fallback count");
+
+  ovvsNnDescentGraph_t graph = reinterpret_cast<ovvsNnDescentGraph_t>(uintptr_t{1});
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  expect(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_LP_UNEXPANDED, 4, 1,
+                            &graph) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "unsupported FORCE_GPU NN-Descent must be unavailable");
+  expect(graph == nullptr, "failed FORCE_GPU NN-Descent must not publish a graph");
+  int32_t after_gpu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_gpu), "NN-Descent count after GPU");
+  expect(after_gpu == fallback_count, "FORCE_GPU NN-Descent must not increment NPU fallback");
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "NN-Descent last after GPU failure");
+  expect(last == OVVS_DEVICE_CPU, "failed FORCE_GPU NN-Descent preserves last device");
+
+  ovvsCagraIndex_t cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8,
+                        &cagra) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "FORCE_GPU CAGRA build must reject its host prune stage");
+  expect(cagra == nullptr, "failed FORCE_GPU CAGRA build must not publish an index");
+
+  graph = reinterpret_cast<ovvsNnDescentGraph_t>(uintptr_t{1});
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  expect(ovvsNnDescentBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 1,
+                            &graph) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "FORCE_NPU NN-Descent must be unavailable");
+  expect(graph == nullptr, "failed FORCE_NPU NN-Descent must not publish a graph");
+  int32_t after_npu = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu), "NN-Descent count after NPU");
+  expect(after_npu == fallback_count + 1, "FORCE_NPU NN-Descent increments fallback once");
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "NN-Descent last after NPU failure");
+  expect(last == OVVS_DEVICE_CPU, "failed FORCE_NPU NN-Descent preserves last device");
+
+  cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8, &cagra) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA must propagate forced NN-Descent failure");
+  expect(cagra == nullptr, "failed CAGRA build must not publish an index");
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu), "CAGRA propagated fallback count");
+  expect(after_npu == fallback_count + 2, "CAGRA forced NPU failure increments once");
+
+  cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuildEx(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8,
+                          OVVS_CAGRA_BUILD_ITERATIVE, &cagra) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "iterative CAGRA must propagate forced NN-Descent failure");
+  expect(cagra == nullptr, "failed iterative CAGRA build must not publish an index");
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu),
+                "iterative CAGRA propagated fallback count");
+  expect(after_npu == fallback_count + 3,
+         "iterative CAGRA forced NPU failure increments once");
+
+  ovvsVamanaIndex_t vamana = reinterpret_cast<ovvsVamanaIndex_t>(uintptr_t{1});
+  expect(ovvsVamanaBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4,
+                         1.2f, &vamana) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "Vamana must propagate forced NN-Descent failure");
+  expect(vamana == nullptr, "failed Vamana build must not publish an index");
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu),
+                "Vamana propagated fallback count");
+  expect(after_npu == fallback_count + 4,
+         "Vamana forced NPU failure increments once");
+
+  cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuildEx(res.r, data.data(), n, dim, static_cast<ovvsMetric>(99), 4,
+                          8, OVVS_CAGRA_BUILD_NN_DESCENT, &cagra) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "CAGRA invalid metric must reject");
+  expect(cagra == nullptr, "invalid-metric CAGRA must not publish an index");
+  cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuildEx(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4,
+                          8, static_cast<ovvsCagraBuildAlgo>(99), &cagra) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "CAGRA invalid build algorithm must reject");
+  expect(cagra == nullptr, "invalid-algorithm CAGRA must not publish an index");
+  vamana = reinterpret_cast<ovvsVamanaIndex_t>(uintptr_t{1});
+  expect(ovvsVamanaBuild(res.r, data.data(), n, dim, static_cast<ovvsMetric>(99), 4,
+                         1.2f, &vamana) == OVVS_STATUS_INVALID_ARGUMENT,
+         "Vamana invalid metric must reject");
+  expect(vamana == nullptr, "invalid-metric Vamana must not publish an index");
+
+  graph = reinterpret_cast<ovvsNnDescentGraph_t>(uintptr_t{1});
+  expect(ovvsNnDescentBuild(res.r, data.data(),
+                            static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1,
+                            dim, OVVS_METRIC_L2_EXPANDED, 4, 1, &graph) ==
+             OVVS_STATUS_SHAPE_MISMATCH,
+         "NN-Descent int32 graph ID overflow must reject before reading data");
+  expect(graph == nullptr, "shape rejection must not publish a graph");
+
+  graph = reinterpret_cast<ovvsNnDescentGraph_t>(uintptr_t{1});
+  expect(ovvsNnDescentBuild(nullptr, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                            4, 1, &graph) == OVVS_STATUS_INVALID_ARGUMENT,
+         "NN-Descent invalid resources must reject");
+  expect(graph == nullptr, "invalid NN-Descent build must clear output");
+  cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuild(nullptr, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8,
+                        &cagra) == OVVS_STATUS_INVALID_ARGUMENT,
+         "CAGRA invalid resources must reject");
+  expect(cagra == nullptr, "invalid CAGRA build must clear output");
+  vamana = reinterpret_cast<ovvsVamanaIndex_t>(uintptr_t{1});
+  expect(ovvsVamanaBuild(nullptr, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4,
+                         1.2f, &vamana) == OVVS_STATUS_INVALID_ARGUMENT,
+         "Vamana invalid resources must reject");
+  expect(vamana == nullptr, "invalid Vamana build must clear output");
+  ovvsIvfPqIndex_t ivfpq = reinterpret_cast<ovvsIvfPqIndex_t>(uintptr_t{1});
+  expect(ovvsIvfPqBuild(res.r, data.data(), 4, dim, static_cast<ovvsMetric>(99), 2,
+                        1, 8, &ivfpq) == OVVS_STATUS_INVALID_ARGUMENT,
+         "IVF-PQ invalid metric must reject");
+  expect(ivfpq == nullptr, "invalid-metric IVF-PQ must clear output");
 }
 
 OVVS_TEST(cagra_build_search_filter_serialize) {
@@ -539,6 +790,11 @@ OVVS_TEST(hnsw_from_cagra) {
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());
   expect(recall_at_k(got.data(), truth.data(), nq, k) >= 0.6f, "hnsw recall");
   ovvsHnswDestroy(hx);
+  expect_status(ovvsCagraDetachDataset(cg), "detach before HNSW conversion rejection");
+  hx = reinterpret_cast<ovvsHnswIndex_t>(uintptr_t{1});
+  expect(ovvsHnswFromCagra(res.r, cg, &hx) == OVVS_STATUS_INVALID_ARGUMENT,
+         "HNSW conversion must reject detached CAGRA dataset");
+  expect(hx == nullptr, "failed HNSW conversion must clear output");
   ovvsCagraDestroy(cg);
 }
 
@@ -844,6 +1100,31 @@ OVVS_TEST(cagra_q_forced_policy_does_not_host_fallback) {
     expect(preserved_device == OVVS_DEVICE_GPU, "GPU stamp must use GPU");
   }
 
+  int32_t quantize_fallbacks = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &quantize_fallbacks),
+                "CAGRA-Q quantize fallback baseline");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+  expect(ovvsCagraQuantize(res.r, ix, 4, 8) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA-Q FORCE_GPU quantize must reject host stages");
+  int32_t after_gpu_quantize = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_gpu_quantize),
+                "CAGRA-Q quantize count after FORCE_GPU");
+  expect(after_gpu_quantize == quantize_fallbacks,
+         "FORCE_GPU quantize must not increment NPU fallback count");
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
+  expect(ovvsCagraQuantize(res.r, ix, 4, 8) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA-Q FORCE_NPU quantize must reject host stages");
+  int32_t after_npu_quantize = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu_quantize),
+                "CAGRA-Q quantize count after FORCE_NPU");
+  expect(after_npu_quantize == quantize_fallbacks + 1,
+         "FORCE_NPU quantize must increment fallback once");
+  ovvsDevice after_quantize_device = OVVS_DEVICE_AUTO;
+  expect_status(ovvsResourcesLastDevice(res.r, &after_quantize_device),
+                "CAGRA-Q quantize forced failure last device");
+  expect(after_quantize_device == preserved_device,
+         "failed CAGRA-Q quantize must preserve prior attribution");
+
   int32_t fallback_count = 0;
   expect_status(ovvsResourcesNpuFallbacks(res.r, &fallback_count), "CAGRA-Q fallback count");
   std::fill(neighbors.begin(), neighbors.end(), -77);
@@ -889,23 +1170,25 @@ OVVS_TEST(cagra_q_forced_policy_does_not_host_fallback) {
 }
 
 OVVS_TEST(cagra_sycl_walk_n_over_4096) {
-  if (!ovvsSyclEnabled()) return;
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
   Res res;
   int32_t gpu = 0;
   ovvsResourcesGpuAvailable(res.r, &gpu);
-  if (!gpu) return;
+  if (!gpu) skip_test("GPU device unavailable");
   /* n>4096: old kernel skipped expanding id>=4096 and overflowed slm at search_width>64. */
   const int64_t n = 4200, dim = 8, nq = 4, k = 5;
   auto data = make_data(n, dim, 442);
   auto q = make_data(nq, dim, 443);
-  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU);
+  ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO);
   ovvsCagraIndex_t ix = nullptr;
   expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 8, 16, &ix), "b");
+  ovvsDevice last = OVVS_DEVICE_AUTO;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "sycl n>4096 build device");
+  expect(last == OVVS_DEVICE_CPU, "mixed CAGRA build must report its final host prune stage");
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
   std::vector<int64_t> got(static_cast<size_t>(nq * k)), truth(static_cast<size_t>(nq * k));
   std::vector<float> gd(static_cast<size_t>(nq * k)), td(static_cast<size_t>(nq * k));
   expect_status(ovvsCagraSearch(res.r, ix, q.data(), nq, k, 32, 80, nullptr, got.data(), gd.data()), "s");
-  ovvsDevice last = OVVS_DEVICE_CPU;
   ovvsResourcesLastDevice(res.r, &last);
   expect(last == OVVS_DEVICE_GPU, "sycl n>4096 last_device");
   brute_oracle(data.data(), n, dim, q.data(), nq, k, truth.data(), td.data());

@@ -15,7 +15,7 @@ How to use: append dated entries; check items off in **Open items** (do not dele
 
 ovVS **0.2.0** is a cuVS-shaped library with real NPU (OpenVINO) and iGPU (SYCL) primitive backends and honest Arrow Lake bakeoffs. It is **not** a hardware-accelerated cuVS equivalent.
 
-The C ABI covers brute-force, IVF-Flat/PQ/RaBitQ, CAGRA, NN-Descent, Vamana, ScaNN, HNSW-from-CAGRA, all-neighbors, filters, dynamic batcher, k-means, SLINK, spectral, PQ/SQ/binary, PCA, pairwise, k-selection. Python ctypes + NumPy/DLPack ingest exist. Toy tests pass (typically **n=24–80**). The published competitor bench is SIFT **n=2000**, not SIFT1M.
+The C ABI covers brute-force, IVF-Flat/PQ/RaBitQ, CAGRA, NN-Descent, Vamana, ScaNN, HNSW-from-CAGRA, all-neighbors, filters, dynamic batcher, k-means, SLINK, spectral, PQ/SQ/binary, PCA, pairwise, k-selection. Python ctypes + NumPy/DLPack ingest exist. Most algorithm tests remain toy-sized (**n=24–80**); bounded NN-Descent GPU regressions now cover 4,097 and 16,384 rows. The published competitor bench is SIFT **n=2000**, not SIFT1M.
 
 On Arrow Lake 265K AUTO search is still a **CPU oneMKL** library. The two remaining hardware bets (iGPU CAGRA walk, NPU PQ ADC) are wired but do not beat FAISS-CPU / hnswlib. Lunar Lake (plan v1.0 SKU) has no tables.
 
@@ -45,7 +45,7 @@ Priority: P0 = objective is blocked without it; P1 = v1.0 quality; P2 = v1.1 / p
 | B2 | CAGRA search kernel T13.4: one **work-group** per query, SLM itopk, bounded hashmap (not `Seen[nq×n]`), graph-aware seeds, subgroup distance | T13.4, then T13.5–T13.6 | **PARTIAL:** work-group/query, cooperative distance, SLM candidates, and a bounded visited hash are implemented. Hash seeds, leader-serial selection/sort, and per-search dataset/graph copies remain. The 2K smoke keeps recall but is roughly 10× slower than hnswlib at `itopk=32/search_width=1` and farther behind at `64/2`. SIFT1M recall gate remains blocked by B5. |
 | B3 | IVF-PQ search rewrite: persistent list codes, ADC tables batched over `nq×nprobe`, iGPU variable-length scan; padded-list NPU bakeoff | T10.2–T10.4, T9.3 | `prim_pq_adc` on NPU is real. `ovvsIvfPqSearch` rebuilds residual + tables + packed codes **on the host per query per list**. That is why FAISS is ~6× faster on 2k points. |
 | B4 | IVF-RaBitQ packed binary/INT GEMM (or SHAVE popcount), not scalar `rabitq_ip` | T11 | Plan: this is the NPU-native ANN, not a consolation prize. |
-| B5 | NN-Descent iGPU local-join + bloom for n≫4096 | T12 | n≤4096 is exact kNN via `prim_pairwise`. Else a host nested loop. CAGRA IVF-PQ init uses `nlist = min(8, n/4)` — will not build 1e6 graphs. |
+| B5 | NN-Descent iGPU local-join + bloom for n≫4096 | T12 | **PARTIAL:** n≤4096 remains exact kNN; larger L2/L2-sqrt/IP/cosine builds now use a deterministic, double-buffered SYCL sampled local join with SLM candidates/Bloom and honest forced-policy failures. AUTO C/Python CAGRA uses this initializer, then finishes with host prune; full FORCE_GPU CAGRA build therefore rejects until T13.3. SIFT1M quality/build evidence and convergence/new-edge scheduling remain open. The explicit IVF-PQ initializer independently retains its `nlist≤8` per-row-search scale defect. |
 | B6 | Wire `OVVS_POLICY_HETERO` as stage overlap (NPU ADC ∥ iGPU walk), not a third GEMM backend | T20, `docs/hw-split.md` | Currently equals AUTO. |
 
 ### P1 — v1.0 quality and SKU coverage
@@ -139,6 +139,18 @@ The iGPU CAGRA walk now assigns one SYCL work-group per query, cooperatively red
 Bounded SIFT-prefix evidence (`n=2000`, `nq=32`, `k=10`) is a correctness check only: FORCE_GPU recall@10 was 0.990625 at `itopk=32/search_width=1` and 1.0 at `64/2`, versus hnswlib 0.99375/1.0. Median QPS was about 7.4K/2.9K versus 71.7K/49.2K, and the batch-size-one lane exposed the cost of copying dataset/graph buffers per search. B2 remains partial; graph-aware seeds, parallel candidate selection, persistent index buffers, B5 scale, and the SIFT1M gate are open. Reproducible details are in `tables/arrow-lake/bench-recall-qps.md`.
 
 The B1 failure was traced separately to Arrow Lake NPU FP16-range behavior behind f32 tensors: large SIFT dot products clipped near 65,504 and TopK returned `+inf`. NPU GEMM/TopK now reject unsafe/non-finite ranges and validate outputs, so forced execution fails closed instead of returning corrupt success. Range-scaled execution remains future work.
+
+### 2026-08-28 — B5 bounded NN-Descent iGPU checkpoint
+
+For `n>4096`, NN-Descent now dispatches through the mixer to a synchronous iGPU kernel: one work-group owns each vertex, initialization is deterministic and unique, refinement reads/writes double-buffered graphs, dimensions reduce cooperatively, and bounded current/two-hop/exploration candidates use SLM plus a per-iteration Bloom-assisted duplicate filter. Transient graph storage is `O(n×degree)`; the kernel never allocates an `n²` score matrix. L2, L2-sqrt, inner product, and cosine are supported. FORCE_GPU either completes the kernel or returns unavailable, FORCE_NPU is unavailable and counted once, and adaptive execution does not silently enter the large host loop after an advertised GPU path fails.
+
+The builder lifecycle now propagates primitive/device failures through standalone NN-Descent, default/explicit CAGRA initialization, IVF-PQ training/search, and Vamana; failed C ABI builds do not publish partial handles. GPU OOM and runtime failures remain distinct statuses, queued kernels drain before device storage is freed, and invalid metric/build enums reject. The standalone NN-Descent result retains only host graph IDs, not a duplicate dataset. The requested iteration count is honored instead of being silently raised to ten. The n≤4096 exact path now has an independent 1.0-overlap regression.
+
+Bounded Arrow Lake evidence is deliberately below the product gate. Isolated-process medians were 107.1 ms for `n=4097, dim=8, degree=8, iterations=6` (5 runs; 106.8–1079.5 ms including first-use SYCL initialization) and 832.6 ms for `n=16384, dim=16, degree=16, iterations=4` (21 runs; 826.7–1333.2 ms). Exact-neighbor overlap remained 0.7266 on 64 sampled rows and 0.2832 on 32 rows. Both had valid unique non-self rows and GPU attribution; the 4,097-row graph was deterministic across repeats. AUTO CAGRA build plus FORCE_GPU search also passes at `n=4200`; the full build reports its final CPU prune and FORCE_GPU build rejects until T13.3. Details: `tables/arrow-lake/nndescent-b5.md`.
+
+B5 remains partial. The SIFT1M downstream-CAGRA comparison, sample/iteration tuning, new-edge/convergence scheduling, peak-RSS evidence, and T13.3 GPU prune are open. GPU scale regressions are isolated CTest processes with 45/120-second timeouts and an Intel-GPU resource lock. The B1 harness still forces CPU for index construction and retains the explicit `--allow-unscalable-cagra` gate; neither is removed until a full measured build succeeds.
+
+Checkpoint verification: 63/63 native tests, 6/6 CTest lanes, 19/19 benchmark-harness tests, and 6/6 SIFT-fetcher tests. Device-absent scale lanes report CTest SKIP rather than PASS.
 
 ### 2026-08-28 — Deep assessment vs cuVS-equivalent objective
 

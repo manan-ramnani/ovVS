@@ -63,6 +63,11 @@ class ScopedDeviceUsm {
   ~ScopedDeviceUsm() noexcept {
     if (!ptr_) return;
     try {
+      q_->wait_and_throw();
+    } catch (...) {
+      /* Waiting still drains submitted work before storage is released. */
+    }
+    try {
       sycl::free(ptr_, *q_);
     } catch (...) {
     }
@@ -561,9 +566,369 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
 
 int32_t sycl_enabled() {
 #if defined(OVVS_WITH_SYCL)
-  return 1;
+  return sycl_gpu_available() ? 1 : 0;
 #else
   return 0;
+#endif
+}
+
+bool sycl_gpu_available() {
+#if defined(OVVS_WITH_SYCL)
+  try {
+    return gpu_queue().get_device().is_gpu();
+  } catch (...) {
+    return false;
+  }
+#else
+  return false;
+#endif
+}
+
+ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
+                               int64_t dim, ovvsMetric metric, int32_t degree,
+                               int32_t iters, int32_t* graph) {
+#if defined(OVVS_WITH_SYCL)
+  if (!sycl_gpu_available()) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  if (!dataset || !graph || n <= 1 || dim <= 0 || degree <= 0 || iters <= 0) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (n > std::numeric_limits<int32_t>::max() || static_cast<int64_t>(degree) >= n) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  if (metric != OVVS_METRIC_L2_EXPANDED && metric != OVVS_METRIC_L2_SQRT_EXPANDED &&
+      metric != OVVS_METRIC_INNER_PRODUCT && metric != OVVS_METRIC_COSINE_EXPANDED) {
+    return OVVS_STATUS_UNSUPPORTED;
+  }
+
+  try {
+    auto& q = gpu_queue();
+    const auto device = q.get_device();
+    const size_t N = static_cast<size_t>(n);
+    const size_t D = static_cast<size_t>(dim);
+    const size_t DEG = static_cast<size_t>(degree);
+    const size_t neighbor_samples = std::min<size_t>(DEG, 8u);
+    const size_t exploration_count = std::min<size_t>(32u, std::max<size_t>(8u, DEG / 2u));
+    const int met = static_cast<int>(metric);
+    const int64_t iteration_count = static_cast<int64_t>(iters);
+
+    size_t dataset_count = 0;
+    size_t graph_count = 0;
+    size_t sampled_count = 0;
+    if (!checked_product(N, D, dataset_count) || !checked_product(N, DEG, graph_count) ||
+        !checked_product(DEG, neighbor_samples, sampled_count)) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    if (sampled_count > std::numeric_limits<size_t>::max() - DEG ||
+        sampled_count + DEG > std::numeric_limits<size_t>::max() - exploration_count) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    const size_t candidate_capacity = DEG + sampled_count + exploration_count;
+    if (candidate_capacity > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+
+    size_t dataset_bytes = 0;
+    size_t graph_bytes = 0;
+    if (!checked_product(dataset_count, sizeof(float), dataset_bytes) ||
+        !checked_product(graph_count, sizeof(int32_t), graph_bytes)) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    const bool dataset_direct = gpu_pointer_accessible(q, dataset);
+    const size_t max_alloc = device.get_info<sycl::info::device::max_mem_alloc_size>();
+    if ((!dataset_direct && dataset_bytes > max_alloc) || graph_bytes > max_alloc) {
+      return OVVS_STATUS_OOM;
+    }
+
+    size_t device_bytes = dataset_direct ? 0u : dataset_bytes;
+    if (graph_bytes > (std::numeric_limits<size_t>::max() - device_bytes) / 2u) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    device_bytes += graph_bytes * 2u;
+    const uint64_t global_mem = device.get_info<sycl::info::device::global_mem_size>();
+    if (static_cast<uint64_t>(device_bytes) > global_mem) return OVVS_STATUS_OOM;
+
+    size_t requested_bloom_bits = 0;
+    if (!checked_product(candidate_capacity, 8u, requested_bloom_bits)) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    const size_t bloom_bits = next_power_of_two(std::max<size_t>(256u, requested_bloom_bits));
+    if (bloom_bits == 0 || (bloom_bits & 31u) != 0) return OVVS_STATUS_SHAPE_MISMATCH;
+    const size_t bloom_words = bloom_bits / 32u;
+
+    size_t candidate_bytes = 0;
+    size_t bloom_bytes = 0;
+    if (!checked_product(candidate_capacity, sizeof(int32_t) + sizeof(float), candidate_bytes) ||
+        !checked_product(bloom_words, sizeof(uint32_t), bloom_bytes) ||
+        bloom_bytes > std::numeric_limits<size_t>::max() - 4u * sizeof(int32_t) ||
+        candidate_bytes >
+            std::numeric_limits<size_t>::max() - bloom_bytes - 4u * sizeof(int32_t)) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    const size_t local_bytes = candidate_bytes + bloom_bytes + 4u * sizeof(int32_t);
+    const size_t local_mem = device.get_info<sycl::info::device::local_mem_size>();
+    if (local_bytes > local_mem) return OVVS_STATUS_OOM;
+
+    const size_t max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>();
+    if (max_work_group_size == 0) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+    size_t work_group_size = 1;
+    while (work_group_size < 128u && work_group_size <= max_work_group_size / 2u) {
+      work_group_size <<= 1u;
+    }
+    constexpr size_t kVertexGroupsPerLaunch = 65536u;
+
+    ScopedDeviceUsm<float> dataset_copy(q, dataset_direct ? 0u : dataset_count);
+    ScopedDeviceUsm<int32_t> graph_a(q, graph_count);
+    ScopedDeviceUsm<int32_t> graph_b(q, graph_count);
+    const float* DS = dataset_direct ? dataset : dataset_copy.get();
+    if (!dataset_direct) q.memcpy(dataset_copy.get(), dataset, dataset_bytes);
+    q.wait_and_throw();
+
+    int32_t* current = graph_a.get();
+    int32_t* next = graph_b.get();
+
+    for (size_t vertex_offset = 0; vertex_offset < N; vertex_offset += kVertexGroupsPerLaunch) {
+      const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
+      size_t global_size = 0;
+      if (!checked_product(launch_vertices, work_group_size, global_size)) {
+        return OVVS_STATUS_SHAPE_MISMATCH;
+      }
+      q.submit([&](sycl::handler& h) {
+         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
+                                         sycl::range<1>(work_group_size)),
+                        [=](sycl::nd_item<1> item) {
+           const size_t lid = item.get_local_linear_id();
+           const size_t vertex = vertex_offset + item.get_group_linear_id();
+           const uint64_t modulus = static_cast<uint64_t>(N - 1u);
+
+           auto mix32 = [](uint32_t value) {
+             value ^= value >> 16u;
+             value *= 0x7feb352du;
+             value ^= value >> 15u;
+             value *= 0x846ca68bu;
+             value ^= value >> 16u;
+             return value;
+           };
+           auto gcd64 = [](uint64_t a, uint64_t b) {
+             while (b != 0u) {
+               const uint64_t remainder = a % b;
+               a = b;
+               b = remainder;
+             }
+             return a;
+           };
+
+           const uint32_t seed = mix32(static_cast<uint32_t>(vertex) ^ 0x9e3779b9u);
+           const uint64_t start = static_cast<uint64_t>(seed) % modulus;
+           uint64_t step = 1u + static_cast<uint64_t>(mix32(seed ^ 0xa511e9b3u)) % modulus;
+           while (gcd64(step, modulus) != 1u) step = step == modulus ? 1u : step + 1u;
+
+           for (size_t edge = lid; edge < DEG; edge += work_group_size) {
+             const uint64_t permuted =
+                 (start + static_cast<uint64_t>(edge) * step) % modulus;
+             const size_t id = (vertex + 1u + static_cast<size_t>(permuted)) % N;
+             current[vertex * DEG + edge] = static_cast<int32_t>(id);
+           }
+         });
+       });
+    }
+    q.wait_and_throw();
+
+    for (int64_t iteration = 0; iteration < iteration_count; ++iteration) {
+      for (size_t vertex_offset = 0; vertex_offset < N; vertex_offset += kVertexGroupsPerLaunch) {
+        const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
+        size_t global_size = 0;
+        if (!checked_product(launch_vertices, work_group_size, global_size)) {
+          return OVVS_STATUS_SHAPE_MISMATCH;
+        }
+        q.submit([&](sycl::handler& h) {
+           sycl::local_accessor<int32_t, 1> candidate_ids(sycl::range<1>(candidate_capacity), h);
+           sycl::local_accessor<float, 1> candidate_distances(sycl::range<1>(candidate_capacity), h);
+           sycl::local_accessor<uint32_t, 1> seen_edges(sycl::range<1>(bloom_words), h);
+           sycl::local_accessor<int32_t, 1> state(sycl::range<1>(4), h);
+           h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
+                                           sycl::range<1>(work_group_size)),
+                          [=](sycl::nd_item<1> item) {
+             const size_t lid = item.get_local_linear_id();
+             const size_t vertex = vertex_offset + item.get_group_linear_id();
+             auto group = item.get_group();
+
+             auto mix32 = [](uint32_t value) {
+               value ^= value >> 16u;
+               value *= 0x7feb352du;
+               value ^= value >> 15u;
+               value *= 0x846ca68bu;
+               value ^= value >> 16u;
+               return value;
+             };
+
+             for (size_t word = lid; word < bloom_words; word += work_group_size) {
+               seen_edges[word] = 0u;
+             }
+             for (size_t slot = lid; slot < candidate_capacity; slot += work_group_size) {
+               candidate_ids[slot] = -1;
+               candidate_distances[slot] = std::numeric_limits<float>::max();
+             }
+             if (lid == 0) state[0] = 0;
+             item.barrier(sycl::access::fence_space::local_space);
+
+             auto cooperative_distance = [&](int32_t id) {
+               float l2 = 0.f;
+               float ip = 0.f;
+               float nx = 0.f;
+               float ny = 0.f;
+               const bool needs_ip = met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT) ||
+                                     met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED);
+               for (size_t d = lid; d < D; d += work_group_size) {
+                 const float a = DS[vertex * D + d];
+                 const float b = DS[static_cast<size_t>(id) * D + d];
+                 if (!needs_ip) {
+                   const float delta = a - b;
+                   l2 += delta * delta;
+                 } else {
+                   ip += a * b;
+                   if (met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED)) {
+                     nx += a * a;
+                     ny += b * b;
+                   }
+                 }
+               }
+               if (!needs_ip) {
+                 l2 = sycl::reduce_over_group(group, l2, sycl::plus<float>());
+                 return met == static_cast<int>(OVVS_METRIC_L2_SQRT_EXPANDED) ? sycl::sqrt(l2)
+                                                                             : l2;
+               }
+               ip = sycl::reduce_over_group(group, ip, sycl::plus<float>());
+               if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) return -ip;
+               nx = sycl::reduce_over_group(group, nx, sycl::plus<float>());
+               ny = sycl::reduce_over_group(group, ny, sycl::plus<float>());
+               const float safe_nx = nx > 1e-12f ? nx : 1e-12f;
+               const float safe_ny = ny > 1e-12f ? ny : 1e-12f;
+               return 1.f - ip / (sycl::sqrt(safe_nx) * sycl::sqrt(safe_ny));
+             };
+
+             auto add_candidate = [&](int32_t candidate) {
+               if (candidate < 0 || static_cast<size_t>(candidate) >= N ||
+                   candidate == static_cast<int32_t>(vertex)) {
+                 return -1;
+               }
+               const uint32_t h1 = mix32(static_cast<uint32_t>(candidate));
+               const uint32_t h2 = mix32(static_cast<uint32_t>(candidate) ^ 0x9e3779b9u);
+               const size_t bit1 = static_cast<size_t>(h1) & (bloom_bits - 1u);
+               const size_t bit2 = static_cast<size_t>(h2) & (bloom_bits - 1u);
+               const uint32_t mask1 = 1u << (bit1 & 31u);
+               const uint32_t mask2 = 1u << (bit2 & 31u);
+               const bool maybe_seen = (seen_edges[bit1 >> 5u] & mask1) != 0u &&
+                                       (seen_edges[bit2 >> 5u] & mask2) != 0u;
+               if (maybe_seen) {
+                 for (int32_t i = 0; i < state[0]; ++i) {
+                   if (candidate_ids[static_cast<size_t>(i)] == candidate) return -1;
+                 }
+               }
+               if (state[0] >= static_cast<int32_t>(candidate_capacity)) return -1;
+               seen_edges[bit1 >> 5u] |= mask1;
+               seen_edges[bit2 >> 5u] |= mask2;
+               const int32_t slot = state[0]++;
+               candidate_ids[static_cast<size_t>(slot)] = candidate;
+               return slot;
+             };
+
+             auto evaluate_candidate = [&](int32_t candidate) {
+               if (lid == 0) {
+                 state[1] = candidate;
+                 state[2] = add_candidate(candidate);
+               }
+               item.barrier(sycl::access::fence_space::local_space);
+               const int32_t accepted = state[1];
+               const int32_t slot = state[2];
+               const float distance = slot >= 0 ? cooperative_distance(accepted) : 0.f;
+               if (lid == 0 && slot >= 0) {
+                 candidate_distances[static_cast<size_t>(slot)] = distance;
+               }
+               item.barrier(sycl::access::fence_space::local_space);
+             };
+
+             for (size_t edge = 0; edge < DEG; ++edge) {
+               evaluate_candidate(current[vertex * DEG + edge]);
+             }
+
+             for (size_t edge = 0; edge < DEG; ++edge) {
+               const int32_t neighbor = current[vertex * DEG + edge];
+               for (size_t sample = 0; sample < neighbor_samples; ++sample) {
+                 int32_t candidate = -1;
+                 if (neighbor >= 0 && static_cast<size_t>(neighbor) < N) {
+                   const uint32_t offset_hash = mix32(static_cast<uint32_t>(vertex) ^
+                                                      static_cast<uint32_t>(edge * 0x9e37u) ^
+                                                      (static_cast<uint32_t>(iteration) * 0x85ebu));
+                   const size_t offset = static_cast<size_t>(offset_hash) % DEG;
+                   const size_t sampled_edge =
+                       (offset + (sample * DEG) / neighbor_samples) % DEG;
+                   candidate = current[static_cast<size_t>(neighbor) * DEG + sampled_edge];
+                 }
+                 evaluate_candidate(candidate);
+               }
+             }
+
+             for (size_t explore = 0; explore < exploration_count; ++explore) {
+               const uint32_t random = mix32(static_cast<uint32_t>(vertex) ^
+                                             ((static_cast<uint32_t>(iteration) + 1u) * 0x9e3779b9u) ^
+                                             static_cast<uint32_t>((explore + 1u) * 0x85ebca6bu));
+               int32_t candidate = static_cast<int32_t>(static_cast<size_t>(random) % N);
+               if (candidate == static_cast<int32_t>(vertex)) {
+                 candidate = static_cast<int32_t>((static_cast<size_t>(candidate) + 1u) % N);
+               }
+               evaluate_candidate(candidate);
+             }
+
+             if (lid == 0) {
+               const int32_t count = state[0];
+               for (size_t out_edge = 0; out_edge < DEG; ++out_edge) {
+                 int32_t best = -1;
+                 for (int32_t slot = 0; slot < count; ++slot) {
+                   const int32_t id = candidate_ids[static_cast<size_t>(slot)];
+                   if (id < 0) continue;
+                   if (best < 0 ||
+                       candidate_distances[static_cast<size_t>(slot)] <
+                           candidate_distances[static_cast<size_t>(best)] ||
+                       (candidate_distances[static_cast<size_t>(slot)] ==
+                            candidate_distances[static_cast<size_t>(best)] &&
+                        id < candidate_ids[static_cast<size_t>(best)])) {
+                     best = slot;
+                   }
+                 }
+                 if (best >= 0) {
+                   next[vertex * DEG + out_edge] = candidate_ids[static_cast<size_t>(best)];
+                   candidate_ids[static_cast<size_t>(best)] = -1;
+                 } else {
+                   next[vertex * DEG + out_edge] = current[vertex * DEG + out_edge];
+                 }
+               }
+             }
+           });
+         });
+      }
+      q.wait_and_throw();
+      std::swap(current, next);
+    }
+
+    q.memcpy(graph, current, graph_bytes);
+    q.wait_and_throw();
+    (void)r;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+#else
+  (void)r;
+  (void)dataset;
+  (void)n;
+  (void)dim;
+  (void)metric;
+  (void)degree;
+  (void)iters;
+  (void)graph;
+  return OVVS_STATUS_DEVICE_UNAVAILABLE;
 #endif
 }
 

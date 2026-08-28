@@ -123,8 +123,34 @@ if(OVVS_BUILD_TESTS)
   add_executable(ovvs_consumer_cxx tests/consumer.cpp)
   target_link_libraries(ovvs_consumer_cxx PRIVATE ovvs)
   enable_testing()
-  add_test(NAME cpu COMMAND ovvs_tests)
-  set_tests_properties(cpu PROPERTIES LABELS "cpu")
+  add_test(NAME cpu COMMAND ovvs_tests
+    --exclude nndescent_gpu_n_over_4096
+    --exclude nndescent_gpu_bounded_scale
+    --exclude cagra_sycl_walk_n_over_4096)
+  set_tests_properties(cpu PROPERTIES
+    LABELS "cpu"
+    RESOURCE_LOCK intel_gpu)
+  add_test(NAME nndescent_gpu_n_over_4096
+    COMMAND ovvs_tests --filter nndescent_gpu_n_over_4096)
+  set_tests_properties(nndescent_gpu_n_over_4096 PROPERTIES
+    LABELS "gpu;scale"
+    RESOURCE_LOCK intel_gpu
+    SKIP_RETURN_CODE 77
+    TIMEOUT 45)
+  add_test(NAME nndescent_gpu_bounded_scale
+    COMMAND ovvs_tests --filter nndescent_gpu_bounded_scale)
+  set_tests_properties(nndescent_gpu_bounded_scale PROPERTIES
+    LABELS "gpu;scale"
+    RESOURCE_LOCK intel_gpu
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120)
+  add_test(NAME cagra_sycl_walk_n_over_4096
+    COMMAND ovvs_tests --filter cagra_sycl_walk_n_over_4096)
+  set_tests_properties(cagra_sycl_walk_n_over_4096 PROPERTIES
+    LABELS "gpu;scale"
+    RESOURCE_LOCK intel_gpu
+    SKIP_RETURN_CODE 77
+    TIMEOUT 45)
   add_test(NAME consumer COMMAND ovvs_consumer)
   set_tests_properties(consumer PROPERTIES LABELS "cpu")
   add_test(NAME consumer_cxx COMMAND ovvs_consumer_cxx)

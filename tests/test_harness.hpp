@@ -9,6 +9,14 @@
 
 int ovvs_register_test(const char* name, void (*fn)());
 
+struct OvvsSkipTest : public std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+[[noreturn]] inline void skip_test(const std::string& reason) {
+  throw OvvsSkipTest(reason);
+}
+
 #define OVVS_TEST(name)                                          \
   static void test_##name();                                     \
   static int reg_##name = ovvs_register_test(#name, test_##name); \
