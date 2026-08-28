@@ -1,6 +1,6 @@
 # Arrow Lake IVF-PQ B3 evidence
 
-Status: **correctness guarded; persistent storage and synchronous fixed-bucket batching complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
+Status: **correctness guarded; persistent storage, synchronous fixed buckets, and a forced affine-range lane complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
 
 The current clean-code artifacts are `out/bench/ivfpq-b3-batched-sift-postcommit-r1.json` through `r3.json`, with sibling Markdown files. Earlier baseline, guarded, and packed artifacts remain local negative history. Every run is overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
 
@@ -21,13 +21,13 @@ The bounded checksum-pinned SIFT-prefix smoke uses `n=2,000`, `dim=128`, `nq=32`
 
 A one-off local per-list ADC diagnostic found CPU top candidate scores around 85,273.5–99,740.4 while full 128-row NPU tiles returned 65,504. Safe `M=8, Ks=256` tile-boundary probes at 127/128/129/255/256/257 codes had maximum absolute error below 0.004, so the primary defect was FP16-range saturation rather than code indexing or tail handling. No raw diagnostic artifact was preserved; these measurements are supporting diagnosis, not a benchmark result.
 
-`npu_pq_adc` now requires:
+The original fail-closed guard checkpoint required:
 
 - finite LUT entries;
 - `sum_m max_code(abs(lut[m, code])) < 65,504`;
 - finite request-owned output strictly below 65,504 before it is copied to caller memory.
 
-Unsafe AUTO execution falls back to CPU. Unsafe FORCE_NPU returns `DEVICE_UNAVAILABLE`, increments the fallback counter, does not count a compile failure, and does not publish output. Multi-tile NPU results are staged and published atomically only after every tile validates. A same-index wide-range native regression verifies exact AUTO/CPU neighbor parity and distance parity within `1e-5 * max(1, abs(cpu_distance))`.
+At that checkpoint, unsafe AUTO execution fell back to CPU and unsafe FORCE_NPU returned `DEVICE_UNAVAILABLE`. The later bounded FORCE_NPU transform is documented below; AUTO deliberately retains the guard behavior. Multi-tile NPU results are staged and published atomically only after every tile validates. A same-index wide-range native regression verifies exact AUTO/CPU neighbor parity and distance parity within `1e-5 * max(1, abs(cpu_distance))`.
 
 The guarded AUTO path is correct but not fast: at `nprobe=8`, FORCE_CPU was 6.82× faster. The smoke's ovVS lane uses exact refinement while its FAISS lane uses raw `IndexIVFPQ`, so no ovVS-versus-FAISS conclusion is drawn from this artifact.
 
@@ -69,7 +69,7 @@ Three sequential clean-code runs at commit `aa716eb` (`git.dirty=false`) on a SI
 | AUTO | 58,801.9 (58,575.9–62,293.2) | 23,071.4 (22,709.5–23,338.9) | 0.6375 / 0.946875 | 141.3–141.6 MiB |
 | FORCE_CPU | 83,095.3 (75,757.6–85,015.9) | 32,228.8 (32,154.3–32,817.1) | 0.6375 / 0.946875 | 141.4–141.8 MiB |
 
-AUTO was 1.41×/1.40× slower than FORCE_CPU at `nprobe=2/8`; the `nprobe=8` ratio was 9.14× at the pre-batching checkpoint. AUTO's median ratio between checkpoints is 4.55×/6.63× while recall stayed exact, but this is not a simultaneous isolated A/B and includes control-path/allocation changes as well as batching. Wide-range SIFT LUTs still fail the 65,504 bound, so FORCE_NPU remained explicitly unavailable in all three runs and AUTO attributed the final primitive to CPU. Per-LUT scaling remains unimplemented.
+AUTO was 1.41×/1.40× slower than FORCE_CPU at `nprobe=2/8`; the `nprobe=8` ratio was 9.14× at the pre-batching checkpoint. AUTO's median ratio between checkpoints is 4.55×/6.63× while recall stayed exact, but this is not a simultaneous isolated A/B and includes control-path/allocation changes as well as batching. At that checkpoint, wide-range SIFT LUTs still failed the 65,504 bound, FORCE_NPU was explicitly unavailable in all three runs, and per-LUT scaling was unimplemented. AUTO attributed the final primitive to CPU.
 
 Raw FAISS in the same clean runs had median-of-run-median QPS 143,626.6/149,045.2 at `nprobe=2/8`, with ranges 111,265.6–407,124.7 and 128,876.4–299,345.2. Recall was only 0.553125/0.6375; ovVS used `krefine=32` while FAISS was unrefined. This is retained as a high-variance unmatched competitor observation, not evidence that ovVS wins or loses at equal quality. All three artifacts remain partial because forced NPU is unavailable and package energy was disabled.
 
@@ -85,15 +85,38 @@ These one-off local probes prefilled request-owned tensors and exclude input pac
 
 At depth four with a constant 524,288 scored codes, fixed buckets measured 1.539M, 2.869M, 5.918M, 10.927M, and 18.596M codes/s for bucket sizes 128, 256, 512, 1,024, and 2,048 respectively. Launch overhead dominates small tiles; SIFT1M with `nlist=1,024` averages about 977 codes per list, making bucket 1,024 the first end-to-end candidate rather than a selected winner.
 
-An isolated per-LUT scaling probe used a conservative 60,000 headroom, then de-scaled each list before cross-list selection. Candidate top-32 overlap versus CPU averaged 0.9990 over 32 queries, with minimum 0.96875 and 31/32 queries exact. This is not yet implemented and is not an end-to-end recall result.
+An isolated per-LUT scaling probe used a conservative 60,000 headroom, then de-scaled each list before cross-list selection. Candidate top-32 overlap versus CPU averaged 0.9990 over 32 queries, with minimum 0.96875 and 31/32 queries exact. That probe motivated the bounded implementation below; it was not itself an end-to-end recall result.
+
+## Forced affine-range experiment
+
+The production backend now supports a deliberately bounded FORCE_NPU transform for LUTs whose raw absolute-sum guard fails. For subspace `m`, it subtracts `min_code(lut[m,code])`; it sums those minima as a task bias, and scales the sum of remaining subspace spans to at most 60,000. After synchronous inference, it requires each centered score to remain non-negative and within its planned span plus a conservative fp16 reduction envelope, divides by the scale, restores the bias, validates finite f32, and publishes only after the complete logical call succeeds. Exact arithmetic preserves every candidate score. NPU precision does not, so this first implementation rejects scales below 0.5. AUTO still falls back to CPU for raw-unsafe LUTs.
+
+Live deterministic cases establish the bounded contract:
+
+| Case | Result |
+|---|---|
+| Eight constant LUT offsets, exact score 65,536 | FORCE_NPU success; one transformed chunk and 129 transformed rows recorded |
+| Mixed safe and constant-offset tasks | FORCE_NPU success; oracle match within `2e-4 * max(1,abs(score))` |
+| Span 102,000, scale 0.588 | 27.25 maximum absolute error; 32/32 CPU top-32 overlap |
+| Span 2,040,000, scale about 0.029 | `DEVICE_UNAVAILABLE`; output canaries preserved; one fallback; no compile failure |
+| Zero span, finite LUT entries whose restored sum exceeds f32 | post-inference `DEVICE_UNAVAILABLE`; output canaries and prior attribution preserved; executed-request and runtime-failure telemetry retained |
+
+`ovvs_bakeoff pq-adc-scale` uses the scale-0.588 table and includes validation, transformation, u8-to-i32 Gather-index construction, request tensor fills, inference, restoration, and publication. It excludes IVF list selection, final candidate selection, and refinement. Three fresh-process samples each ran one warmup, one timed call, and one hot call:
+
+| Candidates, `M=8`, `Ks=256` | CPU hot median (range) | NPU hot median (range) | NPU/CPU wall |
+|---:|---:|---:|---:|
+| 131,072 | 0.4363 ms (0.4258–0.6352) | 46.2097 ms (46.0634–46.5929) | 105.9× |
+| 524,288 | 2.5255 ms (2.5000–2.5357) | 185.1460 ms (184.8050–185.3009) | 73.3× |
+
+GPU is unavailable for PQ ADC. Package-energy readings bracketed the complete multi-policy tool process and cannot be attributed to a lane. This is a strong negative result for the present Gather+ReduceSum dataflow, not for the NPU generally. The path still pays for expanded i32 indices, synchronous request traffic, and full score readback, but stage telemetry has not isolated their individual shares. The current diagnostic fails the AUTO promotion gate. The next speed path is iGPU variable-length fused scan/select, while the request cache is bounded/versioned and stage telemetry is added. Depth 2/4 remains a secondary bakeoff rather than a production default.
 
 ## Remaining B3 gate
 
-1. Validate per-LUT scaling at production geometry before re-enabling unsafe-range NPU work.
-2. Bake off reusable request depths 1/2/4 with queue, cache, tail, copy, memory, and stage-device telemetry; depth one remains the production default until end-to-end evidence says otherwise.
-3. Bound the compiled-request cache and include effective compile properties, runtime/compiler/driver identity, device ID, and performance mode in its key.
-4. Add the iGPU variable-length scan/select path and compare it with padded NPU execution per SKU.
+1. Validate the bounded affine transform on production LUTs through shortlist survival and final recall; do not promote AUTO unless complete search wall or energy beats CPU.
+2. Bound the compiled-request cache and include effective compile properties, runtime/compiler/driver identity, device ID, and performance mode in its key.
+3. Add stage telemetry, then bake reusable request depths 1/2/4 only if a production-shaped NPU lane remains competitive; depth one stays default.
+4. Add the iGPU variable-length fused scan/select path and compare it with CPU and padded NPU execution per SKU.
 5. Compare raw ovVS and raw FAISS at identical `nlist`, `nprobe`, `pq_m`, `nbits`, and `krefine=k`; refined comparisons need an equivalent FAISS refinement lane.
 6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, and package-energy evidence before claiming a win.
 
-Latest checkpoint verification: 81/81 accelerator-enabled native tests with zero skips, 10/10 focused IVF-PQ/NPU tests, 6/6 CTest lanes, 57/57 benchmark-harness tests, and 6/6 SIFT-fetcher tests. CTest re-runs native subsets plus the two consumers, so its count is not additive.
+Latest checkpoint verification: 82/82 accelerator-enabled native tests with zero skips and 6/6 CTest lanes. The unchanged benchmark harness and SIFT fetcher were not rerun at the affine checkpoint; their latest completed counts remain 57/57 and 6/6. CTest re-runs native subsets plus the two consumers, so its count is not additive.

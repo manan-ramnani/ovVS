@@ -175,6 +175,8 @@ struct ResourcesData {
   int64_t pq_adc_npu_requests = 0;
   int64_t pq_adc_npu_rows = 0;
   int64_t pq_adc_npu_capacity_rows = 0;
+  int64_t pq_adc_npu_transformed_chunks = 0;
+  int64_t pq_adc_npu_transformed_rows = 0;
   int64_t pq_adc_cpu_rows = 0;
   bool npu_busy = false;
   ovvsDevice large_gemm_winner = OVVS_DEVICE_AUTO;

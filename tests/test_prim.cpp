@@ -419,6 +419,9 @@ OVVS_TEST(pq_adc_cpu_multitask_matches_oracle_and_rejects_bad_codes_atomically) 
 OVVS_TEST(pq_adc_multitask_forced_policies_fail_atomically) {
   using ovvs::impl::PqAdcTask;
   Res res;
+  int32_t npu = 0;
+  expect_status(ovvsResourcesNpuAvailable(res.r, &npu),
+                "multi-task ADC NPU availability");
   constexpr int32_t pq_m = 8, ks = 16;
   const std::vector<int64_t> rows{129, 257};
   std::vector<float> safe_tables(static_cast<size_t>(pq_m * ks), 0.25f);
@@ -459,24 +462,40 @@ OVVS_TEST(pq_adc_multitask_forced_policies_fail_atomically) {
 
   expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
                 "multi-task ADC FORCE_NPU policy");
-  expect(ovvs::impl::prim_pq_adc_batch(*ovvs::impl::rd(res.r), tasks, 2, pq_m, ks,
-                                       actual.data() + 1, output_rows) ==
-             OVVS_STATUS_DEVICE_UNAVAILABLE,
-         "unsafe multi-task FORCE_NPU ADC fails closed");
-  for (float value : actual) expect(value == -12345.0f, "FORCE_NPU ADC output is atomic");
+  const ovvsStatus npu_status = ovvs::impl::prim_pq_adc_batch(
+      *ovvs::impl::rd(res.r), tasks, 2, pq_m, ks, actual.data() + 1, output_rows);
   int32_t fallbacks_after_npu = 0;
   int32_t compile_fails_after = 0;
   expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after_npu),
                 "multi-task ADC FORCE_NPU fallback count");
   expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_after),
                 "multi-task ADC FORCE_NPU compile-fail count");
-  expect(fallbacks_after_npu == fallbacks_before + 1,
-         "unsafe multi-task FORCE_NPU ADC records one logical fallback");
+  if (!npu) {
+    expect(npu_status == OVVS_STATUS_DEVICE_UNAVAILABLE,
+           "multi-task FORCE_NPU rejects an absent device");
+    for (float value : actual) expect(value == -12345.0f, "absent NPU output is atomic");
+    expect(fallbacks_after_npu == fallbacks_before + 1,
+           "absent multi-task FORCE_NPU records one logical fallback");
+  } else {
+    expect_status(npu_status, "centered multi-task FORCE_NPU ADC");
+    expect(actual.front() == -12345.0f && actual.back() == -12345.0f,
+           "centered multi-task FORCE_NPU ADC canaries");
+    for (int64_t row = 0; row < output_rows; ++row) {
+      const float tolerance =
+          2e-4f * std::max(1.0f, std::fabs(seeded[static_cast<size_t>(row)]));
+      expect(std::fabs(actual[static_cast<size_t>(row + 1)] -
+                       seeded[static_cast<size_t>(row)]) <= tolerance,
+             "centered multi-task FORCE_NPU ADC oracle row=" + std::to_string(row));
+    }
+    expect(fallbacks_after_npu == fallbacks_before,
+           "scaled multi-task FORCE_NPU needs no fallback");
+    ovvsDevice last = OVVS_DEVICE_CPU;
+    expect_status(ovvsResourcesLastDevice(res.r, &last),
+                  "scaled multi-task ADC last device");
+    expect(last == OVVS_DEVICE_NPU, "scaled multi-task ADC attributes NPU");
+  }
   expect(compile_fails_after == compile_fails_before,
-         "range rejection is not an NPU compile failure");
-  ovvsDevice last = OVVS_DEVICE_NPU;
-  expect_status(ovvsResourcesLastDevice(res.r, &last), "failed multi-task ADC last device");
-  expect(last == OVVS_DEVICE_CPU, "failed multi-task ADC preserves prior attribution");
+         "scaled or unavailable ADC is not a compile failure");
 }
 
 OVVS_TEST(npu_pq_adc_true_multitask_matches_reference_when_present) {
@@ -773,7 +792,7 @@ OVVS_TEST(npu_pq_adc_tile_boundaries_match_reference_when_present) {
   }
 }
 
-OVVS_TEST(npu_pq_adc_rejects_unsafe_accumulation_when_present) {
+OVVS_TEST(npu_pq_adc_center_scales_unsafe_accumulation_when_present) {
   Res res;
   int32_t npu = 0;
   ovvsResourcesNpuAvailable(res.r, &npu);
@@ -804,26 +823,46 @@ OVVS_TEST(npu_pq_adc_rejects_unsafe_accumulation_when_present) {
                 "unsafe NPU ADC fallback count before");
   expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_before),
                 "unsafe NPU ADC compile-fail count before");
+  auto* resources = ovvs::impl::rd(res.r);
+  int64_t scaled_chunks_before = 0;
+  int64_t scaled_rows_before = 0;
+  {
+    std::lock_guard<std::mutex> lock(resources->pq_adc_stats_mutex);
+    scaled_chunks_before = resources->pq_adc_npu_transformed_chunks;
+    scaled_rows_before = resources->pq_adc_npu_transformed_rows;
+  }
 
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
   const ovvsStatus forced =
       ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes, actual.data());
-  expect(forced == OVVS_STATUS_DEVICE_UNAVAILABLE,
-         "unsafe NPU ADC accumulation must fail closed");
-  for (float value : actual) expect(value == -1.0f, "failed NPU ADC must not write output");
-  ovvsDevice last = OVVS_DEVICE_NPU;
-  expect_status(ovvsResourcesLastDevice(res.r, &last), "unsafe rejected ADC last device");
-  expect(last == OVVS_DEVICE_CPU, "rejected NPU ADC must preserve prior device attribution");
+  expect_status(forced, "centered constant-offset NPU ADC");
+  for (int64_t i = 0; i < ncodes; ++i) {
+    const float tolerance = 2e-4f * expected[static_cast<size_t>(i)];
+    expect(std::fabs(actual[static_cast<size_t>(i)] - expected[static_cast<size_t>(i)]) <=
+               tolerance,
+           "centered constant-offset NPU ADC result");
+  }
+  ovvsDevice last = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last), "centered ADC last device");
+  expect(last == OVVS_DEVICE_NPU, "centered ADC must attribute NPU");
   int32_t fallbacks_after = 0;
   int32_t compile_fails_after = 0;
   expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after),
                 "unsafe NPU ADC fallback count after");
   expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_after),
                 "unsafe NPU ADC compile-fail count after");
-  expect(fallbacks_after == fallbacks_before + 1, "unsafe forced ADC fallback count");
+  expect(fallbacks_after == fallbacks_before, "centered forced ADC fallback count");
   expect(compile_fails_after == compile_fails_before,
-         "unsafe forced ADC must not count as a compile failure");
+         "centered forced ADC must not count as a compile failure");
+  {
+    std::lock_guard<std::mutex> lock(resources->pq_adc_stats_mutex);
+    expect(resources->pq_adc_npu_transformed_chunks == scaled_chunks_before + 1,
+           "centered forced ADC records one transformed chunk");
+    expect(resources->pq_adc_npu_transformed_rows == scaled_rows_before + ncodes,
+           "centered forced ADC records transformed rows");
+  }
 
+  std::fill(actual.begin(), actual.end(), -1.0f);
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO);
   expect_status(ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes,
                                actual.data()),
@@ -835,6 +874,164 @@ OVVS_TEST(npu_pq_adc_rejects_unsafe_accumulation_when_present) {
     expect(actual[static_cast<size_t>(i)] == expected[static_cast<size_t>(i)],
            "unsafe AUTO ADC CPU result");
   }
+}
+
+OVVS_TEST(npu_pq_adc_scaled_span_matches_reference_when_present) {
+  Res res;
+  int32_t npu = 0;
+  expect_status(ovvsResourcesNpuAvailable(res.r, &npu), "scaled-span NPU probe");
+  if (!npu) skip_test("NPU not available");
+
+  constexpr int32_t pq_m = 8, ks = 256;
+  constexpr int64_t ncodes = 257;
+  std::vector<float> tables(static_cast<size_t>(pq_m * ks));
+  for (int32_t m = 0; m < pq_m; ++m) {
+    const float base = -200000.0f + 1000.0f * static_cast<float>(m);
+    for (int32_t code = 0; code < ks; ++code) {
+      tables[static_cast<size_t>(m * ks + code)] =
+          base + 50.0f * static_cast<float>(code);
+    }
+  }
+  std::vector<uint8_t> codes(static_cast<size_t>(ncodes * pq_m));
+  for (int64_t row = 0; row < ncodes; ++row) {
+    for (int32_t m = 0; m < pq_m; ++m) {
+      codes[static_cast<size_t>(row * pq_m + m)] =
+          static_cast<uint8_t>((row * 37 + m * 29) % ks);
+    }
+  }
+  std::vector<float> expected(static_cast<size_t>(ncodes));
+  std::vector<float> actual(static_cast<size_t>(ncodes + 2), -12345.0f);
+  for (int64_t row = 0; row < ncodes; ++row) {
+    expected[static_cast<size_t>(row)] =
+        independent_pq_adc(tables.data(), codes.data() + row * pq_m, pq_m, ks);
+  }
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
+                "scaled-span FORCE_NPU policy");
+  expect_status(ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes,
+                               actual.data() + 1),
+                "scaled-span NPU ADC");
+  expect(actual.front() == -12345.0f && actual.back() == -12345.0f,
+         "scaled-span ADC canaries");
+  float max_abs_error = 0.0f;
+  for (int64_t row = 0; row < ncodes; ++row) {
+    max_abs_error = std::max(
+        max_abs_error,
+        std::fabs(actual[static_cast<size_t>(row + 1)] -
+                  expected[static_cast<size_t>(row)]));
+  }
+  constexpr int64_t shortlist = 32;
+  std::vector<int64_t> expected_ids(static_cast<size_t>(shortlist));
+  std::vector<int64_t> actual_ids(static_cast<size_t>(shortlist));
+  std::vector<int64_t> expected_order(static_cast<size_t>(ncodes));
+  std::vector<int64_t> actual_order(static_cast<size_t>(ncodes));
+  std::iota(expected_order.begin(), expected_order.end(), 0);
+  std::iota(actual_order.begin(), actual_order.end(), 0);
+  std::partial_sort(expected_order.begin(), expected_order.begin() + shortlist,
+                    expected_order.end(), [&](int64_t a, int64_t b) {
+                      return expected[static_cast<size_t>(a)] <
+                             expected[static_cast<size_t>(b)];
+                    });
+  std::partial_sort(actual_order.begin(), actual_order.begin() + shortlist,
+                    actual_order.end(), [&](int64_t a, int64_t b) {
+                      return actual[static_cast<size_t>(a + 1)] <
+                             actual[static_cast<size_t>(b + 1)];
+                    });
+  std::copy_n(expected_order.begin(), shortlist, expected_ids.begin());
+  std::copy_n(actual_order.begin(), shortlist, actual_ids.begin());
+  int32_t overlap = 0;
+  for (int64_t expected_id : expected_ids) {
+    if (std::find(actual_ids.begin(), actual_ids.end(), expected_id) != actual_ids.end()) {
+      ++overlap;
+    }
+  }
+  std::printf("    scaled_span max_abs_error=%.3f top32_overlap=%d/32\n",
+              max_abs_error, overlap);
+  expect(max_abs_error < 128.0f,
+         "scaled-span ADC max error " + std::to_string(max_abs_error));
+  expect(overlap >= 31, "scaled-span ADC top-32 overlap " + std::to_string(overlap));
+
+  for (int32_t m = 0; m < pq_m; ++m) {
+    const float base = -200000.0f + 1000.0f * static_cast<float>(m);
+    for (int32_t code = 0; code < ks; ++code) {
+      tables[static_cast<size_t>(m * ks + code)] =
+          base + 1000.0f * static_cast<float>(code);
+    }
+  }
+  std::fill(actual.begin(), actual.end(), -12345.0f);
+  int32_t fallbacks_before = 0;
+  int32_t compile_fails_before = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_before),
+                "excessive-scale fallback count before");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_before),
+                "excessive-scale compile count before");
+  expect(ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes,
+                        actual.data() + 1) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "excessive PQ scaling fails closed");
+  for (float value : actual) {
+    expect(value == -12345.0f, "excessive PQ scaling publishes no output");
+  }
+  int32_t fallbacks_after = 0;
+  int32_t compile_fails_after = 0;
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after),
+                "excessive-scale fallback count after");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_after),
+                "excessive-scale compile count after");
+  expect(fallbacks_after == fallbacks_before + 1,
+         "excessive PQ scaling records one forced fallback");
+  expect(compile_fails_after == compile_fails_before,
+         "excessive PQ scaling is not a compile failure");
+
+  const float huge_offset = std::numeric_limits<float>::max() / 4.0f;
+  std::fill(tables.begin(), tables.end(), huge_offset);
+  std::fill(actual.begin(), actual.end(), -12345.0f);
+  auto* resources = ovvs::impl::rd(res.r);
+  const int32_t runtime_fails_before = resources->npu_runtime_fails;
+  int64_t requests_before = 0;
+  int64_t rows_before = 0;
+  int64_t scaled_chunks_before = 0;
+  int64_t scaled_rows_before = 0;
+  {
+    std::lock_guard<std::mutex> lock(resources->pq_adc_stats_mutex);
+    requests_before = resources->pq_adc_npu_requests;
+    rows_before = resources->pq_adc_npu_rows;
+    scaled_chunks_before = resources->pq_adc_npu_transformed_chunks;
+    scaled_rows_before = resources->pq_adc_npu_transformed_rows;
+  }
+  fallbacks_before = fallbacks_after;
+  compile_fails_before = compile_fails_after;
+  expect(ovvsPqAdcBatch(res.r, tables.data(), pq_m, ks, codes.data(), ncodes,
+                        actual.data() + 1) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "restored-f32 overflow fails closed after inference");
+  for (float value : actual) {
+    expect(value == -12345.0f, "restored-f32 overflow publishes no output");
+  }
+  expect_status(ovvsResourcesNpuFallbacks(res.r, &fallbacks_after),
+                "restored-f32 overflow fallback count after");
+  expect_status(ovvsResourcesNpuCompileFails(res.r, &compile_fails_after),
+                "restored-f32 overflow compile count after");
+  expect(fallbacks_after == fallbacks_before + 1,
+         "restored-f32 overflow records one forced fallback");
+  expect(compile_fails_after == compile_fails_before,
+         "restored-f32 overflow is not a compile failure");
+  expect(resources->npu_runtime_fails == runtime_fails_before + 1,
+         "restored-f32 overflow records one runtime failure");
+  {
+    std::lock_guard<std::mutex> lock(resources->pq_adc_stats_mutex);
+    expect(resources->pq_adc_npu_requests == requests_before + 1,
+           "restored-f32 overflow records the executed request");
+    expect(resources->pq_adc_npu_rows == rows_before + ncodes,
+           "restored-f32 overflow records executed rows");
+    expect(resources->pq_adc_npu_transformed_chunks == scaled_chunks_before + 1,
+           "restored-f32 overflow records transformed chunk");
+    expect(resources->pq_adc_npu_transformed_rows == scaled_rows_before + ncodes,
+           "restored-f32 overflow records transformed rows");
+  }
+  ovvsDevice last = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last),
+                "restored-f32 overflow last device");
+  expect(last == OVVS_DEVICE_NPU,
+         "restored-f32 overflow preserves prior successful attribution");
 }
 
 OVVS_TEST(npu_pq_adc_multitile_output_is_atomic_when_present) {

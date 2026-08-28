@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,11 @@ int main(int argc, char** argv) {
       K = 128;
     }
   }
+  if (op == "pq-adc-scale" && argc <= 4) {
+    M = 131072; /* codes */
+    N = 8;      /* PQ subquantizers */
+    K = 256;    /* codes per subquantizer */
+  }
   if (argc > 4) {
     M = std::strtoll(argv[2], nullptr, 10);
     N = std::strtoll(argv[3], nullptr, 10);
@@ -70,11 +76,46 @@ int main(int argc, char** argv) {
   bool first = true;
   for (int p = 0; p < 3; ++p) {
     ovvsResourcesSetPolicy(res, policies[p]);
-    std::vector<float> A(static_cast<size_t>(M * K), 0.1f), B(static_cast<size_t>(N * K), 0.2f),
-        C(static_cast<size_t>(M * N), 0.f);
-    for (int64_t i = 0; i < M * K && i < 100000; ++i)
-      A[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i % 17);
-    for (int64_t i = 0; i < N * K; ++i) B[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i % 13);
+    std::vector<float> A, B, C;
+    std::vector<uint8_t> pq_codes;
+    if (op == "pq-adc-scale") {
+      if (M <= 0 || N <= 0 || N > INT32_MAX || K <= 0 || K > 256 ||
+          M > std::numeric_limits<int64_t>::max() / N ||
+          N > std::numeric_limits<int64_t>::max() / K ||
+          static_cast<uint64_t>(M) >
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+                  static_cast<uint64_t>(N) ||
+          static_cast<uint64_t>(N) >
+              static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+                  static_cast<uint64_t>(K)) {
+        ovvsResourcesDestroy(res);
+        return 2;
+      }
+      B.resize(static_cast<size_t>(N * K));
+      pq_codes.resize(static_cast<size_t>(M * N));
+      C.resize(static_cast<size_t>(M));
+      for (int64_t m = 0; m < N; ++m) {
+        const float base = 20000.0f + 1000.0f * static_cast<float>(m);
+        for (int64_t code = 0; code < K; ++code) {
+          B[static_cast<size_t>(m * K + code)] =
+              base + 50.0f * static_cast<float>(code);
+        }
+      }
+      for (int64_t row = 0; row < M; ++row) {
+        for (int64_t m = 0; m < N; ++m) {
+          pq_codes[static_cast<size_t>(row * N + m)] =
+              static_cast<uint8_t>((row * 37 + m * 29) % K);
+        }
+      }
+    } else {
+      A.assign(static_cast<size_t>(M * K), 0.1f);
+      B.assign(static_cast<size_t>(N * K), 0.2f);
+      C.assign(static_cast<size_t>(M * N), 0.f);
+      for (int64_t i = 0; i < M * K && i < 100000; ++i)
+        A[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i % 17);
+      for (int64_t i = 0; i < N * K; ++i)
+        B[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i % 13);
+    }
 
     auto run_op = [&]() {
       ovvsStatus st = OVVS_STATUS_SUCCESS;
@@ -94,6 +135,9 @@ int main(int argc, char** argv) {
         for (int64_t i = 0; i < nidx; ++i) idx[static_cast<size_t>(i)] = i % M;
         std::vector<float> out(static_cast<size_t>(nidx * K));
         st = ovvsGatherRows(res, A.data(), M, K, idx.data(), nidx, out.data());
+      } else if (op == "pq-adc-scale") {
+        st = ovvsPqAdcBatch(res, B.data(), static_cast<int32_t>(N),
+                            static_cast<int32_t>(K), pq_codes.data(), M, C.data());
       }
       return st;
     };
@@ -108,10 +152,17 @@ int main(int argc, char** argv) {
     first = false;
     ovvsDevice last = OVVS_DEVICE_CPU;
     ovvsResourcesLastDevice(res, &last);
-    std::printf(
-        "    {\"requested\": \"%s\", \"last_device\": \"%s\", \"ms\": %.4f, \"ms_hot\": %.4f, "
-        "\"status\": \"%s\"}",
-        names[p], last_name(last), t1 - t0, t2 - t1, ovvsStatusString(st));
+    if (st == OVVS_STATUS_SUCCESS) {
+      std::printf(
+          "    {\"requested\": \"%s\", \"last_device\": \"%s\", \"ms\": %.4f, "
+          "\"ms_hot\": %.4f, \"status\": \"%s\"}",
+          names[p], last_name(last), t1 - t0, t2 - t1, ovvsStatusString(st));
+    } else {
+      std::printf(
+          "    {\"requested\": \"%s\", \"last_device\": null, \"ms\": %.4f, "
+          "\"ms_hot\": %.4f, \"status\": \"%s\"}",
+          names[p], t1 - t0, t2 - t1, ovvsStatusString(st));
+    }
   }
   const ovvsStatus es1 = ovvsResourcesEnergyUj(res, &e1);
   std::printf("\n  ],\n  \"energy_uj_before\": %lld,\n  \"energy_uj_after\": %lld,\n  \"energy_status\": \"%s\"\n}\n",

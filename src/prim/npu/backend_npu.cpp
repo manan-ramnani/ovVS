@@ -36,6 +36,10 @@ namespace impl {
 namespace {
 
 constexpr float kNpuFp16FiniteMax = 65504.0f;
+constexpr double kNpuPqAdcScaledHeadroom = 60000.0;
+/* The first scaled lane is deliberately narrow: at most 2x de-scaling. Wider
+   transforms remain unavailable until candidate-ranking error is measured. */
+constexpr double kNpuPqAdcMinScale = 0.5;
 
 bool finite_below_npu_limit(const float* values, int64_t count) {
   for (int64_t i = 0; i < count; ++i) {
@@ -44,7 +48,16 @@ bool finite_below_npu_limit(const float* values, int64_t count) {
   return true;
 }
 
-bool npu_pq_adc_range_safe(const float* tables, int32_t pq_m, int32_t ks) {
+struct PqAdcTransform {
+  bool active = false;
+  float scale = 1.0f;
+  double bias = 0.0;
+  double scaled_bound = 0.0;
+};
+
+bool plan_npu_pq_adc_transform(const float* tables, int32_t pq_m, int32_t ks,
+                               bool allow_transform, float* offsets,
+                               PqAdcTransform& transform) {
   double accumulation_bound = 0.0;
   for (int32_t m = 0; m < pq_m; ++m) {
     double subspace_bound = 0.0;
@@ -57,6 +70,70 @@ bool npu_pq_adc_range_safe(const float* tables, int32_t pq_m, int32_t ks) {
     accumulation_bound += subspace_bound;
     if (!std::isfinite(accumulation_bound) ||
         accumulation_bound >= static_cast<double>(kNpuFp16FiniteMax)) {
+      break;
+    }
+  }
+  if (accumulation_bound < static_cast<double>(kNpuFp16FiniteMax)) return true;
+  if (!allow_transform || !offsets) return false;
+
+  double span_bound = 0.0;
+  double bias = 0.0;
+  for (int32_t m = 0; m < pq_m; ++m) {
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    for (int32_t code = 0; code < ks; ++code) {
+      const double value = static_cast<double>(
+          tables[static_cast<size_t>(m) * static_cast<size_t>(ks) +
+                 static_cast<size_t>(code)]);
+      if (!std::isfinite(value)) return false;
+      lo = std::min(lo, value);
+      hi = std::max(hi, value);
+    }
+    const double span = hi - lo;
+    if (!std::isfinite(lo) || !std::isfinite(span) || span < 0.0) return false;
+    offsets[m] = static_cast<float>(lo);
+    bias += lo;
+    span_bound += span;
+    if (!std::isfinite(bias) || !std::isfinite(span_bound)) return false;
+  }
+
+  double scale = 1.0;
+  if (span_bound >= kNpuPqAdcScaledHeadroom) {
+    scale = kNpuPqAdcScaledHeadroom / span_bound;
+  }
+  if (!std::isfinite(scale) || scale < kNpuPqAdcMinScale || scale > 1.0) {
+    return false;
+  }
+  transform.active = true;
+  transform.scale = static_cast<float>(scale);
+  transform.bias = bias;
+  transform.scaled_bound = span_bound * static_cast<double>(transform.scale);
+  return std::isfinite(transform.scale) && transform.scale > 0.0f &&
+         std::isfinite(transform.scaled_bound) && transform.scaled_bound >= 0.0 &&
+         transform.scaled_bound < static_cast<double>(kNpuFp16FiniteMax);
+}
+
+bool transformed_npu_adc_output_valid(const float* values, int64_t count,
+                                      const PqAdcTransform& transform,
+                                      int32_t pq_m) {
+  if (!transform.active || !values || count < 0 || pq_m <= 0) return false;
+  /* The graph may accumulate in fp16 even with f32 IO. Allow a conservative
+     reduction-rounding envelope, but never accept a negative centered sum or
+     cross the device's observed finite boundary. */
+  constexpr double kFp16RelativeSpacing = 1.0 / 1024.0;
+  const double rounding_slack =
+      transform.scaled_bound == 0.0
+          ? 0.0
+          : std::max(1.0, transform.scaled_bound *
+                              (static_cast<double>(pq_m) + 1.0) *
+                              kFp16RelativeSpacing);
+  const double upper = std::min(
+      static_cast<double>(kNpuFp16FiniteMax),
+      transform.scaled_bound + rounding_slack);
+  for (int64_t i = 0; i < count; ++i) {
+    const double value = static_cast<double>(values[i]);
+    if (!std::isfinite(value) || value < 0.0 ||
+        value >= static_cast<double>(kNpuFp16FiniteMax) || value > upper) {
       return false;
     }
   }
@@ -92,13 +169,19 @@ void saturating_add_i64(int64_t& dst, int64_t value) {
 }
 
 void record_npu_adc_execution(ResourcesData& r, int64_t requests, int64_t rows,
-                              int64_t capacity_rows) noexcept {
-  if (requests <= 0 && rows <= 0 && capacity_rows <= 0) return;
+                              int64_t capacity_rows, int64_t scaled_chunks,
+                              int64_t scaled_rows) noexcept {
+  if (requests <= 0 && rows <= 0 && capacity_rows <= 0 && scaled_chunks <= 0 &&
+      scaled_rows <= 0) {
+    return;
+  }
   try {
     std::lock_guard<std::mutex> lock(r.pq_adc_stats_mutex);
     saturating_add_i64(r.pq_adc_npu_requests, requests);
     saturating_add_i64(r.pq_adc_npu_rows, rows);
     saturating_add_i64(r.pq_adc_npu_capacity_rows, capacity_rows);
+    saturating_add_i64(r.pq_adc_npu_transformed_chunks, scaled_chunks);
+    saturating_add_i64(r.pq_adc_npu_transformed_rows, scaled_rows);
   } catch (...) {
   }
 }
@@ -630,12 +713,26 @@ bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_
   int64_t executed_requests = 0;
   int64_t executed_rows = 0;
   int64_t executed_capacity_rows = 0;
+  int64_t executed_scaled_chunks = 0;
+  int64_t executed_scaled_rows = 0;
   bool creating_request = false;
   try {
     using namespace ov;
     std::vector<int64_t> bucket_chunks[5];
     std::vector<std::pair<int64_t, int64_t>> output_ranges;
     output_ranges.reserve(static_cast<size_t>(chunk_count));
+    const bool allow_transform = r.policy == OVVS_POLICY_FORCE_NPU;
+    std::vector<PqAdcTransform> transforms(static_cast<size_t>(chunk_count));
+    std::vector<float> transform_offsets;
+    if (allow_transform) {
+      if (static_cast<uint64_t>(chunk_count) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+              static_cast<uint64_t>(pq_m)) {
+        return false;
+      }
+      transform_offsets.resize(static_cast<size_t>(chunk_count) *
+                               static_cast<size_t>(pq_m));
+    }
     int64_t max_output_end = 0;
 
     /* Validate the complete logical call before compiling or submitting any request.
@@ -654,7 +751,17 @@ bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_
           break;
         }
       }
-      if (bucket_index < 0 || !npu_pq_adc_range_safe(chunk.tables, pq_m, ks)) return false;
+      float* offsets =
+          allow_transform
+              ? transform_offsets.data() +
+                    static_cast<size_t>(ci) * static_cast<size_t>(pq_m)
+              : nullptr;
+      if (bucket_index < 0 ||
+          !plan_npu_pq_adc_transform(chunk.tables, pq_m, ks,
+                                     allow_transform, offsets,
+                                     transforms[static_cast<size_t>(ci)])) {
+        return false;
+      }
       for (int32_t row = 0; row < chunk.valid_rows; ++row) {
         const uint8_t* code =
             chunk.codes + static_cast<size_t>(row) * static_cast<size_t>(pq_m);
@@ -739,10 +846,40 @@ bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_
         }
 
         int64_t request_rows = 0;
+        int64_t request_scaled_chunks = 0;
+        int64_t request_scaled_rows = 0;
         for (size_t batch = 0; batch < active; ++batch) {
-          const PqAdcChunk& chunk = chunks[group[base + batch]];
-          std::memcpy(lutp + batch * static_cast<size_t>(lut_n), chunk.tables,
-                      static_cast<size_t>(lut_n) * sizeof(float));
+          const int64_t chunk_index = group[base + batch];
+          const PqAdcChunk& chunk = chunks[chunk_index];
+          const PqAdcTransform& transform =
+              transforms[static_cast<size_t>(chunk_index)];
+          float* lut_dst = lutp + batch * static_cast<size_t>(lut_n);
+          if (!transform.active) {
+            std::memcpy(lut_dst, chunk.tables,
+                        static_cast<size_t>(lut_n) * sizeof(float));
+          } else {
+            const float* offsets =
+                transform_offsets.data() +
+                static_cast<size_t>(chunk_index) * static_cast<size_t>(pq_m);
+            for (int32_t m = 0; m < pq_m; ++m) {
+              const double offset = static_cast<double>(offsets[m]);
+              for (int32_t code = 0; code < ks; ++code) {
+                const size_t lut_index =
+                    static_cast<size_t>(m) * static_cast<size_t>(ks) +
+                    static_cast<size_t>(code);
+                const double centered =
+                    static_cast<double>(chunk.tables[lut_index]) - offset;
+                const double scaled = centered * static_cast<double>(transform.scale);
+                if (!std::isfinite(scaled) || scaled < 0.0 ||
+                    scaled >= static_cast<double>(kNpuFp16FiniteMax)) {
+                  throw std::runtime_error("npu ADC transformed LUT outside finite range");
+                }
+                lut_dst[lut_index] = static_cast<float>(scaled);
+              }
+            }
+            ++request_scaled_chunks;
+            saturating_add_i64(request_scaled_rows, chunk.valid_rows);
+          }
           for (int32_t row = 0; row < chunk.valid_rows; ++row) {
             const uint8_t* code =
                 chunk.codes + static_cast<size_t>(row) * static_cast<size_t>(pq_m);
@@ -757,6 +894,12 @@ bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_
         }
 
         slot.req.infer();
+        ++executed_requests;
+        saturating_add_i64(executed_rows, request_rows);
+        saturating_add_i64(executed_capacity_rows,
+                           static_cast<int64_t>(capacity) * bucket);
+        saturating_add_i64(executed_scaled_chunks, request_scaled_chunks);
+        saturating_add_i64(executed_scaled_rows, request_scaled_rows);
         Tensor result = slot.req.get_output_tensor(0);
         const size_t result_elems = static_cast<size_t>(capacity) * static_cast<size_t>(bucket);
         if (result.get_byte_size() < result_elems * sizeof(float)) {
@@ -764,18 +907,34 @@ bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_
         }
         const float* result_data = result.data<const float>();
         for (size_t batch = 0; batch < active; ++batch) {
-          const PqAdcChunk& chunk = chunks[group[base + batch]];
+          const int64_t chunk_index = group[base + batch];
+          const PqAdcChunk& chunk = chunks[chunk_index];
+          const PqAdcTransform& transform =
+              transforms[static_cast<size_t>(chunk_index)];
           const float* src = result_data + batch * static_cast<size_t>(bucket);
-          if (!finite_below_npu_limit(src, chunk.valid_rows)) {
+          if ((!transform.active && !finite_below_npu_limit(src, chunk.valid_rows)) ||
+              (transform.active &&
+               !transformed_npu_adc_output_valid(src, chunk.valid_rows, transform,
+                                                 pq_m))) {
             throw std::runtime_error("npu ADC output outside finite range");
           }
-          std::memcpy(staged.data() + chunk.output_offset, src,
-                      static_cast<size_t>(chunk.valid_rows) * sizeof(float));
+          float* dst = staged.data() + chunk.output_offset;
+          if (!transform.active) {
+            std::memcpy(dst, src, static_cast<size_t>(chunk.valid_rows) * sizeof(float));
+          } else {
+            const double inverse_scale = 1.0 / static_cast<double>(transform.scale);
+            for (int32_t row = 0; row < chunk.valid_rows; ++row) {
+              const double restored = static_cast<double>(src[row]) * inverse_scale +
+                                      transform.bias;
+              if (!std::isfinite(restored) ||
+                  std::fabs(restored) >
+                      static_cast<double>(std::numeric_limits<float>::max())) {
+                throw std::runtime_error("npu ADC restored output is not finite f32");
+              }
+              dst[row] = static_cast<float>(restored);
+            }
+          }
         }
-        ++executed_requests;
-        saturating_add_i64(executed_rows, request_rows);
-        saturating_add_i64(executed_capacity_rows,
-                           static_cast<int64_t>(capacity) * bucket);
         base += active;
       }
     }
@@ -784,10 +943,12 @@ bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_
       std::memcpy(out + chunk.output_offset, staged.data() + chunk.output_offset,
                   static_cast<size_t>(chunk.valid_rows) * sizeof(float));
     }
-    record_npu_adc_execution(r, executed_requests, executed_rows, executed_capacity_rows);
+    record_npu_adc_execution(r, executed_requests, executed_rows, executed_capacity_rows,
+                             executed_scaled_chunks, executed_scaled_rows);
     return true;
   } catch (...) {
-    record_npu_adc_execution(r, executed_requests, executed_rows, executed_capacity_rows);
+    record_npu_adc_execution(r, executed_requests, executed_rows, executed_capacity_rows,
+                             executed_scaled_chunks, executed_scaled_rows);
     int32_t& failure_counter = creating_request ? r.npu_compile_fails : r.npu_runtime_fails;
     if (failure_counter < std::numeric_limits<int32_t>::max()) ++failure_counter;
     return false;

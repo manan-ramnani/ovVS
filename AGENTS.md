@@ -33,9 +33,9 @@ bindings → C ABI (libovvs) → C++ algorithms → mixer/planner
 - Algorithms call `ovvs::prim`, never OpenVINO or SYCL directly.
 - Default tensor home: USM shared (CPU + iGPU). NPU sees tiles/bound host buffers, not a second index copy as source of truth.
 - Graph ANN (CAGRA/Vamana/NN-Descent walk) lives on **iGPU**. NPU may score a padded candidate slab if bakeoff says so.
-- Dense GEMM / coarse IVF assign / k-means assign: **CPU oneMKL** on Arrow Lake (bakeoff). PQ ADC: **NPU only when its conservative accumulation bound is range-safe; otherwise AUTO falls back to CPU until scaled execution lands**. Graph walk: **iGPU**. NPU Parameter MatMul is kept for FORCE_NPU and for SKUs whose `gemm_large.json` names NPU.
+- Dense GEMM / coarse IVF assign / k-means assign: **CPU oneMKL** on Arrow Lake (bakeoff). PQ ADC: range-safe LUTs may use NPU; FORCE_NPU can affine-center and scale a bounded unsafe span, while AUTO keeps the CPU fallback until the complete search wins. Graph walk: **iGPU**. NPU Parameter MatMul is kept for FORCE_NPU and for SKUs whose `gemm_large.json` names NPU.
 
-**Device split (canonical):** `docs/hw-split.md`. AUTO GEMM / TopK / Gather → CPU (oneMKL `cblas_sgemm` beats NPU wall and iGPU XMX on Arrow Lake). CAGRA walk → iGPU. Range-safe PQ ADC may use NPU; unsafe tables use CPU. `FORCE_*` still hits NPU/GPU or fails unavailable.
+**Device split (canonical):** `docs/hw-split.md`. AUTO GEMM / TopK / Gather → CPU (oneMKL `cblas_sgemm` beats NPU wall and iGPU XMX on Arrow Lake). CAGRA walk → iGPU. Range-safe PQ ADC may use NPU; unsafe AUTO tables use CPU, while bounded FORCE_NPU affine execution runs or fails unavailable. `FORCE_*` never silently falls back.
 
 Details, knobs, and CAGRA mapping: the plan §4–§6.
 
@@ -51,9 +51,9 @@ Intel added an **inference engine** (compiled graph, weight-stationary, ~4 MB sc
 2. **Feed L0 tensors via `get_input_tensor` / `get_output_tensor`.** The plugin allocates Level Zero buffers at request creation. `memcpy` into those. `set_tensor` on a malloc/USM host pointer **forces a SHAVE copy** (intel_npu README). That copy is the 35 ms “SHAVE A” in `PERF_COUNT`, not a broken DPU.
 3. **Reuse the request’s L0 buffers.** `memcpy` unless `nbytes ≥ 64 KiB` and a 32-sample fingerprint matches (search dataset). Pointer-identity alone is unsafe: k-means/ScaNN mutate centroids. Scratchpad is **4 MB** (`1e5×768` f16 ≈ 150 MB does not fit).
 4. **INT8 is NNCF Low Precision IR** (FakeQuantize on activations **and Constant weights**). Raw `si8` MatMul is illegal. Two live fp32 Parameters will not light INT8 MACs. TOPS on this SKU are INT8; FP16 is half-rate. Compile with `NPU_TURBO` + `optimization-level=2 performance-hint-override=latency`.
-5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (18 ms vs NPU 45 ms vs GPU 221 ms at 1e5×32×768). Graph walk → iGPU. Range-safe ADC may use NPU; unsafe ADC falls back to CPU. NPU DPU is still 5.3 ms; Parameter DMA is why wall loses to MKL.
+5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (18 ms vs NPU 45 ms vs GPU 221 ms at 1e5×32×768). Graph walk → iGPU. Range-safe ADC may use NPU; unsafe AUTO ADC falls back to CPU. The forced centered/scaled ADC lane is correctness evidence, not an AUTO win. NPU DPU is still 5.3 ms; Parameter DMA is why wall loses to MKL.
 6. **Do not bake B as an IR Constant just to be clever.** That made DPU 10× faster and wall 10× *slower* (UMD/constant reload). Sticky Parameter + reused request + L0 `get_tensor` is the path.
-7. **Fail closed on numeric range.** Arrow Lake f32 graph IO can exhibit FP16-range saturation. GEMM, TopK, and PQ ADC reject non-finite inputs, unsafe conservative bounds, or invalid outputs; FORCE_NPU returns `DEVICE_UNAVAILABLE` until a measured scaling path exists. For ADC the bound is `sum_m max_code(abs(lut[m, code])) < 65,504`, and the request-owned output is validated before publication.
+7. **Fail closed on numeric range.** Arrow Lake f32 graph IO can exhibit FP16-range saturation. GEMM and TopK reject unsafe bounds. PQ ADC uses raw LUTs below `sum_m max_code(abs(lut[m, code])) < 65,504`; FORCE_NPU may subtract each subspace minimum, scale the remaining total span to 60,000, and restore the bias only when the scale is at least 0.5. Non-finite values, wider transforms, or invalid outputs return `DEVICE_UNAVAILABLE` without publication. AUTO deliberately retains the unsafe-range CPU fallback.
 
 If a change “uses the NPU” but creates a request per call, `set_tensor`s host pointers, or DMA’s the dataset every query, it is a defect.
 
@@ -67,7 +67,7 @@ Work the plan’s phases in sequence. **v0.2.0 already has C ABI symbols through
 
 1. B1 harness core and the current-code matched SIFT1M CAGRA gate are complete; full curves/energy and the real 100K×768 corpus remain open.
 2. B2/B5 pass the SIFT1M recall-closeness gate (0.9036 versus hnswlib 0.8915), but ≥0.95 recall, CAGRA QPS, NN-Descent convergence, and GPU prune remain open.
-3. **Next implementation:** IVF-PQ persistent list-major CSR, bounded query/list descriptors, and synchronous fixed ADC buckets are complete. Continue B3 with a bounded/versioned request cache, measured request depths 1/2/4, per-LUT scaling, and iGPU scan/select; then RaBitQ packed binary GEMM (B4). Keep this software-only; do not require BIOS changes.
+3. **Next implementation:** IVF-PQ persistent list-major CSR, bounded descriptors, synchronous fixed ADC buckets, and the forced centered/scaled correctness lane are complete. The scaled Gather graph remains 73–106× slower than the CPU primitive in current diagnostic shapes, so AUTO stays CPU. Continue B3 with a bounded/versioned request cache and iGPU fused scan/select; measure request depths 1/2/4 only after stage telemetry. Then correct and accelerate RaBitQ (B4). Keep this software-only; do not require BIOS changes.
 4. Continue CAGRA throughput work only from profiling evidence; never weaken hnswlib settings.
 5. HETERO stage overlap (B6); NPU L0 dataset-home experiment (B7); Lunar Lake bakeoff when hardware exists (B8)
 6. Then plan v1.0 polish (B9–B20). Vamana/ScaNN/SLINK/bindings are v1.1 (B21+) — do not start them ahead of B2
