@@ -30,16 +30,48 @@ static sycl::queue& gpu_queue() {
 }
 
 template <typename T>
-static T* usm_scratch(size_t n) {
-  static T* p = nullptr;
-  static size_t cap = 0;
-  auto& q = gpu_queue();
-  if (n > cap) {
-    if (p) sycl::free(p, q);
-    p = sycl::malloc_shared<T>(n, q);
-    cap = p ? n : 0;
+struct ThreadUsmScratch {
+  explicit ThreadUsmScratch(const sycl::queue& queue_value)
+      : queue(queue_value), context(queue_value.get_context()) {}
+
+  ThreadUsmScratch(const ThreadUsmScratch&) = delete;
+  ThreadUsmScratch& operator=(const ThreadUsmScratch&) = delete;
+
+  ~ThreadUsmScratch() noexcept {
+    if (!ptr) return;
+    try {
+      queue.wait();
+    } catch (...) {
+    }
+    try {
+      sycl::free(ptr, context);
+    } catch (...) {
+    }
   }
-  return p;
+
+  T* ptr = nullptr;
+  size_t capacity = 0;
+  sycl::queue queue;
+  sycl::context context;
+};
+
+template <typename T>
+static T* usm_scratch(size_t n) {
+  /* A search can run on multiple resources concurrently. Keep each worker's
+     reusable scratch independent; every caller waits before returning it. The
+     queue/context holder drains and frees the thread's high-water allocation. */
+  auto& q = gpu_queue();
+  static thread_local ThreadUsmScratch<T> scratch(q);
+  if (n > scratch.capacity) {
+    if (scratch.ptr) {
+      sycl::free(scratch.ptr, scratch.context);
+      scratch.ptr = nullptr;
+      scratch.capacity = 0;
+    }
+    scratch.ptr = sycl::malloc_shared<T>(n, q);
+    scratch.capacity = scratch.ptr ? n : 0;
+  }
+  return scratch.ptr;
 }
 
 static float* usm_f(size_t n) { return usm_scratch<float>(n); }
@@ -529,6 +561,443 @@ bool gpu_topk(ResourcesData& r, const float* scores, int64_t rows, int64_t cols,
   return ov_topk(r, "GPU", scores, rows, cols, k, indices, values, largest);
 }
 
+ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
+                                 int64_t task_count, const float* luts,
+                                 int64_t lut_elements, const int64_t* packed_ids,
+                                 const uint8_t* packed_codes, int64_t packed_rows,
+                                 const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
+                                 int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
+                                 int32_t* packed_positions, int32_t* counts) {
+  (void)r;
+#if defined(OVVS_WITH_SYCL)
+  constexpr size_t kWorkGroupSize = 128;
+  constexpr size_t kSortCapacity = 2 * kWorkGroupSize;
+
+  if (!tasks || !luts || !packed_codes || !packed_positions || !counts ||
+      task_count <= 0 || lut_elements <= 0 || packed_rows <= 0 || nq <= 0 ||
+      pq_m <= 0 || ks <= 0 || ks > 256 || krefine <= 0) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (task_count > std::numeric_limits<int32_t>::max() ||
+      packed_rows > std::numeric_limits<int32_t>::max() ||
+      nq > std::numeric_limits<int32_t>::max()) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  if (krefine > static_cast<int32_t>(kWorkGroupSize)) {
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if ((allow_bitset == nullptr) != (allow_bitset_bytes == 0) ||
+      allow_bitset_bytes < 0 ||
+      (allow_bitset && (!packed_ids ||
+                        allow_bitset_bytes > std::numeric_limits<int64_t>::max() / 8 ||
+                        allow_bitset_bytes < (packed_rows + 7) / 8))) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+
+  size_t lut_per_task = 0;
+  size_t output_slots = 0;
+  size_t packed_code_elements = 0;
+  if (!checked_product(static_cast<size_t>(pq_m), static_cast<size_t>(ks), lut_per_task) ||
+      !checked_product(static_cast<size_t>(nq), static_cast<size_t>(krefine), output_slots) ||
+      !checked_product(static_cast<size_t>(packed_rows), static_cast<size_t>(pq_m),
+                       packed_code_elements) ||
+      lut_per_task > static_cast<size_t>(lut_elements) ||
+      static_cast<uint64_t>(lut_elements) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float)) ||
+      static_cast<uint64_t>(task_count) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(IvfPqScanTask)) ||
+      static_cast<uint64_t>(allow_bitset_bytes) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  }
+  (void)packed_code_elements;
+
+  try {
+    auto& q = gpu_queue();
+    const auto device = q.get_device();
+    if (!device.is_gpu() ||
+        device.get_info<sycl::info::device::max_work_group_size>() < kWorkGroupSize ||
+        !gpu_pointer_accessible(q, packed_codes) ||
+        (allow_bitset && !gpu_pointer_accessible(q, packed_ids))) {
+      return OVVS_STATUS_DEVICE_UNAVAILABLE;
+    }
+
+    const size_t sort_local_bytes =
+        kSortCapacity * (sizeof(float) + 2 * sizeof(int32_t));
+    const size_t local_mem_bytes = device.get_info<sycl::info::device::local_mem_size>();
+    if (lut_per_task > (std::numeric_limits<size_t>::max() - sort_local_bytes) /
+                           sizeof(float) ||
+        lut_per_task * sizeof(float) + sort_local_bytes > local_mem_bytes) {
+      return OVVS_STATUS_DEVICE_UNAVAILABLE;
+    }
+
+    std::vector<int32_t> query_task_offsets(static_cast<size_t>(nq) + 1, 0);
+    int64_t cursor = 0;
+    for (int64_t query = 0; query < nq; ++query) {
+      query_task_offsets[static_cast<size_t>(query)] = static_cast<int32_t>(cursor);
+      int64_t expected_dense_offset = 0;
+      const int64_t query_task_begin = cursor;
+      while (cursor < task_count && tasks[cursor].query_index == query) {
+        const IvfPqScanTask& task = tasks[cursor];
+        if (task.list_begin < 0 || task.list_count <= 0 ||
+            task.list_begin > packed_rows - task.list_count || task.lut_offset < 0 ||
+            task.lut_offset > lut_elements - static_cast<int64_t>(lut_per_task) ||
+            task.query_dense_offset != expected_dense_offset ||
+            task.list_count > std::numeric_limits<int32_t>::max() - expected_dense_offset) {
+          return OVVS_STATUS_INVALID_ARGUMENT;
+        }
+        const int64_t task_end = task.list_begin + task.list_count;
+        for (int64_t prior = query_task_begin; prior < cursor; ++prior) {
+          const int64_t prior_end = tasks[prior].list_begin + tasks[prior].list_count;
+          if (task.list_begin < prior_end && tasks[prior].list_begin < task_end) {
+            return OVVS_STATUS_INVALID_ARGUMENT;
+          }
+        }
+        const float* task_lut = luts + task.lut_offset;
+        for (size_t element = 0; element < lut_per_task; ++element) {
+          if (!std::isfinite(task_lut[element])) return OVVS_STATUS_INVALID_ARGUMENT;
+        }
+        expected_dense_offset += task.list_count;
+        ++cursor;
+      }
+      query_task_offsets[static_cast<size_t>(query + 1)] = static_cast<int32_t>(cursor);
+      if (cursor < task_count && tasks[cursor].query_index < query + 1) {
+        return OVVS_STATUS_INVALID_ARGUMENT;
+      }
+    }
+    if (cursor != task_count) return OVVS_STATUS_INVALID_ARGUMENT;
+
+    ScopedDeviceUsm<IvfPqScanTask> device_tasks(q, static_cast<size_t>(task_count));
+    ScopedDeviceUsm<float> device_luts(q, static_cast<size_t>(lut_elements));
+    ScopedDeviceUsm<uint8_t> device_allow(q, static_cast<size_t>(allow_bitset_bytes));
+    ScopedDeviceUsm<int32_t> device_query_offsets(q, static_cast<size_t>(nq) + 1);
+    ScopedDeviceUsm<float> list_scores(q,
+                                       static_cast<size_t>(task_count) *
+                                           static_cast<size_t>(krefine));
+    ScopedDeviceUsm<int32_t> list_ordinals(q,
+                                           static_cast<size_t>(task_count) *
+                                               static_cast<size_t>(krefine));
+    ScopedDeviceUsm<int32_t> list_positions(q,
+                                            static_cast<size_t>(task_count) *
+                                                static_cast<size_t>(krefine));
+    ScopedDeviceUsm<int32_t> device_positions(q, output_slots);
+    ScopedDeviceUsm<int32_t> device_counts(q, static_cast<size_t>(nq));
+    ScopedDeviceUsm<int32_t> invalid_input(q, 1);
+
+    std::vector<sycl::event> input_events;
+    input_events.reserve(5);
+    input_events.push_back(q.memcpy(device_tasks.get(), tasks,
+                                    static_cast<size_t>(task_count) *
+                                        sizeof(IvfPqScanTask)));
+    input_events.push_back(q.memcpy(device_luts.get(), luts,
+                                    static_cast<size_t>(lut_elements) * sizeof(float)));
+    input_events.push_back(q.memcpy(device_query_offsets.get(), query_task_offsets.data(),
+                                    (static_cast<size_t>(nq) + 1) * sizeof(int32_t)));
+    input_events.push_back(q.memset(invalid_input.get(), 0, sizeof(int32_t)));
+    if (allow_bitset) {
+      input_events.push_back(q.memcpy(device_allow.get(), allow_bitset,
+                                      static_cast<size_t>(allow_bitset_bytes)));
+    }
+
+    const IvfPqScanTask* const task_data = device_tasks.get();
+    const float* const lut_data = device_luts.get();
+    const int64_t* const id_data = packed_ids;
+    const uint8_t* const code_data = packed_codes;
+    const uint8_t* const allow_data = allow_bitset ? device_allow.get() : nullptr;
+    float* const task_scores = list_scores.get();
+    int32_t* const task_ordinals = list_ordinals.get();
+    int32_t* const task_positions = list_positions.get();
+    int32_t* const invalid = invalid_input.get();
+    const int32_t M = pq_m;
+    const int32_t KS = ks;
+    const int32_t K = krefine;
+    const int64_t valid_id_rows = packed_rows;
+
+    const sycl::event scan_event = q.submit([&](sycl::handler& h) {
+      h.depends_on(input_events);
+      sycl::local_accessor<float, 1> local_lut(sycl::range<1>(lut_per_task), h);
+      sycl::local_accessor<float, 1> local_scores(sycl::range<1>(kSortCapacity), h);
+      sycl::local_accessor<int32_t, 1> local_ordinals(sycl::range<1>(kSortCapacity), h);
+      sycl::local_accessor<int32_t, 1> local_positions(sycl::range<1>(kSortCapacity), h);
+      h.parallel_for(
+          sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(task_count) * kWorkGroupSize),
+                            sycl::range<1>(kWorkGroupSize)),
+          [=](sycl::nd_item<1> item) {
+            const size_t task_index = item.get_group_linear_id();
+            const size_t lane = item.get_local_linear_id();
+            const IvfPqScanTask task = task_data[task_index];
+            const float infinity = std::numeric_limits<float>::infinity();
+            const int32_t no_ordinal = std::numeric_limits<int32_t>::max();
+
+            for (size_t element = lane; element < lut_per_task;
+                 element += kWorkGroupSize) {
+              local_lut[element] = lut_data[static_cast<size_t>(task.lut_offset) + element];
+            }
+            if (lane < static_cast<size_t>(K)) {
+              local_scores[lane] = infinity;
+              local_ordinals[lane] = no_ordinal;
+              local_positions[lane] = -1;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            for (int64_t base = 0; base < task.list_count;
+                 base += static_cast<int64_t>(kWorkGroupSize)) {
+              const size_t incoming = static_cast<size_t>(K) + lane;
+              const int64_t row = base + static_cast<int64_t>(lane);
+              float score = infinity;
+              int32_t ordinal = no_ordinal;
+              int32_t position = -1;
+              if (row < task.list_count) {
+                const int64_t packed_position = task.list_begin + row;
+                bool candidate_allowed = true;
+                if (allow_data) {
+                  const int64_t id = id_data[packed_position];
+                  if (id < 0 || id >= valid_id_rows) {
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space>(*invalid)
+                        .fetch_or(1);
+                    candidate_allowed = false;
+                  } else {
+                    candidate_allowed =
+                        ((allow_data[static_cast<size_t>(id >> 3)] >> (id & 7)) & 1u) != 0;
+                  }
+                }
+                if (candidate_allowed) {
+                  float candidate_score = 0.f;
+                  bool code_valid = true;
+                  const size_t code_offset =
+                      static_cast<size_t>(packed_position) * static_cast<size_t>(M);
+                  for (int32_t subspace = 0; subspace < M; ++subspace) {
+                    const uint8_t code = code_data[code_offset + static_cast<size_t>(subspace)];
+                    if (static_cast<int32_t>(code) >= KS) {
+                      sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                       sycl::memory_scope::device,
+                                       sycl::access::address_space::global_space>(*invalid)
+                          .fetch_or(1);
+                      code_valid = false;
+                      break;
+                    }
+                    candidate_score +=
+                        local_lut[static_cast<size_t>(subspace) * static_cast<size_t>(KS) +
+                                  static_cast<size_t>(code)];
+                  }
+                  if (code_valid && sycl::isfinite(candidate_score)) {
+                    score = candidate_score;
+                    ordinal = static_cast<int32_t>(task.query_dense_offset + row);
+                    position = static_cast<int32_t>(packed_position);
+                  } else if (code_valid) {
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space>(*invalid)
+                        .fetch_or(1);
+                  }
+                }
+              }
+              local_scores[incoming] = score;
+              local_ordinals[incoming] = ordinal;
+              local_positions[incoming] = position;
+              if (lane < kWorkGroupSize - static_cast<size_t>(K)) {
+                const size_t unused = static_cast<size_t>(K) + kWorkGroupSize + lane;
+                local_scores[unused] = infinity;
+                local_ordinals[unused] = no_ordinal;
+                local_positions[unused] = -1;
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+
+              for (size_t width = 2; width <= kSortCapacity; width <<= 1) {
+                for (size_t stride = width >> 1; stride > 0; stride >>= 1) {
+                  const size_t left =
+                      (lane / stride) * (stride << 1) + (lane % stride);
+                  const size_t right = left + stride;
+                  const float left_score = local_scores[left];
+                  const float right_score = local_scores[right];
+                  const int32_t left_ordinal = local_ordinals[left];
+                  const int32_t right_ordinal = local_ordinals[right];
+                  const bool left_better =
+                      left_score < right_score ||
+                      (left_score == right_score && left_ordinal < right_ordinal);
+                  const bool right_better =
+                      right_score < left_score ||
+                      (right_score == left_score && right_ordinal < left_ordinal);
+                  const bool ascending = (left & width) == 0;
+                  if ((ascending && right_better) || (!ascending && left_better)) {
+                    local_scores[left] = right_score;
+                    local_scores[right] = left_score;
+                    local_ordinals[left] = right_ordinal;
+                    local_ordinals[right] = left_ordinal;
+                    const int32_t left_position = local_positions[left];
+                    local_positions[left] = local_positions[right];
+                    local_positions[right] = left_position;
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+              }
+            }
+
+            if (lane < static_cast<size_t>(K)) {
+              const size_t output = task_index * static_cast<size_t>(K) + lane;
+              task_scores[output] = local_scores[lane];
+              task_ordinals[output] = local_ordinals[lane];
+              task_positions[output] = local_positions[lane];
+            }
+          });
+    });
+
+    const int32_t* const query_offsets = device_query_offsets.get();
+    int32_t* const output_positions = device_positions.get();
+    int32_t* const output_counts = device_counts.get();
+    const sycl::event merge_event = q.submit([&](sycl::handler& h) {
+      h.depends_on(scan_event);
+      sycl::local_accessor<float, 1> local_scores(sycl::range<1>(kSortCapacity), h);
+      sycl::local_accessor<int32_t, 1> local_ordinals(sycl::range<1>(kSortCapacity), h);
+      sycl::local_accessor<int32_t, 1> local_positions(sycl::range<1>(kSortCapacity), h);
+      h.parallel_for(
+          sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(nq) * kWorkGroupSize),
+                            sycl::range<1>(kWorkGroupSize)),
+          [=](sycl::nd_item<1> item) {
+            const size_t query = item.get_group_linear_id();
+            const size_t lane = item.get_local_linear_id();
+            const float infinity = std::numeric_limits<float>::infinity();
+            const int32_t no_ordinal = std::numeric_limits<int32_t>::max();
+            if (lane < static_cast<size_t>(K)) {
+              local_scores[lane] = infinity;
+              local_ordinals[lane] = no_ordinal;
+              local_positions[lane] = -1;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            const int32_t task_begin = query_offsets[query];
+            const int32_t task_end = query_offsets[query + 1];
+            for (int32_t task = task_begin; task < task_end; ++task) {
+              const size_t incoming = static_cast<size_t>(K) + lane;
+              if (lane < static_cast<size_t>(K)) {
+                const size_t source = static_cast<size_t>(task) * static_cast<size_t>(K) + lane;
+                local_scores[incoming] = task_scores[source];
+                local_ordinals[incoming] = task_ordinals[source];
+                local_positions[incoming] = task_positions[source];
+              } else {
+                local_scores[incoming] = infinity;
+                local_ordinals[incoming] = no_ordinal;
+                local_positions[incoming] = -1;
+              }
+              if (lane < kWorkGroupSize - static_cast<size_t>(K)) {
+                const size_t unused = static_cast<size_t>(K) + kWorkGroupSize + lane;
+                local_scores[unused] = infinity;
+                local_ordinals[unused] = no_ordinal;
+                local_positions[unused] = -1;
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+
+              for (size_t width = 2; width <= kSortCapacity; width <<= 1) {
+                for (size_t stride = width >> 1; stride > 0; stride >>= 1) {
+                  const size_t left =
+                      (lane / stride) * (stride << 1) + (lane % stride);
+                  const size_t right = left + stride;
+                  const float left_score = local_scores[left];
+                  const float right_score = local_scores[right];
+                  const int32_t left_ordinal = local_ordinals[left];
+                  const int32_t right_ordinal = local_ordinals[right];
+                  const bool left_better =
+                      left_score < right_score ||
+                      (left_score == right_score && left_ordinal < right_ordinal);
+                  const bool right_better =
+                      right_score < left_score ||
+                      (right_score == left_score && right_ordinal < left_ordinal);
+                  const bool ascending = (left & width) == 0;
+                  if ((ascending && right_better) || (!ascending && left_better)) {
+                    local_scores[left] = right_score;
+                    local_scores[right] = left_score;
+                    local_ordinals[left] = right_ordinal;
+                    local_ordinals[right] = left_ordinal;
+                    const int32_t left_position = local_positions[left];
+                    local_positions[left] = local_positions[right];
+                    local_positions[right] = left_position;
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+              }
+            }
+
+            if (lane < static_cast<size_t>(K)) {
+              output_positions[query * static_cast<size_t>(K) + lane] =
+                  local_positions[lane];
+            }
+            if (lane == 0) {
+              int32_t selected = 0;
+              for (int32_t rank = 0; rank < K; ++rank) {
+                if (local_positions[static_cast<size_t>(rank)] >= 0) ++selected;
+              }
+              output_counts[query] = selected;
+            }
+          });
+    });
+
+    std::vector<int32_t> staged_positions(output_slots, -1);
+    std::vector<int32_t> staged_counts(static_cast<size_t>(nq), 0);
+    int32_t invalid_value = 0;
+    sycl::event positions_copy = q.submit([&](sycl::handler& h) {
+      h.depends_on(merge_event);
+      h.memcpy(staged_positions.data(), output_positions, output_slots * sizeof(int32_t));
+    });
+    sycl::event counts_copy = q.submit([&](sycl::handler& h) {
+      h.depends_on(merge_event);
+      h.memcpy(staged_counts.data(), output_counts,
+               static_cast<size_t>(nq) * sizeof(int32_t));
+    });
+    sycl::event invalid_copy = q.submit([&](sycl::handler& h) {
+      h.depends_on(merge_event);
+      h.memcpy(&invalid_value, invalid, sizeof(int32_t));
+    });
+    positions_copy.wait_and_throw();
+    counts_copy.wait_and_throw();
+    invalid_copy.wait_and_throw();
+    if (invalid_value != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+
+    for (int64_t query = 0; query < nq; ++query) {
+      const int32_t selected = staged_counts[static_cast<size_t>(query)];
+      if (selected < 0 || selected > K) return OVVS_STATUS_ERROR;
+      for (int32_t rank = 0; rank < K; ++rank) {
+        const int32_t position =
+            staged_positions[static_cast<size_t>(query) * static_cast<size_t>(K) +
+                             static_cast<size_t>(rank)];
+        if ((rank < selected && (position < 0 || position >= packed_rows)) ||
+            (rank >= selected && position != -1)) {
+          return OVVS_STATUS_ERROR;
+        }
+      }
+    }
+    std::memcpy(packed_positions, staged_positions.data(), output_slots * sizeof(int32_t));
+    std::memcpy(counts, staged_counts.data(), static_cast<size_t>(nq) * sizeof(int32_t));
+    r.last_compute_dtype = OVVS_DTYPE_F32;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::length_error&) {
+    return OVVS_STATUS_SHAPE_MISMATCH;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+#else
+  (void)tasks;
+  (void)task_count;
+  (void)luts;
+  (void)lut_elements;
+  (void)packed_ids;
+  (void)packed_codes;
+  (void)packed_rows;
+  (void)allow_bitset;
+  (void)allow_bitset_bytes;
+  (void)nq;
+  (void)pq_m;
+  (void)ks;
+  (void)krefine;
+  (void)packed_positions;
+  (void)counts;
+  return OVVS_STATUS_DEVICE_UNAVAILABLE;
+#endif
+}
+
 bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64_t dim,
                      const int64_t* idx, int64_t nidx, float* out) {
 #if defined(OVVS_WITH_SYCL)
@@ -560,6 +1029,11 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
     return true;
   } catch (...) {
   }
+#endif
+#if defined(OVVS_WITH_SYCL)
+  /* A persistent shared dataset must never fall through to an OpenVINO Gather
+     that re-uploads the full index after a direct SYCL failure. */
+  if (ovvs_usm_is_shared(src)) return false;
 #endif
   return ov_gather_rows(r, "GPU", src, src_rows, dim, idx, nidx, out);
 }

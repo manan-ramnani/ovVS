@@ -333,12 +333,6 @@ def enumerate_lanes(algorithms: Sequence[str], policies: Sequence[str], n: int,
                     "and cannot be reported as an NPU lane."
                 )
                 expected_skip = True
-            elif algorithm == "ivf-pq" and policy == "gpu":
-                reason = (
-                    "IVF-PQ ADC has NPU and CPU paths but no iGPU backend; FORCE_GPU fails closed and "
-                    "cannot be reported as a GPU lane."
-                )
-                expected_skip = True
             elif algorithm == "cagra" and n > 4_096 and not allow_unscalable_cagra:
                 reason = (
                     "B5 full-scale evidence gate: GPU NN-Descent is implemented, but CAGRA build quality, "

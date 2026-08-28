@@ -177,6 +177,46 @@ static PqAdcStatsSnapshot pq_adc_stats(ovvsResources_t resources) {
           data->pq_adc_npu_rows,    data->pq_adc_cpu_rows};
 }
 
+static void require_ivfpq_test_gpu(ovvsResources_t resources) {
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(resources, &gpu),
+                "IVF-PQ GPU availability");
+  if (!gpu) skip_test("GPU device unavailable");
+}
+
+static void expect_ivfpq_results_equal(const std::vector<int64_t>& actual_ids,
+                                       const std::vector<float>& actual_distances,
+                                       const std::vector<int64_t>& expected_ids,
+                                       const std::vector<float>& expected_distances,
+                                       const std::string& label) {
+  expect(actual_ids.size() == expected_ids.size() &&
+             actual_distances.size() == expected_distances.size() &&
+             actual_ids.size() == actual_distances.size(),
+         label + " result shape");
+  for (size_t i = 0; i < actual_ids.size(); ++i) {
+    expect(actual_ids[i] == expected_ids[i],
+           label + " ID mismatch at " + std::to_string(i) + ": got " +
+               std::to_string(actual_ids[i]) + ", expected " +
+               std::to_string(expected_ids[i]));
+    if (std::isinf(expected_distances[i])) {
+      expect(std::isinf(actual_distances[i]) &&
+                 std::signbit(actual_distances[i]) ==
+                     std::signbit(expected_distances[i]),
+             label + " infinite distance mismatch at " + std::to_string(i));
+      continue;
+    }
+    const float tolerance =
+        2e-4f * std::max(1.0f, std::fabs(expected_distances[i]));
+    expect(std::isfinite(actual_distances[i]) &&
+               std::fabs(actual_distances[i] - expected_distances[i]) <= tolerance,
+           label + " distance mismatch at " + std::to_string(i) + ": got " +
+               std::to_string(actual_distances[i]) + ", expected " +
+               std::to_string(expected_distances[i]) + ", tolerance " +
+               std::to_string(tolerance));
+  }
+}
+
 static std::vector<uint8_t> read_binary_file(const std::filesystem::path& path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   expect(static_cast<bool>(file), "open binary file for reading");
@@ -1028,6 +1068,435 @@ OVVS_TEST(ivf_pq_auto_matches_cpu_on_wide_range) {
            "wide-range ivfpq AUTO/CPU distance parity");
   }
   ovvsIvfPqDestroy(ix);
+}
+
+OVVS_TEST(ivf_pq_fused_gpu_parity_filters_tail_and_blocks) {
+  Res res;
+  require_ivfpq_test_gpu(res.r);
+  constexpr int64_t n = 65;
+  constexpr int64_t dim = 8;
+  constexpr int64_t nq = 33;
+  constexpr int64_t k = 8;
+  constexpr int32_t nlist = 7;
+  constexpr int32_t pq_m = 4;
+  constexpr int32_t pq_nbits = 4;
+  auto data = make_data(n, dim, 224);
+  auto queries = make_data(nq, dim, 225);
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "fused IVF-PQ CPU build policy");
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, pq_m, pq_nbits,
+                               &index),
+                "fused IVF-PQ CPU build");
+
+  struct SearchResult {
+    std::vector<int64_t> ids;
+    std::vector<float> distances;
+  };
+  auto search = [&](ovvsPolicy policy, const uint8_t* filter,
+                    const char* label) {
+    expect_status(ovvsResourcesSetPolicy(res.r, policy), label);
+    SearchResult result{std::vector<int64_t>(static_cast<size_t>(nq * k), -9),
+                        std::vector<float>(static_cast<size_t>(nq * k), -9.f)};
+    expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
+                                  static_cast<int32_t>(n), filter,
+                                  result.ids.data(), result.distances.data()),
+                  label);
+    return result;
+  };
+
+  std::vector<uint8_t> all_allowed(static_cast<size_t>((n + 7) / 8), 0xffu);
+  std::vector<uint8_t> selective(all_allowed.size(), 0u);
+  for (const int64_t id : {int64_t{0}, int64_t{1}, int64_t{31}, int64_t{32}}) {
+    selective[static_cast<size_t>(id >> 3)] |=
+        static_cast<uint8_t>(1u << (id & 7));
+  }
+  /* The last byte deliberately sets ID 64 and every out-of-range tail bit. */
+  selective.back() = 0xffu;
+  std::vector<uint8_t> empty(all_allowed.size(), 0u);
+
+  const SearchResult cpu_null =
+      search(OVVS_POLICY_FORCE_CPU, nullptr, "fused IVF-PQ CPU null-filter search");
+  const SearchResult cpu_all = search(OVVS_POLICY_FORCE_CPU, all_allowed.data(),
+                                      "fused IVF-PQ CPU all-filter search");
+  const SearchResult cpu_selective =
+      search(OVVS_POLICY_FORCE_CPU, selective.data(),
+             "fused IVF-PQ CPU selective-filter search");
+  const SearchResult cpu_empty = search(OVVS_POLICY_FORCE_CPU, empty.data(),
+                                        "fused IVF-PQ CPU empty-filter search");
+  expect_ivfpq_results_equal(cpu_all.ids, cpu_all.distances, cpu_null.ids,
+                             cpu_null.distances,
+                             "all-allowed filter versus null CPU reference");
+
+  const IvfPqStatsSnapshot before_gpu = ivfpq_stats(res.r);
+  const SearchResult gpu_null =
+      search(OVVS_POLICY_FORCE_GPU, nullptr, "fused IVF-PQ GPU null-filter search");
+  const SearchResult gpu_all = search(OVVS_POLICY_FORCE_GPU, all_allowed.data(),
+                                      "fused IVF-PQ GPU all-filter search");
+  const SearchResult gpu_selective =
+      search(OVVS_POLICY_FORCE_GPU, selective.data(),
+             "fused IVF-PQ GPU selective-filter search");
+  const SearchResult gpu_empty = search(OVVS_POLICY_FORCE_GPU, empty.data(),
+                                        "fused IVF-PQ GPU empty-filter search");
+  expect_ivfpq_results_equal(gpu_null.ids, gpu_null.distances, cpu_null.ids,
+                             cpu_null.distances, "fused GPU null filter");
+  expect_ivfpq_results_equal(gpu_all.ids, gpu_all.distances, cpu_all.ids,
+                             cpu_all.distances, "fused GPU all filter");
+  expect_ivfpq_results_equal(gpu_selective.ids, gpu_selective.distances,
+                             cpu_selective.ids, cpu_selective.distances,
+                             "fused GPU selective filter");
+  expect_ivfpq_results_equal(gpu_empty.ids, gpu_empty.distances, cpu_empty.ids,
+                             cpu_empty.distances, "fused GPU empty filter");
+
+  for (int64_t q = 0; q < nq; ++q) {
+    std::set<int64_t> returned;
+    for (int64_t t = 0; t < k; ++t) {
+      const size_t offset = static_cast<size_t>(q * k + t);
+      const int64_t id = gpu_selective.ids[offset];
+      if (t < 5) {
+        expect(id >= 0 && id < n &&
+                   (selective[static_cast<size_t>(id >> 3)] &
+                    static_cast<uint8_t>(1u << (id & 7))) != 0,
+               "selective GPU result must be an allowed in-range ID");
+        returned.insert(id);
+      } else {
+        expect(id == -1 && std::isinf(gpu_selective.distances[offset]) &&
+                   !std::signbit(gpu_selective.distances[offset]),
+               "selective GPU search must fill exhausted results with -1/+inf");
+      }
+    }
+    expect(returned.size() == 5,
+           "selective GPU search must return each of five allowed IDs once");
+  }
+  for (size_t i = 0; i < gpu_empty.ids.size(); ++i) {
+    expect(gpu_empty.ids[i] == -1 && std::isinf(gpu_empty.distances[i]) &&
+               !std::signbit(gpu_empty.distances[i]),
+           "empty GPU filter must publish only -1/+inf");
+  }
+
+  const IvfPqStatsSnapshot after_gpu = ivfpq_stats(res.r);
+  const int64_t scanned_rows = nq * n;
+  expect(after_gpu.unfiltered_direct_rows ==
+             before_gpu.unfiltered_direct_rows + scanned_rows &&
+             after_gpu.unfiltered_id_copy_bytes_avoided ==
+                 before_gpu.unfiltered_id_copy_bytes_avoided +
+                     scanned_rows * static_cast<int64_t>(sizeof(int64_t)) &&
+             after_gpu.selected_id_resolutions ==
+                 before_gpu.selected_id_resolutions + scanned_rows,
+         "successful unfiltered fused scan records rows and shortlist-only ID resolution");
+  expect(after_gpu.filtered_code_copy_bytes ==
+             before_gpu.filtered_code_copy_bytes,
+         "filtered fused scan must not publish host code-copy bytes");
+
+  ovvsIvfPqDestroy(index);
+
+  /* Find a singleton list by observing the successful route's scanned-row
+     counter. This avoids depending on the private index or serialized layout.
+     Repeating that row 33 times crosses the 32-query block limit without the
+     independent candidate-row cap splitting the block earlier. */
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "block-split IVF-PQ CPU build policy");
+  constexpr int32_t split_nlist = 64;
+  ovvsIvfPqIndex_t split_index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, split_nlist, pq_m,
+                               pq_nbits,
+                               &split_index),
+                "block-split IVF-PQ CPU build");
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU),
+                "block-split singleton discovery GPU policy");
+  int64_t singleton_id = -1;
+  for (int64_t row = 0; row < n; ++row) {
+    int64_t probe_id = -1;
+    float probe_distance = -1.f;
+    const IvfPqStatsSnapshot before_probe = ivfpq_stats(res.r);
+    expect_status(ovvsIvfPqSearch(res.r, split_index, data.data() + row * dim,
+                                  1, 1, 1, 1, nullptr, &probe_id,
+                                  &probe_distance),
+                  "block-split singleton discovery search");
+    const IvfPqStatsSnapshot after_probe = ivfpq_stats(res.r);
+    if (after_probe.unfiltered_direct_rows ==
+            before_probe.unfiltered_direct_rows + 1 &&
+        probe_id == row && std::fabs(probe_distance) < 1e-6f) {
+      singleton_id = row;
+      break;
+    }
+  }
+  expect(singleton_id >= 0 && singleton_id < n,
+         "block-split fixture must contain one in-range singleton list");
+  std::vector<float> split_queries(static_cast<size_t>(nq * dim));
+  for (int64_t q = 0; q < nq; ++q) {
+    std::memcpy(split_queries.data() + static_cast<size_t>(q * dim),
+                data.data() + static_cast<size_t>(singleton_id * dim),
+                static_cast<size_t>(dim) * sizeof(float));
+  }
+  std::vector<int64_t> split_cpu_ids(static_cast<size_t>(nq));
+  std::vector<int64_t> split_gpu_ids(static_cast<size_t>(nq));
+  std::vector<float> split_cpu_distances(static_cast<size_t>(nq));
+  std::vector<float> split_gpu_distances(static_cast<size_t>(nq));
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "block-split IVF-PQ CPU search policy");
+  expect_status(ovvsIvfPqSearch(res.r, split_index, split_queries.data(), nq, 1,
+                                1, 1, nullptr, split_cpu_ids.data(),
+                                split_cpu_distances.data()),
+                "block-split IVF-PQ CPU search");
+  const IvfPqStatsSnapshot before_split_gpu = ivfpq_stats(res.r);
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU),
+                "block-split IVF-PQ GPU policy");
+  expect_status(ovvsIvfPqSearch(res.r, split_index, split_queries.data(), nq, 1,
+                                1, 1, nullptr, split_gpu_ids.data(),
+                                split_gpu_distances.data()),
+                "block-split IVF-PQ GPU search");
+  expect_ivfpq_results_equal(split_gpu_ids, split_gpu_distances, split_cpu_ids,
+                             split_cpu_distances,
+                             "fused GPU 33-query block split");
+  expect(std::all_of(split_gpu_ids.begin(), split_gpu_ids.end(),
+                     [&](int64_t id) { return id == singleton_id; }),
+         "block-split GPU search must preserve the singleton list ID");
+  const IvfPqStatsSnapshot after_split_gpu = ivfpq_stats(res.r);
+  expect(after_split_gpu.unfiltered_direct_rows ==
+             before_split_gpu.unfiltered_direct_rows + nq &&
+             after_split_gpu.unfiltered_id_copy_bytes_avoided ==
+                 before_split_gpu.unfiltered_id_copy_bytes_avoided +
+                     nq * static_cast<int64_t>(sizeof(int64_t)) &&
+             after_split_gpu.selected_id_resolutions ==
+                 before_split_gpu.selected_id_resolutions + nq,
+         "33-query block fixture must scan and resolve exactly one row per query");
+  ovvsDevice last = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(res.r, &last),
+                "fused IVF-PQ last device");
+  expect(last == OVVS_DEVICE_GPU,
+         "successful fused IVF-PQ search must attribute the GPU");
+  ovvsIvfPqDestroy(split_index);
+}
+
+OVVS_TEST(ivf_pq_fused_gpu_krefine_ties_and_atomicity) {
+  Res res;
+  require_ivfpq_test_gpu(res.r);
+  constexpr int64_t n = 129;
+  constexpr int64_t dim = 4;
+  constexpr int32_t pq_m = 2;
+  constexpr int32_t pq_nbits = 4;
+  std::vector<float> data(static_cast<size_t>(n * dim), 0.f);
+  const float query[dim] = {};
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "tie IVF-PQ CPU build policy");
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, 1, pq_m, pq_nbits,
+                               &index),
+                "tie IVF-PQ CPU build");
+
+  auto search = [&](ovvsPolicy policy, int64_t k, int32_t krefine,
+                    const char* label) {
+    expect_status(ovvsResourcesSetPolicy(res.r, policy), label);
+    std::pair<std::vector<int64_t>, std::vector<float>> result{
+        std::vector<int64_t>(static_cast<size_t>(k), -1),
+        std::vector<float>(static_cast<size_t>(k), -1.f)};
+    expect_status(ovvsIvfPqSearch(res.r, index, query, 1, k, 1, krefine,
+                                  nullptr, result.first.data(),
+                                  result.second.data()),
+                  label);
+    return result;
+  };
+
+  const auto cpu_one =
+      search(OVVS_POLICY_FORCE_CPU, 1, 1, "krefine=1 CPU search");
+  const auto gpu_one =
+      search(OVVS_POLICY_FORCE_GPU, 1, 1, "krefine=1 GPU search");
+  expect_ivfpq_results_equal(gpu_one.first, gpu_one.second, cpu_one.first,
+                             cpu_one.second, "fused GPU krefine=1");
+  expect(gpu_one.first[0] == 0 && gpu_one.second[0] == 0.f,
+         "equal-score krefine=1 must select ordinal zero");
+
+  const auto cpu_128 =
+      search(OVVS_POLICY_FORCE_CPU, 8, 128, "krefine=128 CPU search");
+  const auto gpu_128 =
+      search(OVVS_POLICY_FORCE_GPU, 8, 128, "krefine=128 GPU search");
+  const auto gpu_128_repeat =
+      search(OVVS_POLICY_FORCE_GPU, 8, 128, "krefine=128 repeated GPU search");
+  expect_ivfpq_results_equal(gpu_128.first, gpu_128.second, cpu_128.first,
+                             cpu_128.second, "fused GPU krefine=128");
+  expect_ivfpq_results_equal(gpu_128_repeat.first, gpu_128_repeat.second,
+                             gpu_128.first, gpu_128.second,
+                             "fused GPU deterministic equal-score repeat");
+  for (int64_t i = 0; i < 8; ++i) {
+    expect(gpu_128.first[static_cast<size_t>(i)] == i &&
+               gpu_128.second[static_cast<size_t>(i)] == 0.f,
+           "equal-score fused selection must use dense ordinal as tie-break");
+  }
+
+  const int64_t id_canary = INT64_C(0x123456789abcdef);
+  const float distance_canary = -12345.25f;
+  std::vector<int64_t> rejected_ids(8, id_canary);
+  std::vector<float> rejected_distances(8, distance_canary);
+  const IvfPqStatsSnapshot before_rejection = ivfpq_stats(res.r);
+  expect(ovvsIvfPqSearch(res.r, index, query, 1, 8, 1, 129, nullptr,
+                         rejected_ids.data(), rejected_distances.data()) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "krefine=129 must fail as an unsupported forced-GPU shape");
+  expect(std::all_of(rejected_ids.begin(), rejected_ids.end(),
+                     [&](int64_t value) { return value == id_canary; }) &&
+             std::all_of(rejected_distances.begin(), rejected_distances.end(),
+                         [&](float value) { return value == distance_canary; }),
+         "failed fused GPU search must preserve caller output canaries");
+  const IvfPqStatsSnapshot after_rejection = ivfpq_stats(res.r);
+  expect(after_rejection.packed_rebuilds == before_rejection.packed_rebuilds &&
+             after_rejection.packed_rebuild_rows ==
+                 before_rejection.packed_rebuild_rows &&
+             after_rejection.unfiltered_direct_rows ==
+                 before_rejection.unfiltered_direct_rows &&
+             after_rejection.unfiltered_id_copy_bytes_avoided ==
+                 before_rejection.unfiltered_id_copy_bytes_avoided &&
+             after_rejection.selected_id_resolutions ==
+                 before_rejection.selected_id_resolutions &&
+             after_rejection.filtered_code_copy_bytes ==
+                 before_rejection.filtered_code_copy_bytes,
+         "failed fused GPU search must publish no IVF-PQ layout telemetry");
+  ovvsIvfPqDestroy(index);
+}
+
+OVVS_TEST(ivf_pq_fused_gpu_persistence_extend_and_concurrency) {
+  Res res;
+  require_ivfpq_test_gpu(res.r);
+  constexpr int64_t n = 65;
+  constexpr int64_t nextra = 7;
+  constexpr int64_t dim = 8;
+  constexpr int64_t nq_a = 6;
+  constexpr int64_t nq_b = 5;
+  constexpr int64_t k = 7;
+  constexpr int32_t nlist = 7;
+  constexpr int32_t pq_m = 4;
+  constexpr int32_t pq_nbits = 4;
+  constexpr int32_t extended_n = static_cast<int32_t>(n + nextra);
+  auto data = make_data(n, dim, 226);
+  auto extra = make_data(nextra, dim, 227);
+  auto queries_a = make_data(nq_a, dim, 228);
+  auto queries_b = make_data(nq_b, dim, 229);
+  const auto base_path = unique_temp_file("ovvs_ivfpq_fused_gpu_base");
+  const auto extended_path = unique_temp_file("ovvs_ivfpq_fused_gpu_extended");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "persistent IVF-PQ CPU build policy");
+  ovvsIvfPqIndex_t original = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, pq_m, pq_nbits,
+                               &original),
+                "persistent IVF-PQ CPU build");
+  expect_status(ovvsIvfPqSerialize(original, base_path.string().c_str()),
+                "persistent IVF-PQ base serialize");
+  ovvsIvfPqIndex_t extended = nullptr;
+  expect_status(ovvsIvfPqDeserialize(res.r, base_path.string().c_str(), &extended),
+                "persistent IVF-PQ base deserialize");
+  expect_status(ovvsIvfPqExtend(res.r, extended, extra.data(), nextra),
+                "persistent IVF-PQ extend");
+
+  auto search = [&](ovvsResources_t resources, ovvsIvfPqIndex_t search_index,
+                    const float* queries, int64_t nq, ovvsPolicy policy,
+                    std::vector<int64_t>& ids, std::vector<float>& distances,
+                    const char* label) {
+    expect_status(ovvsResourcesSetPolicy(resources, policy), label);
+    ids.assign(static_cast<size_t>(nq * k), -1);
+    distances.assign(static_cast<size_t>(nq * k), -1.f);
+    return ovvsIvfPqSearch(resources, search_index, queries, nq, k, nlist,
+                           extended_n, nullptr, ids.data(), distances.data());
+  };
+
+  std::vector<int64_t> extended_cpu_ids;
+  std::vector<int64_t> extended_gpu_ids;
+  std::vector<float> extended_cpu_distances;
+  std::vector<float> extended_gpu_distances;
+  expect_status(search(res.r, extended, queries_a.data(), nq_a,
+                       OVVS_POLICY_FORCE_CPU, extended_cpu_ids,
+                       extended_cpu_distances,
+                       "extended IVF-PQ CPU search policy"),
+                "extended IVF-PQ CPU search");
+  expect_status(search(res.r, extended, queries_a.data(), nq_a,
+                       OVVS_POLICY_FORCE_GPU, extended_gpu_ids,
+                       extended_gpu_distances,
+                       "extended IVF-PQ GPU search policy"),
+                "extended IVF-PQ GPU search");
+  expect_ivfpq_results_equal(extended_gpu_ids, extended_gpu_distances,
+                             extended_cpu_ids, extended_cpu_distances,
+                             "fused GPU search after deserialize and extend");
+
+  expect_status(ovvsIvfPqSerialize(extended, extended_path.string().c_str()),
+                "persistent IVF-PQ extended serialize");
+  ovvsIvfPqIndex_t refreshed = nullptr;
+  expect_status(
+      ovvsIvfPqDeserialize(res.r, extended_path.string().c_str(), &refreshed),
+      "persistent IVF-PQ extended deserialize");
+
+  std::vector<int64_t> cpu_a_ids;
+  std::vector<int64_t> cpu_b_ids;
+  std::vector<float> cpu_a_distances;
+  std::vector<float> cpu_b_distances;
+  expect_status(search(res.r, refreshed, queries_a.data(), nq_a,
+                       OVVS_POLICY_FORCE_CPU, cpu_a_ids, cpu_a_distances,
+                       "refreshed IVF-PQ CPU A policy"),
+                "refreshed IVF-PQ CPU A search");
+  expect_ivfpq_results_equal(cpu_a_ids, cpu_a_distances, extended_cpu_ids,
+                             extended_cpu_distances,
+                             "extended IVF-PQ serialization parity");
+  expect_status(search(res.r, refreshed, queries_b.data(), nq_b,
+                       OVVS_POLICY_FORCE_CPU, cpu_b_ids, cpu_b_distances,
+                       "refreshed IVF-PQ CPU B policy"),
+                "refreshed IVF-PQ CPU B search");
+
+  Res gpu_a;
+  Res gpu_b;
+  require_ivfpq_test_gpu(gpu_a.r);
+  require_ivfpq_test_gpu(gpu_b.r);
+  expect_status(ovvsResourcesSetPolicy(gpu_a.r, OVVS_POLICY_FORCE_GPU),
+                "concurrent IVF-PQ GPU A policy");
+  expect_status(ovvsResourcesSetPolicy(gpu_b.r, OVVS_POLICY_FORCE_GPU),
+                "concurrent IVF-PQ GPU B policy");
+  std::vector<int64_t> gpu_a_ids(static_cast<size_t>(nq_a * k), -1);
+  std::vector<int64_t> gpu_b_ids(static_cast<size_t>(nq_b * k), -1);
+  std::vector<float> gpu_a_distances(static_cast<size_t>(nq_a * k), -1.f);
+  std::vector<float> gpu_b_distances(static_cast<size_t>(nq_b * k), -1.f);
+  ovvsStatus status_a = OVVS_STATUS_ERROR;
+  ovvsStatus status_b = OVVS_STATUS_ERROR;
+  std::latch start(2);
+  std::thread thread_a([&] {
+    start.arrive_and_wait();
+    status_a = ovvsIvfPqSearch(gpu_a.r, refreshed, queries_a.data(), nq_a, k,
+                               nlist, extended_n, nullptr, gpu_a_ids.data(),
+                               gpu_a_distances.data());
+  });
+  std::thread thread_b([&] {
+    start.arrive_and_wait();
+    status_b = ovvsIvfPqSearch(gpu_b.r, refreshed, queries_b.data(), nq_b, k,
+                               nlist, extended_n, nullptr, gpu_b_ids.data(),
+                               gpu_b_distances.data());
+  });
+  thread_a.join();
+  thread_b.join();
+  expect_status(status_a, "concurrent fused IVF-PQ GPU A search");
+  expect_status(status_b, "concurrent fused IVF-PQ GPU B search");
+  expect_ivfpq_results_equal(gpu_a_ids, gpu_a_distances, cpu_a_ids,
+                             cpu_a_distances,
+                             "concurrent fused GPU resource A");
+  expect_ivfpq_results_equal(gpu_b_ids, gpu_b_distances, cpu_b_ids,
+                             cpu_b_distances,
+                             "concurrent fused GPU resource B");
+  ovvsDevice last_a = OVVS_DEVICE_CPU;
+  ovvsDevice last_b = OVVS_DEVICE_CPU;
+  expect_status(ovvsResourcesLastDevice(gpu_a.r, &last_a),
+                "concurrent IVF-PQ GPU A last device");
+  expect_status(ovvsResourcesLastDevice(gpu_b.r, &last_b),
+                "concurrent IVF-PQ GPU B last device");
+  expect(last_a == OVVS_DEVICE_GPU && last_b == OVVS_DEVICE_GPU,
+         "each concurrent resource must attribute successful fused search to GPU");
+
+  ovvsIvfPqDestroy(refreshed);
+  ovvsIvfPqDestroy(extended);
+  ovvsIvfPqDestroy(original);
+  std::filesystem::remove(base_path);
+  std::filesystem::remove(extended_path);
 }
 
 OVVS_TEST(ivf_rabitq_recall) {

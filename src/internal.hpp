@@ -136,6 +136,17 @@ struct PqAdcChunk {
   int64_t output_offset = 0;
 };
 
+/* Offset-only descriptor for the fused IVF-PQ GPU scan/select path. Offsets are
+   expressed in elements/rows of the flattened inputs, never as transient host
+   pointers. query_dense_offset preserves query -> probe -> list-row tie order. */
+struct IvfPqScanTask {
+  int32_t query_index = 0;
+  int64_t list_begin = 0;
+  int64_t list_count = 0;
+  int64_t lut_offset = 0;
+  int64_t query_dense_offset = 0;
+};
+
 struct ResourcesData {
   ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
@@ -232,8 +243,11 @@ struct UsmAllocator {
 
 using UsmFloatVec = std::vector<float, UsmAllocator<float>>;
 using UsmI32Vec = std::vector<int32_t, UsmAllocator<int32_t>>;
+using UsmI64Vec = std::vector<int64_t, UsmAllocator<int64_t>>;
+using UsmU8Vec = std::vector<uint8_t, UsmAllocator<uint8_t>>;
 
-/* Device backends. Return false if unavailable / failed (caller falls back). */
+/* Device backends. Boolean paths return false when unavailable/failed; status
+   paths preserve validation, OOM, and runtime failures for policy routing. */
 bool npu_available();
 bool gpu_available();
 bool ov_device_available(const char* name);
@@ -276,6 +290,13 @@ bool npu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t n
                   int64_t ny, int64_t dim, float* out, float metric_arg);
 bool npu_pq_adc_batch(ResourcesData& r, const PqAdcChunk* chunks, int64_t chunk_count,
                       int32_t pq_m, int32_t ks, float* out);
+ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
+                                 int64_t task_count, const float* luts,
+                                 int64_t lut_elements, const int64_t* packed_ids,
+                                 const uint8_t* packed_codes, int64_t packed_rows,
+                                 const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
+                                 int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
+                                 int32_t* packed_positions, int32_t* counts);
 int32_t sycl_enabled();
 bool sycl_gpu_available();
 bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components);
@@ -312,6 +333,13 @@ OVVS_API ovvsStatus plan_pq_adc_chunks(const PqAdcTask* tasks, int64_t task_coun
 OVVS_API ovvsStatus prim_pq_adc_batch(ResourcesData& r, const PqAdcTask* tasks,
                                       int64_t task_count, int32_t pq_m, int32_t ks,
                                       float* out, int64_t output_rows);
+ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
+                                  int64_t task_count, const float* luts,
+                                  int64_t lut_elements, const int64_t* packed_ids,
+                                  const uint8_t* packed_codes, int64_t packed_rows,
+                                  const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
+                                  int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
+                                  int32_t* packed_positions, int32_t* counts);
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph);

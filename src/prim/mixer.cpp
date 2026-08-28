@@ -399,6 +399,32 @@ ovvsStatus prim_pq_adc(ResourcesData& r, const float* tables, int32_t pq_m, int3
   return prim_pq_adc_batch(r, &task, 1, pq_m, ks, out, ncodes);
 }
 
+ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
+                                  int64_t task_count, const float* luts,
+                                  int64_t lut_elements, const int64_t* packed_ids,
+                                  const uint8_t* packed_codes, int64_t packed_rows,
+                                  const uint8_t* allow_bitset, int64_t allow_bitset_bytes,
+                                  int64_t nq, int32_t pq_m, int32_t ks, int32_t krefine,
+                                  int32_t* packed_positions, int32_t* counts) {
+  /* No SKU/shape table promotes this fused path yet. FORCE_CPU, FORCE_NPU,
+     NPU_IF_FASTER, AUTO, GPU_IF_FASTER, and HETERO keep the existing ADC/select
+     route until matched end-to-end evidence names the GPU as winner. */
+  if (r.policy != OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_UNSUPPORTED;
+
+  const ovvsStatus status = gpu_ivfpq_scan_select(
+      r, tasks, task_count, luts, lut_elements, packed_ids, packed_codes,
+      packed_rows, allow_bitset, allow_bitset_bytes, nq, pq_m, ks, krefine,
+      packed_positions, counts);
+  if (status == OVVS_STATUS_SUCCESS) {
+    r.last_device = OVVS_DEVICE_GPU;
+    return OVVS_STATUS_SUCCESS;
+  }
+  if (status == OVVS_STATUS_UNSUPPORTED || status == OVVS_STATUS_DEVICE_UNAVAILABLE) {
+    return finish_forced_fail(r);
+  }
+  return status;
+}
+
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph) {

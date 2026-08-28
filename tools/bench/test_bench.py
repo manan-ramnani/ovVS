@@ -472,6 +472,9 @@ class PureHelperTests(unittest.TestCase):
         exc = RuntimeError("forced device unavailable")
         exc.status = 7
         self.assertEqual(exception_point_status(exc), "unavailable")
+        compile_fail = RuntimeError("forced device compile failed")
+        compile_fail.status = 5
+        self.assertEqual(exception_point_status(compile_fail), "failed")
         self.assertEqual(exception_point_status(RuntimeError("numeric corruption")), "failed")
 
     def test_cagra_transfer_zero_upload_evidence_completes_force_gpu_point(self) -> None:
@@ -626,25 +629,23 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertFalse(mismatch["conforming"])
         self.assertEqual(mismatch["status"], "mismatch_or_unattributed")
 
-    def test_ivf_pq_force_gpu_expected_skip_is_nonblocking(self) -> None:
+    def test_ivf_pq_force_gpu_is_runnable_and_failures_block_completion(self) -> None:
         lanes = enumerate_lanes(["ivf-pq"], ["auto", "gpu"], 1_000_000, True, False)
         by_id = {lane.id: lane for lane in lanes}
         gpu = by_id["ovvs.ivf-pq.gpu"]
-        self.assertTrue(gpu.expected_skip)
+        self.assertFalse(gpu.expected_skip)
         self.assertFalse(gpu.blocking_skip)
-        self.assertIn("no iGPU backend", gpu.skip_reason)
+        self.assertIsNone(gpu.skip_reason)
         self.assertIn("faiss-cpu.ivf-pq", by_id)
-        skipped = gpu.as_dict()
-        skipped.update(status="skipped", reason=gpu.skip_reason)
-        self.assertEqual(
-            completion_issues(
-                "sift1m",
-                {"status": "success"},
-                {"status": "success", "exact": True},
-                [skipped],
-            ),
-            [],
+        failed = gpu.as_dict()
+        failed.update(status="failed", reason="forced GPU compile failed")
+        issues = completion_issues(
+            "sift1m",
+            {"status": "success"},
+            {"status": "success", "exact": True},
+            [failed],
         )
+        self.assertTrue(any("ovvs.ivf-pq.gpu" in issue for issue in issues))
 
     def test_successful_ovvs_lane_requires_complete_build_attribution(self) -> None:
         lane = successful_lane("ovvs.cagra.auto")

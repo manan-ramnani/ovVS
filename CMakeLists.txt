@@ -126,7 +126,10 @@ if(OVVS_BUILD_TESTS)
   add_test(NAME cpu COMMAND ovvs_tests
     --exclude nndescent_gpu_n_over_4096
     --exclude nndescent_gpu_bounded_scale
-    --exclude cagra_sycl_walk_n_over_4096)
+    --exclude cagra_sycl_walk_n_over_4096
+    --exclude ivf_pq_fused_gpu_parity_filters_tail_and_blocks
+    --exclude ivf_pq_fused_gpu_krefine_ties_and_atomicity
+    --exclude ivf_pq_fused_gpu_persistence_extend_and_concurrency)
   set_tests_properties(cpu PROPERTIES
     LABELS "cpu"
     RESOURCE_LOCK intel_gpu)
@@ -151,6 +154,16 @@ if(OVVS_BUILD_TESTS)
     RESOURCE_LOCK intel_gpu
     SKIP_RETURN_CODE 77
     TIMEOUT 45)
+  add_test(NAME ivf_pq_fused_gpu_scan_select
+    COMMAND ovvs_tests
+      --filter ivf_pq_fused_gpu_parity_filters_tail_and_blocks
+      --filter ivf_pq_fused_gpu_krefine_ties_and_atomicity
+      --filter ivf_pq_fused_gpu_persistence_extend_and_concurrency)
+  set_tests_properties(ivf_pq_fused_gpu_scan_select PROPERTIES
+    LABELS "gpu;ivf-pq"
+    RESOURCE_LOCK intel_gpu
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120)
   add_test(NAME consumer COMMAND ovvs_consumer)
   set_tests_properties(consumer PROPERTIES LABELS "cpu")
   add_test(NAME consumer_cxx COMMAND ovvs_consumer_cxx)

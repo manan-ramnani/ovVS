@@ -332,7 +332,7 @@ def _artifact(
                 "ovVS last_device reports the final primitive, not a per-stage route trace.",
                 "ovVS construction policy is independent of each lane's search policy.",
                 "HETERO currently equals AUTO (backlog B6).",
-                "IVF-PQ FORCE_GPU is a visible expected skip because ADC has no iGPU backend and fails closed.",
+                "IVF-PQ FORCE_GPU uses the fused iGPU scan/select path; AUTO remains evidence-gated.",
                 "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
                 "SIFT-100k is a noncanonical prefix preflight and cannot close the SIFT1M quality gate.",
                 *(
