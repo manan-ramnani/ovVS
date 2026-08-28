@@ -433,7 +433,7 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
 
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
-                                 int32_t* graph) {
+                                 int32_t* graph, NnDescentBuildStats* stats) {
   if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
 
   const bool gpu_metric_supported = metric == OVVS_METRIC_L2_EXPANDED ||
@@ -447,7 +447,7 @@ ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t 
   const bool gpu_ready = gpu_policy && gpu_metric_supported && sycl_gpu_available();
   if (gpu_ready) {
     const ovvsStatus gpu_status =
-        gpu_nndescent_build(r, dataset, n, dim, metric, degree, iterations, graph);
+        gpu_nndescent_build(r, dataset, n, dim, metric, degree, iterations, graph, stats);
     if (gpu_status == OVVS_STATUS_SUCCESS) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;

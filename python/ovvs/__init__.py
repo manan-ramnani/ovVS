@@ -52,6 +52,66 @@ class _IvfPqSearchStatsV1(ctypes.Structure):
 assert ctypes.sizeof(_IvfPqSearchStatsV1) == 200
 
 
+OVVS_CAGRA_BUILD_STATS_ABI_V1 = 1
+_CAGRA_BUILD_STATS_COUNTERS = (
+    "successful_calls",
+    "rows",
+    "dataset_copy_bytes",
+    "initializer_graph_payload_bytes",
+    "published_graph_copy_bytes",
+    "nndescent_initializer_calls",
+    "ivfpq_initializer_calls",
+    "iterative_initializer_calls",
+    "total_wall_ns",
+    "dataset_copy_ns",
+    "initializer_ns",
+    "optimizer_prune_merge_ns",
+    "index_materialize_ns",
+    "initializer_final_cpu_calls",
+    "initializer_final_gpu_calls",
+    "initializer_final_npu_calls",
+    "nndescent_gpu_iterations",
+    "nndescent_gpu_converged_calls",
+    "nndescent_gpu_final_changed_edges",
+    "nndescent_gpu_final_pending_new_edges",
+    "nndescent_gpu_instrumented_calls",
+    "nndescent_gpu_allocation_calls",
+    "nndescent_gpu_allocation_bytes",
+    "nndescent_gpu_h2d_calls",
+    "nndescent_gpu_h2d_bytes",
+    "nndescent_gpu_d2h_calls",
+    "nndescent_gpu_d2h_bytes",
+    "nndescent_gpu_kernel_launches",
+    "nndescent_gpu_submission_calls",
+    "nndescent_gpu_wait_calls",
+    "nndescent_gpu_peak_owned_bytes_max",
+)
+
+
+class _CagraBuildStatsV1(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", c_uint32),
+        ("struct_size", c_uint32),
+        *((name, c_int64) for name in _CAGRA_BUILD_STATS_COUNTERS),
+    ]
+
+
+assert ctypes.sizeof(_CagraBuildStatsV1) == 256
+assert _CagraBuildStatsV1.abi_version.offset == 0
+assert _CagraBuildStatsV1.struct_size.offset == 4
+assert all(
+    getattr(_CagraBuildStatsV1, name).offset == 8 + 8 * index
+    for index, name in enumerate(_CAGRA_BUILD_STATS_COUNTERS)
+)
+
+
+_CAGRA_BUILD_ALGOS = {
+    "nndescent": 0,
+    "ivf_pq": 1,
+    "iterative": 2,
+}
+
+
 def _load():
     here = Path(__file__).resolve().parent
     if sys.platform.startswith("win"):
@@ -121,6 +181,23 @@ _lib.ovvsCagraBuild.argtypes = [
     c_int32,
     POINTER(c_void_p),
 ]
+try:
+    _cagra_build_ex = _lib.ovvsCagraBuildEx
+except AttributeError:
+    _cagra_build_ex = None
+else:
+    _cagra_build_ex.argtypes = [
+        c_void_p,
+        POINTER(c_float),
+        c_int64,
+        c_int64,
+        c_int32,
+        c_int32,
+        c_int32,
+        c_int32,
+        POINTER(c_void_p),
+    ]
+    _cagra_build_ex.restype = c_int32
 _lib.ovvsCagraSearch.argtypes = [
     c_void_p,
     c_void_p,
@@ -234,6 +311,16 @@ else:
         POINTER(_IvfPqSearchStatsV1),
     ]
     _resources_ivfpq_search_stats_v1.restype = c_int32
+try:
+    _resources_cagra_build_stats_v1 = _lib.ovvsResourcesCagraBuildStatsV1
+except AttributeError:
+    _resources_cagra_build_stats_v1 = None
+else:
+    _resources_cagra_build_stats_v1.argtypes = [
+        c_void_p,
+        POINTER(_CagraBuildStatsV1),
+    ]
+    _resources_cagra_build_stats_v1.restype = c_int32
 _lib.ovvsGemmEx.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -461,6 +548,27 @@ class Resources:
             "abi_version": int(stats.abi_version),
             "struct_size": int(stats.struct_size),
             **{name: int(getattr(stats, name)) for name in _IVFPQ_SEARCH_STATS_COUNTERS},
+        }
+
+    def cagra_build_stats(self) -> dict[str, int] | None:
+        """Return a coherent cumulative CAGRA-build telemetry snapshot when supported."""
+        if _resources_cagra_build_stats_v1 is None:
+            return None
+        stats = _CagraBuildStatsV1()
+        rc = _resources_cagra_build_stats_v1(self._h, ctypes.byref(stats))
+        if rc != 0:
+            return None
+        if (
+            int(stats.abi_version) != OVVS_CAGRA_BUILD_STATS_ABI_V1
+            or int(stats.struct_size) != ctypes.sizeof(_CagraBuildStatsV1)
+        ):
+            raise RuntimeError(
+                "ovvsResourcesCagraBuildStatsV1 returned an incompatible version or size"
+            )
+        return {
+            "abi_version": int(stats.abi_version),
+            "struct_size": int(stats.struct_size),
+            **{name: int(getattr(stats, name)) for name in _CAGRA_BUILD_STATS_COUNTERS},
         }
 
     def gemm(self, a, b, m, n, k, trans_b=1, compute_dtype=0):
@@ -760,20 +868,50 @@ class neighbors:
 
     class cagra:
         @staticmethod
-        def build(dataset, dim=None, metric=0, graph_degree=16, intermediate_degree=32, resources=None):
+        def build(
+            dataset,
+            dim=None,
+            metric=0,
+            graph_degree=16,
+            intermediate_degree=32,
+            resources=None,
+            build_algo="nndescent",
+        ):
+            if build_algo not in _CAGRA_BUILD_ALGOS:
+                choices = ", ".join(_CAGRA_BUILD_ALGOS)
+                raise ValueError(f"build_algo must be one of: {choices}")
+            if _cagra_build_ex is None and build_algo != "nndescent":
+                raise RuntimeError(
+                    f"CAGRA build algorithm {build_algo!r} requires ovvsCagraBuildEx"
+                )
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            rc = _lib.ovvsCagraBuild(
-                res._h,
-                ptr,
-                c_int64(n),
-                c_int64(d),
-                c_int32(metric),
-                c_int32(graph_degree),
-                c_int32(intermediate_degree),
-                ctypes.byref(ix),
-            )
+            if _cagra_build_ex is not None:
+                rc = _cagra_build_ex(
+                    res._h,
+                    ptr,
+                    c_int64(n),
+                    c_int64(d),
+                    c_int32(metric),
+                    c_int32(graph_degree),
+                    c_int32(intermediate_degree),
+                    c_int32(_CAGRA_BUILD_ALGOS[build_algo]),
+                    ctypes.byref(ix),
+                )
+            elif build_algo == "nndescent":
+                # The legacy symbol is exactly the NN-Descent default. This keeps
+                # old libraries usable while making non-default requests fail closed.
+                rc = _lib.ovvsCagraBuild(
+                    res._h,
+                    ptr,
+                    c_int64(n),
+                    c_int64(d),
+                    c_int32(metric),
+                    c_int32(graph_degree),
+                    c_int32(intermediate_degree),
+                    ctypes.byref(ix),
+                )
             _check_status(rc, "CAGRA build")
             return CagraIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsCagraDestroy, n=n)
 

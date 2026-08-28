@@ -22,6 +22,7 @@ from typing import Any, Sequence
 
 from _common import (
     ALGORITHM_ORDER,
+    CAGRA_BUILD_ALGO_ORDER,
     CAGRA_RECALL_GATE,
     CAGRA_RECALL_GATE_POINTS,
     CAGRA_SIFT100K_PREFLIGHT,
@@ -69,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--build-policy",
         default="auto",
         help="single ovVS construction policy, independent of the search-policy lanes",
+    )
+    parser.add_argument(
+        "--cagra-build-algo",
+        choices=CAGRA_BUILD_ALGO_ORDER,
+        default="nndescent",
+        help="CAGRA graph initializer; independent of construction/search device policy",
     )
     parser.add_argument("--sift", default=str(ROOT / "data" / "sift-128-euclidean.hdf5"))
     parser.add_argument("--base", help="embedding-100k custom base .npy (at least 100000 x 768)")
@@ -118,6 +125,7 @@ def normalize_gate_configuration(args: argparse.Namespace) -> None:
     args.algorithms = "cagra"
     args.policies = "gpu"
     args.build_policy = "auto"
+    args.cagra_build_algo = "nndescent"
     args.warmups = 1
     args.repeats = 5
     args.seed = 7
@@ -139,6 +147,7 @@ def normalize_preflight_configuration(args: argparse.Namespace) -> None:
     args.algorithms = "cagra"
     args.policies = "gpu"
     args.build_policy = "auto"
+    args.cagra_build_algo = "nndescent"
     args.warmups = 1
     args.repeats = 5
     args.seed = 7
@@ -294,6 +303,7 @@ def _artifact(
             "algorithms": algorithms,
             "build_policy": POLICY_LABELS[getattr(args, "build_policy", "auto")],
             "build_policy_key": getattr(args, "build_policy", "auto"),
+            "cagra_build_algo": getattr(args, "cagra_build_algo", "nndescent"),
             "policies": [POLICY_LABELS[value] for value in policies],
             "point_selection": (
                 {key: [value] for key, value in CAGRA_RECALL_GATE_POINTS.items()}
@@ -412,6 +422,7 @@ def orchestrate(args: argparse.Namespace) -> int:
             "truth_path": str(directory / "exact-ground-truth.npy"),
             "lanes": [lane.as_dict() for lane in lanes],
             "build_policy": build_policy,
+            "cagra_build_algo": getattr(args, "cagra_build_algo", "nndescent"),
             "library": args.library,
             "energy": not args.no_energy,
             "seed": args.seed,

@@ -1,5 +1,6 @@
 #include "internal.hpp"
 
+#include <chrono>
 #include <fstream>
 
 using namespace ovvs::impl;
@@ -7,6 +8,75 @@ using namespace ovvs::impl;
 namespace {
 
 constexpr uint32_t kCagraMagic = 0x31475243u; /* 'CRG1' */
+
+using BuildClock = std::chrono::steady_clock;
+
+int64_t elapsed_ns(BuildClock::time_point begin) noexcept {
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(BuildClock::now() - begin).count();
+  return elapsed < 0 ? 0 : elapsed;
+}
+
+int64_t logical_bytes(int64_t rows, int64_t width, size_t element_size) noexcept {
+  if (rows <= 0 || width <= 0 || element_size == 0) return 0;
+  const uint64_t a = static_cast<uint64_t>(rows);
+  const uint64_t b = static_cast<uint64_t>(width);
+  const uint64_t limit = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  if (a > limit / b || a * b > limit / element_size) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  return static_cast<int64_t>(a * b * element_size);
+}
+
+void saturating_add(int64_t& value, int64_t delta) noexcept {
+  if (delta <= 0) return;
+  if (value > std::numeric_limits<int64_t>::max() - delta) {
+    value = std::numeric_limits<int64_t>::max();
+  } else {
+    value += delta;
+  }
+}
+
+void publish_cagra_build_stats(ResourcesData& resources,
+                               const ovvsCagraBuildStatsV1& delta) {
+  std::lock_guard<std::mutex> lock(resources.cagra_build_stats_mutex);
+  auto& total = resources.cagra_build_stats;
+#define OVVS_CAGRA_ADD(field) saturating_add(total.field, delta.field)
+  OVVS_CAGRA_ADD(successful_calls);
+  OVVS_CAGRA_ADD(rows);
+  OVVS_CAGRA_ADD(dataset_copy_bytes);
+  OVVS_CAGRA_ADD(initializer_graph_payload_bytes);
+  OVVS_CAGRA_ADD(published_graph_copy_bytes);
+  OVVS_CAGRA_ADD(nndescent_initializer_calls);
+  OVVS_CAGRA_ADD(ivfpq_initializer_calls);
+  OVVS_CAGRA_ADD(iterative_initializer_calls);
+  OVVS_CAGRA_ADD(total_wall_ns);
+  OVVS_CAGRA_ADD(dataset_copy_ns);
+  OVVS_CAGRA_ADD(initializer_ns);
+  OVVS_CAGRA_ADD(optimizer_prune_merge_ns);
+  OVVS_CAGRA_ADD(index_materialize_ns);
+  OVVS_CAGRA_ADD(initializer_final_cpu_calls);
+  OVVS_CAGRA_ADD(initializer_final_gpu_calls);
+  OVVS_CAGRA_ADD(initializer_final_npu_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_iterations);
+  OVVS_CAGRA_ADD(nndescent_gpu_converged_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_final_changed_edges);
+  OVVS_CAGRA_ADD(nndescent_gpu_final_pending_new_edges);
+  OVVS_CAGRA_ADD(nndescent_gpu_instrumented_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_allocation_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_allocation_bytes);
+  OVVS_CAGRA_ADD(nndescent_gpu_h2d_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_h2d_bytes);
+  OVVS_CAGRA_ADD(nndescent_gpu_d2h_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_d2h_bytes);
+  OVVS_CAGRA_ADD(nndescent_gpu_kernel_launches);
+  OVVS_CAGRA_ADD(nndescent_gpu_submission_calls);
+  OVVS_CAGRA_ADD(nndescent_gpu_wait_calls);
+#undef OVVS_CAGRA_ADD
+  total.nndescent_gpu_peak_owned_bytes_max =
+      std::max(total.nndescent_gpu_peak_owned_bytes_max,
+               delta.nndescent_gpu_peak_owned_bytes_max);
+}
 
 struct Dataset {
   UsmFloatVec x;
@@ -149,7 +219,9 @@ ovvsStatus knn_graph_brute(ResourcesData& r, const float* x, int64_t n, int64_t 
 
 ovvsStatus nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t dim,
                             ovvsMetric metric, int32_t degree, int32_t iters,
-                            std::vector<int32_t>& graph) {
+                            std::vector<int32_t>& graph,
+                            NnDescentBuildStats* build_stats = nullptr) {
+  if (build_stats) *build_stats = {};
   degree = std::min(degree, static_cast<int32_t>(std::max<int64_t>(1, n - 1)));
   /* Exact kNN is cheap through prim_pairwise while n^2 scores fit in ~64MiB. */
   if (n <= 4096) {
@@ -157,9 +229,10 @@ ovvsStatus nndescent_build(ResourcesData& r, const float* x, int64_t n, int64_t 
   }
   graph.assign(static_cast<size_t>(n) * static_cast<size_t>(degree), -1);
   const ovvsStatus accelerated =
-      prim_nndescent_build(r, x, n, dim, metric, degree, iters, graph.data());
+      prim_nndescent_build(r, x, n, dim, metric, degree, iters, graph.data(), build_stats);
   if (accelerated == OVVS_STATUS_SUCCESS) return accelerated;
   if (accelerated != OVVS_STATUS_UNSUPPORTED) return accelerated;
+  if (build_stats) *build_stats = {};
 
   auto rng = rng_from(7);
   std::uniform_int_distribution<int64_t> pick(0, n - 1);
@@ -384,8 +457,10 @@ ovvsStatus cagra_init_ivfpq(ResourcesData& r, const float* x, int64_t n, int64_t
 
 ovvsStatus cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int64_t dim,
                                 ovvsMetric metric, int32_t degree,
-                                std::vector<int32_t>& graph) {
-  const ovvsStatus init_status = nndescent_build(r, x, n, dim, metric, degree, 4, graph);
+                                std::vector<int32_t>& graph,
+                                NnDescentBuildStats* build_stats) {
+  const ovvsStatus init_status =
+      nndescent_build(r, x, n, dim, metric, degree, 4, graph, build_stats);
   if (init_status != OVVS_STATUS_SUCCESS) return init_status;
   std::vector<int32_t> next = graph;
   std::vector<int64_t> nb(static_cast<size_t>(degree) + 1);
@@ -941,29 +1016,91 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
   }
   graph_degree = std::max(1, std::min(graph_degree, static_cast<int32_t>(n - 1)));
   intermediate_degree = std::max(graph_degree, std::min(intermediate_degree, static_cast<int32_t>(n - 1)));
+  const auto total_begin = BuildClock::now();
   try {
     auto ix = std::make_unique<CagraIndex>();
+    ovvsCagraBuildStatsV1 call_stats{};
+    call_stats.successful_calls = 1;
+    call_stats.rows = n;
+    call_stats.dataset_copy_bytes = logical_bytes(n, dim, sizeof(float));
+    call_stats.initializer_graph_payload_bytes =
+        logical_bytes(n, intermediate_degree, sizeof(int32_t));
+    call_stats.published_graph_copy_bytes =
+        logical_bytes(n, graph_degree, sizeof(int32_t));
+    if (algo == OVVS_CAGRA_BUILD_NN_DESCENT) {
+      call_stats.nndescent_initializer_calls = 1;
+    } else if (algo == OVVS_CAGRA_BUILD_IVF_PQ) {
+      call_stats.ivfpq_initializer_calls = 1;
+    } else {
+      call_stats.iterative_initializer_calls = 1;
+    }
+
+    const auto dataset_begin = BuildClock::now();
     copy_ds(ix->ds, dataset, n, dim, metric);
+    if (!std::all_of(ix->ds.x.begin(), ix->ds.x.end(),
+                     [](float value) { return std::isfinite(value); })) {
+      return OVVS_STATUS_INVALID_ARGUMENT;
+    }
+    call_stats.dataset_copy_ns = elapsed_ns(dataset_begin);
     ix->degree = graph_degree;
     ix->has_dataset = true;
     std::vector<int32_t> init;
+    NnDescentBuildStats nndescent_stats{};
     ovvsStatus status = OVVS_STATUS_SUCCESS;
+    const auto initializer_begin = BuildClock::now();
     if (algo == OVVS_CAGRA_BUILD_IVF_PQ) {
       status = cagra_init_ivfpq(*rd(res), ix->ds.x.data(), n, dim, metric,
                                 intermediate_degree, init);
     } else if (algo == OVVS_CAGRA_BUILD_ITERATIVE) {
       status = cagra_init_iterative(*rd(res), ix->ds.x.data(), n, dim, metric,
-                                    intermediate_degree, init);
+                                    intermediate_degree, init, &nndescent_stats);
     } else {
       status = nndescent_build(*rd(res), ix->ds.x.data(), n, dim, metric,
-                               intermediate_degree, 6, init);
+                               intermediate_degree, 6, init, &nndescent_stats);
     }
     if (status != OVVS_STATUS_SUCCESS) return status;
+    call_stats.initializer_ns = elapsed_ns(initializer_begin);
+    const ovvsDevice initializer_device = resources->last_device;
+    if (initializer_device == OVVS_DEVICE_CPU) {
+      call_stats.initializer_final_cpu_calls = 1;
+    } else if (initializer_device == OVVS_DEVICE_GPU) {
+      call_stats.initializer_final_gpu_calls = 1;
+    } else if (initializer_device == OVVS_DEVICE_NPU) {
+      call_stats.initializer_final_npu_calls = 1;
+    }
+    if (nndescent_stats.gpu_instrumented) {
+      call_stats.nndescent_gpu_iterations = nndescent_stats.iterations;
+      call_stats.nndescent_gpu_converged_calls = nndescent_stats.converged ? 1 : 0;
+      call_stats.nndescent_gpu_final_changed_edges = nndescent_stats.final_changed_edges;
+      call_stats.nndescent_gpu_final_pending_new_edges =
+          nndescent_stats.final_pending_new_edges;
+      call_stats.nndescent_gpu_instrumented_calls = 1;
+      call_stats.nndescent_gpu_allocation_calls = nndescent_stats.gpu.allocation_calls;
+      call_stats.nndescent_gpu_allocation_bytes = nndescent_stats.gpu.allocation_bytes;
+      call_stats.nndescent_gpu_h2d_calls = nndescent_stats.gpu.h2d_calls;
+      call_stats.nndescent_gpu_h2d_bytes = nndescent_stats.gpu.h2d_bytes;
+      call_stats.nndescent_gpu_d2h_calls = nndescent_stats.gpu.d2h_calls;
+      call_stats.nndescent_gpu_d2h_bytes = nndescent_stats.gpu.d2h_bytes;
+      call_stats.nndescent_gpu_kernel_launches = nndescent_stats.gpu.kernel_launches;
+      call_stats.nndescent_gpu_submission_calls = nndescent_stats.submission_calls;
+      call_stats.nndescent_gpu_wait_calls = nndescent_stats.gpu.wait_calls;
+      call_stats.nndescent_gpu_peak_owned_bytes_max = nndescent_stats.peak_owned_bytes;
+    }
+
     std::vector<int32_t> pruned;
+    const auto optimizer_begin = BuildClock::now();
     status = cagra_optimize_ranked(init.data(), n, intermediate_degree, graph_degree, pruned);
     if (status != OVVS_STATUS_SUCCESS) return status;
+    call_stats.optimizer_prune_merge_ns = elapsed_ns(optimizer_begin);
+
+    const auto materialize_begin = BuildClock::now();
     ix->graph.assign(pruned.begin(), pruned.end());
+    call_stats.index_materialize_ns = elapsed_ns(materialize_begin);
     resources->last_device = OVVS_DEVICE_CPU;
+    /* The public total is the inner build wall through persistent materialization.
+       Telemetry merge, handle publication, and serialization are outside it. */
+    call_stats.total_wall_ns = elapsed_ns(total_begin);
+    publish_cagra_build_stats(*resources, call_stats);
     *index = reinterpret_cast<ovvsCagraIndex_t>(ix.release());
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {

@@ -35,6 +35,11 @@ class Resources {
     check(ovvsResourcesLastComputeDtype(res_, &t));
     return t;
   }
+  ovvsCagraBuildStatsV1 cagra_build_stats() const {
+    ovvsCagraBuildStatsV1 stats{};
+    check(ovvsResourcesCagraBuildStatsV1(res_, &stats));
+    return stats;
+  }
 
  private:
   ovvsResources_t res_ = nullptr;
@@ -157,6 +162,12 @@ class CagraIndex {
              int32_t graph_degree, int32_t intermediate_degree)
       : res_(&res) {
     check(ovvsCagraBuild(res.get(), dataset, n, dim, metric, graph_degree, intermediate_degree, &ix_));
+  }
+  CagraIndex(Resources& res, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
+             int32_t graph_degree, int32_t intermediate_degree, ovvsCagraBuildAlgo algo)
+      : res_(&res) {
+    check(ovvsCagraBuildEx(res.get(), dataset, n, dim, metric, graph_degree,
+                           intermediate_degree, algo, &ix_));
   }
   CagraIndex(Resources& res, const char* path) : res_(&res) {
     check(ovvsCagraDeserialize(res.get(), path, &ix_));

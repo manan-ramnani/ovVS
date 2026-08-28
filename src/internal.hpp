@@ -188,6 +188,22 @@ struct GpuWorkStats {
   void wait() noexcept { add(wait_calls, 1); }
 };
 
+/* Per-call GPU NN-Descent accounting. This object is threaded through the
+   CAGRA initializer so build telemetry never snapshots resource-global
+   last-call diagnostics. */
+struct NnDescentBuildStats {
+  GpuWorkStats gpu;
+  int64_t iterations = 0;
+  int64_t final_changed_edges = 0;
+  int64_t final_pending_new_edges = 0;
+  int64_t submission_calls = 0;
+  int64_t peak_owned_bytes = 0;
+  bool converged = false;
+  bool gpu_instrumented = false;
+
+  void submission() noexcept { GpuWorkStats::add(submission_calls, 1); }
+};
+
 struct ResourcesData {
   ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
@@ -206,6 +222,8 @@ struct ResourcesData {
   int64_t cagra_direct_index_calls = 0;
   int64_t cagra_index_upload_calls = 0;
   int64_t cagra_index_upload_bytes = 0;
+  std::mutex cagra_build_stats_mutex;
+  ovvsCagraBuildStatsV1 cagra_build_stats{};
   std::mutex nndescent_stats_mutex;
   int32_t nndescent_iterations_run = 0;
   int64_t nndescent_changed_edges = 0;
@@ -322,7 +340,8 @@ bool gpu_gather_rows(ResourcesData& r, const float* src, int64_t src_rows, int64
 bool gpu_vector_add(const float* a, const float* b, float* c, int64_t n);
 ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
                                int64_t dim, ovvsMetric metric, int32_t degree,
-                               int32_t iters, int32_t* graph);
+                               int32_t iters, int32_t* graph,
+                               NnDescentBuildStats* stats = nullptr);
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
@@ -392,7 +411,7 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
                                   GpuWorkStats* stats = nullptr);
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
-                                 int32_t* graph);
+                                 int32_t* graph, NnDescentBuildStats* stats = nullptr);
 /* Private C++ test seam; not part of the installed C ABI. */
 OVVS_API ovvsStatus cagra_optimize_ranked(const int32_t* initial, int64_t n,
                                           int32_t initial_degree, int32_t final_degree,

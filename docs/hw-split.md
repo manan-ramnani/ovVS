@@ -58,6 +58,7 @@ CAGRA search
 CAGRA build
   NN-Descent init n>4096 → iGPU SYCL under AUTO
   prune               → CPU until T13.3 (full FORCE_GPU build is unavailable)
+  attribution         → success-only V1 stages plus call-local GPU lifecycle counters; external API wall remains the end-to-end measure
 
 Vamana / NN-Descent
   NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (SIFT1M CAGRA-vs-hnswlib closeness passed; T12.5 IVF-PQ comparison/prune open)

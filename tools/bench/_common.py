@@ -32,6 +32,7 @@ CAGRA_RECALL_GATE_POINTS = {
 }
 
 ALGORITHM_ORDER = ("brute", "ivf-flat", "ivf-pq", "cagra")
+CAGRA_BUILD_ALGO_ORDER = ("nndescent", "ivf_pq", "iterative")
 POLICY_ORDER = ("auto", "cpu", "npu", "gpu", "hetero")
 POLICY_VALUES = {"auto": 0, "hetero": 3, "npu": 4, "gpu": 5, "cpu": 6}
 POLICY_LABELS = {
@@ -42,6 +43,59 @@ POLICY_LABELS = {
     "hetero": "HETERO",
 }
 DEVICE_LABELS = {0: "AUTO", 1: "CPU", 2: "NPU", 3: "GPU", 4: "HETERO"}
+
+
+def fixed_cagra_build_stats_issue(build: dict[str, Any]) -> str | None:
+    """Return why a fixed current-code gate lacks a proven GPU NN-Descent build."""
+
+    stats = build.get("cagra_build_stats")
+    if not isinstance(stats, dict) or stats.get("status") != "success":
+        return "CAGRA build telemetry is unavailable, incompatible, or invalid"
+    delta = stats.get("delta")
+    if not isinstance(delta, dict):
+        return "CAGRA build telemetry has no validated delta"
+    exact = {
+        "successful_calls": 1,
+        "nndescent_initializer_calls": 1,
+        "ivfpq_initializer_calls": 0,
+        "iterative_initializer_calls": 0,
+        "initializer_final_cpu_calls": 0,
+        "initializer_final_gpu_calls": 1,
+        "initializer_final_npu_calls": 0,
+        "nndescent_gpu_instrumented_calls": 1,
+    }
+    if any(type(delta.get(key)) is not int or delta.get(key) != value for key, value in exact.items()):
+        return "CAGRA build delta does not prove one instrumented GPU NN-Descent initializer"
+    positive = (
+        "nndescent_gpu_iterations",
+        "nndescent_gpu_allocation_calls",
+        "nndescent_gpu_allocation_bytes",
+        "nndescent_gpu_d2h_calls",
+        "nndescent_gpu_d2h_bytes",
+        "nndescent_gpu_kernel_launches",
+        "nndescent_gpu_submission_calls",
+        "nndescent_gpu_wait_calls",
+        "nndescent_gpu_peak_owned_bytes_max",
+    )
+    if any(type(delta.get(key)) is not int or delta.get(key) <= 0 for key in positive):
+        return "CAGRA build delta lacks positive GPU NN-Descent structural coverage"
+    h2d_calls = delta.get("nndescent_gpu_h2d_calls")
+    h2d_bytes = delta.get("nndescent_gpu_h2d_bytes")
+    if (
+        type(h2d_calls) is not int
+        or type(h2d_bytes) is not int
+        or h2d_calls < 0
+        or h2d_bytes < 0
+        or (h2d_calls == 0) != (h2d_bytes == 0)
+    ):
+        return "CAGRA build delta has inconsistent H2D calls/bytes"
+    if (
+        stats.get("requested_build_algo") != "nndescent"
+        or stats.get("requested_build_policy") != "auto"
+        or stats.get("gpu_structural_validation_required") is not True
+    ):
+        return "CAGRA build telemetry was not validated as a large AUTO NN-Descent GPU build"
+    return None
 
 
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -446,6 +500,10 @@ def ovvs_resource_metadata(module: Any, resources: Any) -> dict[str, Any]:
         metadata["ivfpq_search_stats"] = resources.ivfpq_search_stats()
     except Exception:
         metadata["ivfpq_search_stats"] = None
+    try:
+        metadata["cagra_build_stats"] = resources.cagra_build_stats()
+    except Exception:
+        metadata["cagra_build_stats"] = None
     try:
         fn = module._lib.ovvsResourcesSku
         fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32]
@@ -945,11 +1003,15 @@ def cagra_recall_gate_result(
         build.get("status") != "success"
         or build.get("requested_policy_key") != "auto"
         or build.get("requested_policy") != "AUTO"
+        or build.get("build_algo") != "nndescent"
         or build.get("policy_contract", {}).get("status") != "not_forced"
         or build.get("last_device", {}).get("status") != "reported"
         or build.get("last_device", {}).get("label") not in ("CPU", "NPU", "GPU")
     ):
         issues.append("ovVS CAGRA build lacks successful AUTO-policy attribution")
+    build_stats_issue = fixed_cagra_build_stats_issue(build)
+    if build_stats_issue:
+        issues.append(f"ovVS CAGRA gate build: {build_stats_issue}")
     contract = cagra_point.get("policy_contract", {})
     if (
         contract.get("requested") != "FORCE_GPU"
@@ -1200,11 +1262,15 @@ def cagra_sift100k_preflight_result(
         build.get("status") != "success"
         or build.get("requested_policy_key") != "auto"
         or build.get("requested_policy") != "AUTO"
+        or build.get("build_algo") != "nndescent"
         or build.get("policy_contract", {}).get("status") != "not_forced"
         or build.get("last_device", {}).get("status") != "reported"
         or build.get("last_device", {}).get("label") not in ("CPU", "NPU", "GPU")
     ):
         issues.append("ovVS CAGRA build lacks successful AUTO-policy attribution")
+    build_stats_issue = fixed_cagra_build_stats_issue(build)
+    if build_stats_issue:
+        issues.append(f"ovVS CAGRA preflight build: {build_stats_issue}")
     contract = cagra_point.get("policy_contract", {})
     if (
         contract.get("requested") != "FORCE_GPU"
@@ -1672,22 +1738,36 @@ def render_markdown(artifact: dict[str, Any]) -> str:
         f"- Completion: **{artifact['completion']['status']}**",
         f"- Dataset: `{dataset.get('kind', 'unavailable')}`; n={dataset.get('n', '—')}, dim={dataset.get('dim', '—')}, nq={dataset.get('nq', '—')}, k={artifact['profile']['settings']['k']}",
         f"- Exact ground truth: `{artifact['ground_truth'].get('status')}` via `{artifact['ground_truth'].get('method', 'unavailable')}`",
-        "- Timings exclude build and warmups. Package energy is whole-package, not isolated device energy.",
-        "- Build and search policies are independent; each `last_device` value is final-primitive evidence only. HETERO equals AUTO today.",
-        "",
-        "| Lane | Status | Build policy | Build ms | Build last primitive | Build NPU fallbacks Δ | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Search last primitive | CAGRA transfer Δ Wcalls/Dcalls/Ucalls/Ubytes | Reason |",
-        "|---|---:|---|---:|---|---:|---|---:|---:|---:|---:|---:|---|---|---|",
     ]
+    selection = artifact.get("selection", {})
+    if "cagra" in selection.get("algorithms", ()):
+        lines.append(
+            f"- CAGRA initializer: `{selection.get('cagra_build_algo', 'nndescent')}`"
+        )
+    lines.extend(
+        [
+            "- Timings exclude build and warmups. Package energy is whole-package, not isolated device energy.",
+            "- Build and search policies are independent; each `last_device` value is final-primitive evidence only. HETERO equals AUTO today.",
+        ]
+    )
+    summary_insert = len(lines)
+    lines.extend(
+        [
+            "",
+            "| Lane | Status | Build policy | Build ms | Build last primitive | Build NPU fallbacks Δ | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Search last primitive | CAGRA transfer Δ Wcalls/Dcalls/Ucalls/Ubytes | Reason |",
+            "|---|---:|---|---:|---|---:|---|---:|---:|---:|---:|---:|---|---|---|",
+        ]
+    )
     gate = artifact.get("quality_gate")
     if gate:
-        lines[8:8] = [
+        lines[summary_insert:summary_insert] = [
             f"- Quality gate: **{gate['status']}**; noncanonical single-point checkpoint",
             f"- Recall: CAGRA={format_number(gate['recall']['cagra'], 4)}, hnswlib={format_number(gate['recall']['hnswlib'], 4)}, gap={format_number(gate['recall']['hnswlib_minus_cagra'], 4)} (maximum 0.0200)",
             f"- QPS median (reported, not part of verdict): CAGRA={format_number(gate['qps_median']['cagra'], 1)}, hnswlib={format_number(gate['qps_median']['hnswlib'], 1)}",
         ]
     preflight = artifact.get("preflight")
     if preflight:
-        lines[8:8] = [
+        lines[summary_insert:summary_insert] = [
             f"- Preflight: **{preflight['status']}**; noncanonical intermediate-scale diagnostic",
             f"- Recall (reported, not a verdict): CAGRA={format_number(preflight['recall']['cagra'], 4)}, hnswlib={format_number(preflight['recall']['hnswlib'], 4)}, gap={format_number(preflight['recall']['hnswlib_minus_cagra'], 4)}",
             f"- QPS median (reported, not a verdict): CAGRA={format_number(preflight['qps_median']['cagra'], 1)}, hnswlib={format_number(preflight['qps_median']['hnswlib'], 1)}",
@@ -1759,7 +1839,8 @@ def render_markdown(artifact: dict[str, Any]) -> str:
                     f"instrumentation-adjusted={format_number(build.get('instrumentation_adjusted_ms'))} ms; "
                     f"stage-sum={format_number(build.get('production_stage_sum_ms'))} ms; "
                     f"scope=`{build.get('scope', 'unavailable')}`.",
-                    f"- CAGRA build: policy=`{cagra.get('requested_policy', 'unavailable')}`; "
+                    f"- CAGRA build: initializer=`{cagra.get('build_algo', 'unavailable')}`; "
+                    f"policy=`{cagra.get('requested_policy', 'unavailable')}`; "
                     f"elapsed={format_number(cagra.get('elapsed_ms'))} ms; final primitive="
                     f"`{cagra.get('last_device', {}).get('label', 'unavailable')}`.",
                     f"- Graph: reachable={graph.get('entry_reachable_nodes', '—')}/"

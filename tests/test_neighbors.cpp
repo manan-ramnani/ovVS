@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -231,6 +232,118 @@ static int64_t ivfpq_named_stage_ns(
          stats.lut_build_ns + stats.adc_scan_select_ns +
          stats.shortlist_select_validate_ns + stats.refine_gather_ns +
          stats.refine_distance_ns + stats.refine_topk_ns;
+}
+
+static_assert(OVVS_CAGRA_BUILD_STATS_ABI_V1 == 1u,
+              "unexpected CAGRA build stats ABI version");
+static_assert(sizeof(ovvsCagraBuildStatsV1) == 256,
+              "unexpected CAGRA build stats ABI size");
+#define OVVS_ASSERT_CAGRA_OFFSET(field, offset) \
+  static_assert(offsetof(ovvsCagraBuildStatsV1, field) == (offset), \
+                "unexpected CAGRA build stats offset: " #field)
+OVVS_ASSERT_CAGRA_OFFSET(abi_version, 0);
+OVVS_ASSERT_CAGRA_OFFSET(struct_size, 4);
+OVVS_ASSERT_CAGRA_OFFSET(successful_calls, 8);
+OVVS_ASSERT_CAGRA_OFFSET(rows, 16);
+OVVS_ASSERT_CAGRA_OFFSET(dataset_copy_bytes, 24);
+OVVS_ASSERT_CAGRA_OFFSET(initializer_graph_payload_bytes, 32);
+OVVS_ASSERT_CAGRA_OFFSET(published_graph_copy_bytes, 40);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_initializer_calls, 48);
+OVVS_ASSERT_CAGRA_OFFSET(ivfpq_initializer_calls, 56);
+OVVS_ASSERT_CAGRA_OFFSET(iterative_initializer_calls, 64);
+OVVS_ASSERT_CAGRA_OFFSET(total_wall_ns, 72);
+OVVS_ASSERT_CAGRA_OFFSET(dataset_copy_ns, 80);
+OVVS_ASSERT_CAGRA_OFFSET(initializer_ns, 88);
+OVVS_ASSERT_CAGRA_OFFSET(optimizer_prune_merge_ns, 96);
+OVVS_ASSERT_CAGRA_OFFSET(index_materialize_ns, 104);
+OVVS_ASSERT_CAGRA_OFFSET(initializer_final_cpu_calls, 112);
+OVVS_ASSERT_CAGRA_OFFSET(initializer_final_gpu_calls, 120);
+OVVS_ASSERT_CAGRA_OFFSET(initializer_final_npu_calls, 128);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_iterations, 136);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_converged_calls, 144);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_final_changed_edges, 152);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_final_pending_new_edges, 160);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_instrumented_calls, 168);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_allocation_calls, 176);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_allocation_bytes, 184);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_h2d_calls, 192);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_h2d_bytes, 200);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_d2h_calls, 208);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_d2h_bytes, 216);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_kernel_launches, 224);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_submission_calls, 232);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_wait_calls, 240);
+OVVS_ASSERT_CAGRA_OFFSET(nndescent_gpu_peak_owned_bytes_max, 248);
+#undef OVVS_ASSERT_CAGRA_OFFSET
+
+static ovvsCagraBuildStatsV1 cagra_build_stats_v1(ovvsResources_t resources) {
+  ovvsCagraBuildStatsV1 stats{};
+  expect_status(ovvsResourcesCagraBuildStatsV1(resources, &stats),
+                "CAGRA V1 build telemetry");
+  expect(stats.abi_version == OVVS_CAGRA_BUILD_STATS_ABI_V1,
+         "CAGRA build telemetry ABI version");
+  expect(stats.struct_size == sizeof(ovvsCagraBuildStatsV1),
+         "CAGRA build telemetry structure size");
+  return stats;
+}
+
+static std::array<int64_t, 31> cagra_build_counters(
+    const ovvsCagraBuildStatsV1& stats) {
+  return {
+      stats.successful_calls,
+      stats.rows,
+      stats.dataset_copy_bytes,
+      stats.initializer_graph_payload_bytes,
+      stats.published_graph_copy_bytes,
+      stats.nndescent_initializer_calls,
+      stats.ivfpq_initializer_calls,
+      stats.iterative_initializer_calls,
+      stats.total_wall_ns,
+      stats.dataset_copy_ns,
+      stats.initializer_ns,
+      stats.optimizer_prune_merge_ns,
+      stats.index_materialize_ns,
+      stats.initializer_final_cpu_calls,
+      stats.initializer_final_gpu_calls,
+      stats.initializer_final_npu_calls,
+      stats.nndescent_gpu_iterations,
+      stats.nndescent_gpu_converged_calls,
+      stats.nndescent_gpu_final_changed_edges,
+      stats.nndescent_gpu_final_pending_new_edges,
+      stats.nndescent_gpu_instrumented_calls,
+      stats.nndescent_gpu_allocation_calls,
+      stats.nndescent_gpu_allocation_bytes,
+      stats.nndescent_gpu_h2d_calls,
+      stats.nndescent_gpu_h2d_bytes,
+      stats.nndescent_gpu_d2h_calls,
+      stats.nndescent_gpu_d2h_bytes,
+      stats.nndescent_gpu_kernel_launches,
+      stats.nndescent_gpu_submission_calls,
+      stats.nndescent_gpu_wait_calls,
+      stats.nndescent_gpu_peak_owned_bytes_max,
+  };
+}
+
+static void expect_cagra_build_stats_zero(const ovvsCagraBuildStatsV1& stats,
+                                          const std::string& label) {
+  const auto counters = cagra_build_counters(stats);
+  expect(std::all_of(counters.begin(), counters.end(),
+                     [](int64_t value) { return value == 0; }),
+         label + " counters must all be zero");
+}
+
+static void expect_cagra_build_stats_equal(const ovvsCagraBuildStatsV1& actual,
+                                           const ovvsCagraBuildStatsV1& expected,
+                                           const std::string& label) {
+  expect(actual.abi_version == expected.abi_version &&
+             actual.struct_size == expected.struct_size &&
+             cagra_build_counters(actual) == cagra_build_counters(expected),
+         label);
+}
+
+static int64_t cagra_named_stage_ns(const ovvsCagraBuildStatsV1& stats) {
+  return stats.dataset_copy_ns + stats.initializer_ns +
+         stats.optimizer_prune_merge_ns + stats.index_materialize_ns;
 }
 
 struct PqAdcStatsSnapshot {
@@ -2436,6 +2549,138 @@ OVVS_TEST(nndescent_large_forced_policy_contract) {
   expect(ivfpq == nullptr, "invalid-metric IVF-PQ must clear output");
 }
 
+OVVS_TEST(cagra_build_telemetry_success_atomicity_and_isolation) {
+  Res res;
+  expect(sizeof(ovvsCagraBuildStatsV1) == 256,
+         "CAGRA build telemetry public structure size");
+  expect_cagra_build_stats_zero(cagra_build_stats_v1(res.r),
+                                "fresh CAGRA build telemetry");
+  ovvsCagraBuildStatsV1 untouched{};
+  expect(ovvsResourcesCagraBuildStatsV1(nullptr, &untouched) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "CAGRA telemetry rejects null resources");
+  expect(ovvsResourcesCagraBuildStatsV1(res.r, nullptr) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "CAGRA telemetry rejects null output");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "CAGRA telemetry CPU policy");
+  constexpr int64_t n = 32;
+  constexpr int64_t dim = 8;
+  constexpr int32_t graph_degree = 8;
+  constexpr int32_t intermediate_degree = 16;
+  constexpr int64_t dataset_bytes = n * dim * sizeof(float);
+  constexpr int64_t initializer_bytes = n * intermediate_degree * sizeof(int32_t);
+  constexpr int64_t published_bytes = n * graph_degree * sizeof(int32_t);
+  auto data = make_data(n, dim, 4190);
+  const ovvsCagraBuildAlgo algorithms[] = {
+      OVVS_CAGRA_BUILD_NN_DESCENT,
+      OVVS_CAGRA_BUILD_IVF_PQ,
+      OVVS_CAGRA_BUILD_ITERATIVE,
+  };
+  for (int i = 0; i < 3; ++i) {
+    ovvsCagraIndex_t index = nullptr;
+    expect_status(ovvsCagraBuildEx(res.r, data.data(), n, dim,
+                                   OVVS_METRIC_L2_EXPANDED, graph_degree,
+                                   intermediate_degree, algorithms[i], &index),
+                  "CAGRA telemetry initializer build");
+    expect(index != nullptr, "successful CAGRA telemetry build publishes index");
+    ovvsCagraDestroy(index);
+
+    const ovvsCagraBuildStatsV1 stats = cagra_build_stats_v1(res.r);
+    const int64_t calls = i + 1;
+    expect(stats.successful_calls == calls && stats.rows == calls * n,
+           "CAGRA telemetry exact successful call and row deltas");
+    expect(stats.dataset_copy_bytes == calls * dataset_bytes &&
+               stats.initializer_graph_payload_bytes == calls * initializer_bytes &&
+               stats.published_graph_copy_bytes == calls * published_bytes,
+           "CAGRA telemetry exact logical byte deltas");
+    expect(stats.nndescent_initializer_calls == 1 &&
+               stats.ivfpq_initializer_calls == (i >= 1 ? 1 : 0) &&
+               stats.iterative_initializer_calls == (i >= 2 ? 1 : 0),
+           "CAGRA telemetry exact initializer deltas");
+    expect(stats.initializer_final_cpu_calls == calls &&
+               stats.initializer_final_gpu_calls == 0 &&
+               stats.initializer_final_npu_calls == 0,
+           "CAGRA telemetry captures initializer final device before CPU materialization");
+    expect(stats.total_wall_ns >= cagra_named_stage_ns(stats),
+           "CAGRA named stage sum must not exceed total build wall");
+    expect(stats.nndescent_gpu_instrumented_calls == 0 &&
+               stats.nndescent_gpu_iterations == 0 &&
+               stats.nndescent_gpu_allocation_calls == 0 &&
+               stats.nndescent_gpu_submission_calls == 0 &&
+               stats.nndescent_gpu_peak_owned_bytes_max == 0,
+           "small CPU initializers must not inherit stale GPU NN-Descent telemetry");
+  }
+
+  const ovvsCagraBuildStatsV1 before_failures = cagra_build_stats_v1(res.r);
+  ovvsCagraIndex_t failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuildEx(res.r, data.data(), n, dim, static_cast<ovvsMetric>(99),
+                          graph_degree, intermediate_degree,
+                          OVVS_CAGRA_BUILD_NN_DESCENT, &failed) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "invalid CAGRA telemetry build rejects");
+  expect(failed == nullptr, "invalid CAGRA telemetry build clears output");
+  failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuildEx(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                          graph_degree, intermediate_degree,
+                          static_cast<ovvsCagraBuildAlgo>(99), &failed) ==
+             OVVS_STATUS_INVALID_ARGUMENT,
+         "invalid CAGRA build algorithm rejects");
+  expect(failed == nullptr, "invalid CAGRA build algorithm clears output");
+
+  auto nonfinite_data = data;
+  nonfinite_data[7] = std::numeric_limits<float>::quiet_NaN();
+  failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuildEx(res.r, nonfinite_data.data(), n, dim,
+                          OVVS_METRIC_L2_EXPANDED, graph_degree,
+                          intermediate_degree, OVVS_CAGRA_BUILD_NN_DESCENT,
+                          &failed) == OVVS_STATUS_INVALID_ARGUMENT,
+         "non-finite CAGRA dataset fails after private dataset materialization");
+  expect(failed == nullptr, "non-finite CAGRA build clears output");
+  expect_cagra_build_stats_equal(cagra_build_stats_v1(res.r), before_failures,
+                                 "post-copy CAGRA failure discards partial telemetry");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU),
+                "CAGRA telemetry forced GPU rejection policy");
+  failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                        graph_degree, intermediate_degree, &failed) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA forced GPU build rejects host optimizer");
+  expect(failed == nullptr, "unavailable forced GPU build clears output");
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
+                "CAGRA telemetry forced NPU rejection policy");
+  failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
+                        graph_degree, intermediate_degree, &failed) ==
+             OVVS_STATUS_DEVICE_UNAVAILABLE,
+         "CAGRA forced NPU build rejects");
+  expect(failed == nullptr, "unavailable forced NPU build clears output");
+  expect_cagra_build_stats_equal(cagra_build_stats_v1(res.r), before_failures,
+                                 "failed CAGRA builds leave telemetry unchanged");
+
+  Res other;
+  expect_status(ovvsResourcesSetPolicy(other.r, OVVS_POLICY_FORCE_CPU),
+                "second CAGRA telemetry resource policy");
+  constexpr int64_t other_n = 18;
+  constexpr int64_t other_dim = 4;
+  auto other_data = make_data(other_n, other_dim, 4191);
+  ovvsCagraIndex_t other_index = nullptr;
+  expect_status(ovvsCagraBuild(other.r, other_data.data(), other_n, other_dim,
+                               OVVS_METRIC_L2_EXPANDED, 4, 8, &other_index),
+                "second resource CAGRA telemetry build");
+  const ovvsCagraBuildStatsV1 other_stats = cagra_build_stats_v1(other.r);
+  expect(other_stats.successful_calls == 1 && other_stats.rows == other_n &&
+             other_stats.dataset_copy_bytes == other_n * other_dim * sizeof(float) &&
+             other_stats.initializer_graph_payload_bytes == other_n * 8 * sizeof(int32_t) &&
+             other_stats.published_graph_copy_bytes == other_n * 4 * sizeof(int32_t),
+         "CAGRA build telemetry is resource-local");
+  expect_cagra_build_stats_equal(cagra_build_stats_v1(res.r), before_failures,
+                                 "second resource does not mutate first telemetry");
+  ovvsCagraDestroy(other_index);
+}
+
 OVVS_TEST(cagra_build_search_filter_serialize) {
   Res res;
   const int64_t n = 36, dim = 8, nq = 4, k = 4;
@@ -2893,6 +3138,37 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   ovvsDevice last = OVVS_DEVICE_AUTO;
   expect_status(ovvsResourcesLastDevice(res.r, &last), "sycl n>4096 build device");
   expect(last == OVVS_DEVICE_CPU, "mixed CAGRA build must report its final host prune stage");
+  const ovvsCagraBuildStatsV1 build_stats = cagra_build_stats_v1(res.r);
+  expect(build_stats.successful_calls == 1 && build_stats.rows == n &&
+             build_stats.nndescent_initializer_calls == 1 &&
+             build_stats.initializer_final_gpu_calls == 1 &&
+             build_stats.initializer_final_cpu_calls == 0 &&
+             build_stats.nndescent_gpu_instrumented_calls == 1,
+         "large CAGRA build attributes its GPU NN-Descent initializer explicitly");
+  expect(build_stats.nndescent_gpu_iterations >= 1 &&
+             build_stats.nndescent_gpu_iterations <= 6 &&
+             build_stats.nndescent_gpu_converged_calls >= 0 &&
+             build_stats.nndescent_gpu_converged_calls <= 1 &&
+             build_stats.nndescent_gpu_final_changed_edges >= 0 &&
+             build_stats.nndescent_gpu_final_changed_edges <= n * 16 &&
+             build_stats.nndescent_gpu_final_pending_new_edges >= 0 &&
+             build_stats.nndescent_gpu_final_pending_new_edges <= n * 16,
+         "large CAGRA build publishes bounded GPU NN-Descent convergence values");
+  const int64_t gpu_iterations = build_stats.nndescent_gpu_iterations;
+  expect(build_stats.nndescent_gpu_allocation_calls == 12 &&
+             build_stats.nndescent_gpu_allocation_bytes > 0 &&
+             build_stats.nndescent_gpu_allocation_bytes ==
+                 build_stats.nndescent_gpu_peak_owned_bytes_max &&
+             build_stats.nndescent_gpu_h2d_calls == 0 &&
+             build_stats.nndescent_gpu_h2d_bytes == 0 &&
+             build_stats.nndescent_gpu_d2h_calls == 3 + 5 * gpu_iterations &&
+             build_stats.nndescent_gpu_d2h_bytes > 0 &&
+             build_stats.nndescent_gpu_kernel_launches == 3 + 8 * gpu_iterations &&
+             build_stats.nndescent_gpu_submission_calls == 7 + 21 * gpu_iterations &&
+             build_stats.nndescent_gpu_wait_calls == 20 + 16 * gpu_iterations,
+         "fixed large CAGRA fixture publishes exact explicit GPU work counters");
+  expect(build_stats.total_wall_ns >= cagra_named_stage_ns(build_stats),
+         "large CAGRA named stage sum must not exceed total build wall");
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
   std::vector<int64_t> got(static_cast<size_t>(nq * k)), truth(static_cast<size_t>(nq * k));
   std::vector<float> gd(static_cast<size_t>(nq * k)), td(static_cast<size_t>(nq * k));
@@ -2929,6 +3205,8 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   }
   const float rec = recall_at_k(got.data(), truth.data(), nq, k);
   expect(rec >= 0.2f, "sycl n>4096 recall vs independent L2 " + std::to_string(rec));
+  expect_cagra_build_stats_equal(cagra_build_stats_v1(res.r), build_stats,
+                                 "CAGRA searches do not mutate build telemetry");
   ovvsCagraDestroy(ix);
 }
 

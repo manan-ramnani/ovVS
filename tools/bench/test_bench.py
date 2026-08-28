@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import importlib.util
 import json
 import struct
 import tempfile
@@ -15,6 +17,7 @@ import bench
 import _common
 import _worker
 from _worker import (
+    _cagra_build_stats_evidence,
     _cagra_transfer_evidence,
     _ivfpq_search_stats_evidence,
     exception_point_status,
@@ -77,13 +80,89 @@ def successful_gpu_cagra_lane(transfer: dict | None) -> dict:
         "policy": "AUTO",
         "requested_policy": "AUTO",
         "requested_policy_key": "auto",
+        "build_algo": "nndescent",
         "elapsed_ms": 1.0,
         "last_device": {"status": "reported", "code": 1, "label": "CPU"},
         "policy_contract": {"status": "not_forced", "conforming": None},
+        "cagra_build_stats": successful_cagra_build_evidence(1_000_000),
     }
     if transfer is not None:
         lane["points"][0]["cagra_transfer"] = transfer
     return lane
+
+
+def cagra_build_snapshot(**updates: int) -> dict[str, int]:
+    snapshot = {
+        "abi_version": 1,
+        "struct_size": 256,
+        **{key: 0 for key in _worker._CAGRA_BUILD_STATS_COUNTERS},
+    }
+    snapshot.update(updates)
+    return snapshot
+
+
+def successful_cagra_build_after(
+    *,
+    n: int = 100_000,
+    dim: int = 128,
+    graph_degree: int = 16,
+    intermediate_degree: int = 32,
+    build_algo: str = "nndescent",
+    final_device: str = "gpu",
+) -> dict[str, int]:
+    initializer = {
+        "nndescent": "nndescent_initializer_calls",
+        "ivf_pq": "ivfpq_initializer_calls",
+        "iterative": "iterative_initializer_calls",
+    }[build_algo]
+    final = {
+        "cpu": "initializer_final_cpu_calls",
+        "gpu": "initializer_final_gpu_calls",
+        "npu": "initializer_final_npu_calls",
+    }[final_device]
+    values = {
+        "successful_calls": 1,
+        "rows": n,
+        "dataset_copy_bytes": n * dim * 4,
+        "initializer_graph_payload_bytes": n * intermediate_degree * 4,
+        "published_graph_copy_bytes": n * graph_degree * 4,
+        initializer: 1,
+        final: 1,
+        "total_wall_ns": 100,
+        "dataset_copy_ns": 10,
+        "initializer_ns": 40,
+        "optimizer_prune_merge_ns": 30,
+        "index_materialize_ns": 10,
+    }
+    if build_algo == "nndescent" and final_device == "gpu":
+        values.update(
+            nndescent_gpu_iterations=6,
+            nndescent_gpu_converged_calls=1,
+            nndescent_gpu_instrumented_calls=1,
+            nndescent_gpu_allocation_calls=4,
+            nndescent_gpu_allocation_bytes=4096,
+            nndescent_gpu_d2h_calls=2,
+            nndescent_gpu_d2h_bytes=16,
+            nndescent_gpu_kernel_launches=12,
+            nndescent_gpu_submission_calls=20,
+            nndescent_gpu_wait_calls=6,
+            nndescent_gpu_peak_owned_bytes_max=2048,
+        )
+    return cagra_build_snapshot(**values)
+
+
+def successful_cagra_build_evidence(n: int) -> dict:
+    return _cagra_build_stats_evidence(
+        cagra_build_snapshot(),
+        successful_cagra_build_after(n=n),
+        build_succeeded=True,
+        n=n,
+        dim=128,
+        graph_degree=16,
+        intermediate_degree=32,
+        build_algo="nndescent",
+        build_policy="auto",
+    )
 
 
 def gate_dataset() -> dict:
@@ -231,6 +310,7 @@ def preflight_lanes(cagra_recall: float = 0.40, hnsw_recall: float = 0.88,
         "successful_observations": walks,
         "failures": 0,
     }
+    lanes[0]["build"]["cagra_build_stats"] = successful_cagra_build_evidence(100_000)
     return lanes
 
 
@@ -290,6 +370,7 @@ class PureHelperTests(unittest.TestCase):
                 "--algorithms", "brute",
                 "--policies", "cpu",
                 "--build-policy", "gpu",
+                "--cagra-build-algo", "iterative",
                 "--warmups", "9",
                 "--repeats", "9",
                 "--seed", "99",
@@ -303,6 +384,7 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(args.algorithms, "cagra")
         self.assertEqual(args.policies, "gpu")
         self.assertEqual(args.build_policy, "auto")
+        self.assertEqual(args.cagra_build_algo, "nndescent")
         self.assertEqual((args.warmups, args.repeats, args.seed), (1, 5, 7))
         self.assertEqual(args.timeout_seconds, 7200)
         self.assertEqual(args.hnsw_threads, 20)
@@ -335,6 +417,48 @@ class PureHelperTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "fail")
         self.assertEqual(result["validation"]["status"], "success")
+
+    def test_cagra_recall_gate_rejects_non_nndescent_initializer(self) -> None:
+        lanes = gate_lanes()
+        lanes[0]["build"]["build_algo"] = "iterative"
+        result = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(
+            any("AUTO-policy attribution" in issue for issue in result["validation"]["issues"])
+        )
+
+    def test_fixed_gate_requires_current_gpu_build_telemetry(self) -> None:
+        lanes = gate_lanes()
+        del lanes[0]["build"]["cagra_build_stats"]
+        missing = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(missing["status"], "invalid")
+        self.assertTrue(
+            any("telemetry is unavailable" in issue for issue in missing["validation"]["issues"])
+        )
+
+        lanes = gate_lanes()
+        lanes[0]["build"]["cagra_build_stats"] = _cagra_build_stats_evidence(
+            cagra_build_snapshot(),
+            successful_cagra_build_after(n=1_000_000, final_device="cpu"),
+            build_succeeded=True,
+            n=1_000_000,
+            dim=128,
+            graph_degree=16,
+            intermediate_degree=32,
+            build_algo="nndescent",
+            build_policy="auto",
+        )
+        cpu = cagra_recall_gate_result(
+            gate_dataset(), gate_truth(), resolved_profile("sift1m"), lanes, 20
+        )
+        self.assertEqual(cpu["status"], "invalid")
+        self.assertTrue(
+            any("instrumented GPU" in issue for issue in cpu["validation"]["issues"])
+        )
 
     def test_cagra_recall_gate_rejects_wrong_transfer_count_and_truth(self) -> None:
         truth = gate_truth()
@@ -614,6 +738,157 @@ class PureHelperTests(unittest.TestCase):
         self.assertIn("do not sum", scopes["timed"]["reason"])
 
 
+class CagraBuildTelemetryTests(unittest.TestCase):
+    @staticmethod
+    def evidence(
+        before: dict | None,
+        after: dict | None,
+        *,
+        build_succeeded: bool = True,
+        build_algo: str = "nndescent",
+        n: int = 100_000,
+        dim: int = 128,
+        graph_degree: int = 16,
+        intermediate_degree: int = 32,
+        build_policy: str = "auto",
+    ) -> dict:
+        return _cagra_build_stats_evidence(
+            before,
+            after,
+            build_succeeded=build_succeeded,
+            n=n,
+            dim=dim,
+            graph_degree=graph_degree,
+            intermediate_degree=intermediate_degree,
+            build_algo=build_algo,
+            build_policy=build_policy,
+        )
+
+    def test_missing_symbol_is_explicit_and_nonblocking(self) -> None:
+        evidence = self.evidence(None, None)
+        self.assertEqual(evidence["status"], "unavailable")
+        self.assertFalse(evidence["blocking"])
+        self.assertIn("unavailable", evidence["reason"])
+
+    def test_ctypes_v1_layout_freezes_every_field_offset(self) -> None:
+        class FakeFunction:
+            pass
+
+        class FakeLibrary:
+            def __init__(self) -> None:
+                self.functions: dict[str, FakeFunction] = {}
+
+            def __getattr__(self, name: str) -> FakeFunction:
+                return self.functions.setdefault(name, FakeFunction())
+
+        with tempfile.TemporaryDirectory() as raw:
+            fake_library = Path(raw) / "ovvs.dll"
+            fake_library.touch()
+            binding_path = ROOT / "python" / "ovvs" / "__init__.py"
+            spec = importlib.util.spec_from_file_location("_ovvs_abi_offset_test", binding_path)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            with (
+                patch.dict(_common.os.environ, {"OVVS_LIBRARY": str(fake_library)}),
+                patch.object(ctypes, "CDLL", return_value=FakeLibrary()),
+                patch.object(_common.os, "add_dll_directory", return_value=object(), create=True),
+            ):
+                spec.loader.exec_module(module)
+
+        structure = module._CagraBuildStatsV1
+        self.assertEqual(ctypes.sizeof(structure), 256)
+        self.assertEqual(structure.abi_version.offset, 0)
+        self.assertEqual(structure.struct_size.offset, 4)
+        for index, name in enumerate(module._CAGRA_BUILD_STATS_COUNTERS):
+            with self.subTest(field=name):
+                self.assertEqual(getattr(structure, name).offset, 8 + 8 * index)
+
+    def test_incompatible_and_backward_snapshots_are_invalid(self) -> None:
+        before = cagra_build_snapshot()
+        incompatible = successful_cagra_build_after()
+        incompatible["struct_size"] = 248
+        evidence = self.evidence(before, incompatible)
+        self.assertEqual(evidence["status"], "invalid")
+        self.assertIn("incompatible", evidence["reason"])
+
+        before = cagra_build_snapshot(successful_calls=2)
+        after = cagra_build_snapshot(successful_calls=1)
+        evidence = self.evidence(before, after)
+        self.assertEqual(evidence["status"], "invalid")
+        self.assertIn("backwards", evidence["reason"])
+
+    def test_successful_large_auto_gpu_delta_validates_with_zero_h2d(self) -> None:
+        evidence = self.evidence(
+            cagra_build_snapshot(),
+            successful_cagra_build_after(),
+        )
+        self.assertEqual(evidence["status"], "success")
+        self.assertTrue(evidence["gpu_structural_validation_required"])
+        self.assertEqual(evidence["delta"]["nndescent_gpu_h2d_calls"], 0)
+        self.assertEqual(evidence["delta"]["nndescent_gpu_h2d_bytes"], 0)
+        self.assertLessEqual(evidence["stage_sum_ns"], evidence["delta"]["total_wall_ns"])
+        self.assertEqual(
+            evidence["total_wall_ns_scope"],
+            "inner build wall through persistent graph materialization, excluding telemetry merge "
+            "and caller-handle publication",
+        )
+
+        inconsistent = successful_cagra_build_after()
+        inconsistent["nndescent_gpu_h2d_calls"] = 1
+        rejected = self.evidence(cagra_build_snapshot(), inconsistent)
+        self.assertEqual(rejected["status"], "invalid")
+        self.assertIn("H2D calls/bytes", rejected["reason"])
+
+    def test_wrong_geometry_and_bytes_are_invalid(self) -> None:
+        for key, value in (
+            ("rows", 99_999),
+            ("dataset_copy_bytes", 1),
+            ("initializer_graph_payload_bytes", 2),
+            ("published_graph_copy_bytes", 3),
+        ):
+            with self.subTest(key=key):
+                after = successful_cagra_build_after()
+                after[key] = value
+                evidence = self.evidence(cagra_build_snapshot(), after)
+                self.assertEqual(evidence["status"], "invalid")
+                self.assertIn(key, evidence["reason"])
+
+    def test_wrong_initializer_algorithm_is_invalid(self) -> None:
+        after = successful_cagra_build_after()
+        after["nndescent_initializer_calls"] = 0
+        after["ivfpq_initializer_calls"] = 1
+        evidence = self.evidence(cagra_build_snapshot(), after)
+        self.assertEqual(evidence["status"], "invalid")
+        self.assertIn("does not match requested nndescent", evidence["reason"])
+
+    def test_stage_overflow_is_invalid(self) -> None:
+        after = successful_cagra_build_after()
+        after["initializer_ns"] = 101
+        evidence = self.evidence(cagra_build_snapshot(), after)
+        self.assertEqual(evidence["status"], "invalid")
+        self.assertIn("stage time exceeds", evidence["reason"])
+
+    def test_failed_build_must_leave_success_only_counters_unchanged(self) -> None:
+        before = cagra_build_snapshot()
+        unchanged = self.evidence(before, dict(before), build_succeeded=False)
+        self.assertEqual(unchanged["status"], "success")
+        self.assertEqual(unchanged["outcome"], "failed_build_unchanged")
+
+        changed_after = dict(before)
+        changed_after["rows"] = 1
+        changed = self.evidence(before, changed_after, build_succeeded=False)
+        self.assertEqual(changed["status"], "invalid")
+        self.assertIn("success-only", changed["reason"])
+
+    def test_cpu_initializer_cannot_publish_gpu_instrumentation(self) -> None:
+        after = successful_cagra_build_after(final_device="cpu")
+        after["nndescent_gpu_kernel_launches"] = 1
+        evidence = self.evidence(cagra_build_snapshot(), after)
+        self.assertEqual(evidence["status"], "invalid")
+        self.assertIn("published GPU", evidence["reason"])
+
+
 class CliAndLaneSemanticsTests(unittest.TestCase):
     def test_no_arg_profile_is_bounded(self) -> None:
         args = bench.build_parser().parse_args([])
@@ -624,6 +899,7 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertLessEqual(profile["timeout_seconds"], 30)
         self.assertGreaterEqual(profile["repeats"], 2)
         self.assertEqual(args.build_policy, "auto")
+        self.assertEqual(args.cagra_build_algo, "nndescent")
 
     def test_sift_100k_profile_is_bounded_preflight(self) -> None:
         profile = resolved_profile("sift-100k")
@@ -642,6 +918,7 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
                 "--algorithms", "brute",
                 "--policies", "cpu",
                 "--build-policy", "gpu",
+                "--cagra-build-algo", "ivf_pq",
                 "--warmups", "9",
                 "--repeats", "9",
                 "--seed", "99",
@@ -655,6 +932,7 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertEqual(args.algorithms, "cagra")
         self.assertEqual(args.policies, "gpu")
         self.assertEqual(args.build_policy, "auto")
+        self.assertEqual(args.cagra_build_algo, "nndescent")
         self.assertEqual((args.warmups, args.repeats, args.seed), (1, 5, 7))
         self.assertEqual(args.timeout_seconds, 1200)
         self.assertEqual(args.hnsw_threads, 20)
@@ -952,6 +1230,7 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertNotIn("base_path", artifact["dataset"])
         self.assertNotIn("query_path", artifact["dataset"])
         self.assertEqual(artifact["dataset"]["runtime_storage"], "ephemeral_files_deleted_after_run")
+        self.assertNotIn("CAGRA initializer", _common.render_markdown(artifact))
 
     def test_sift_100k_artifact_is_always_noncanonical(self) -> None:
         artifact = bench._artifact(
@@ -1385,6 +1664,7 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         self.assertEqual(result["build"]["status"], "success")
         self.assertEqual(result["build"]["policy"], "AUTO")
         self.assertEqual(result["build"]["requested_policy"], "AUTO")
+        self.assertEqual(result["build"]["elapsed_ms_scope"], "complete Python/API build wall")
         self.assertEqual(result["build"]["last_device"]["label"], "GPU")
         self.assertEqual(result["build"]["policy_contract"]["status"], "not_forced")
         self.assertEqual(result["build"]["resource_deltas"]["npu_compile_fails"], 2)
@@ -1418,6 +1698,34 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         self.assertEqual(result["build"]["resource_after"]["npu_fallbacks"], 1)
         self.assertEqual(result["build"]["fallback_telemetry"]["npu_fallbacks"]["delta"], 1)
         self.assertEqual(result["points"], [])
+        self.assertTrue(resources.closed)
+
+    def test_fixed_mode_worker_rejects_missing_build_telemetry(self) -> None:
+        resources = self.FakeResources()
+        index = self.FakeIndex()
+        spec = self.spec()
+        spec["gate_only"] = "cagra-recall"
+        metadata = {
+            "gpu_available": 1,
+            "npu_available": 1,
+            "npu_compile_fails": 0,
+            "npu_fallbacks": 0,
+        }
+        with (
+            patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
+            patch.object(_worker, "load_dataset", return_value=(object(), object())),
+            patch.object(_worker, "_build_ovvs_index", return_value=index),
+            patch.object(_worker, "ovvs_resource_metadata", return_value=metadata),
+        ):
+            result = _worker.run_ovvs(spec, self.lane("gpu"))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["build"]["status"], "success")
+        self.assertEqual(result["build"]["build_algo"], "nndescent")
+        self.assertEqual(result["build"]["cagra_build_stats"]["status"], "unavailable")
+        self.assertIn("fixed-mode", result["reason"])
+        self.assertEqual(resources.policies, [0])
+        self.assertTrue(index.closed)
         self.assertTrue(resources.closed)
 
     def test_cagra_point_delta_includes_measurement_and_energy_searches(self) -> None:

@@ -8,6 +8,8 @@ using ovvs::impl::ResourcesData;
 
 static_assert(sizeof(ovvsIvfPqSearchStatsV1) == 200,
               "ovvsIvfPqSearchStatsV1 is a frozen 200-byte ABI");
+static_assert(sizeof(ovvsCagraBuildStatsV1) == 256,
+              "ovvsCagraBuildStatsV1 is a frozen 256-byte ABI");
 
 ovvsStatus ovvsResourcesCreate(ovvsResources_t* res) {
   if (!res) return OVVS_STATUS_INVALID_ARGUMENT;
@@ -99,6 +101,17 @@ ovvsStatus ovvsResourcesIvfPqSearchStatsV1(ovvsResources_t res,
   std::lock_guard<std::mutex> lock(resources->ivfpq_stats_mutex);
   *stats = resources->ivfpq_search_stats;
   stats->abi_version = OVVS_IVF_PQ_SEARCH_STATS_ABI_V1;
+  stats->struct_size = static_cast<uint32_t>(sizeof(*stats));
+  return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus ovvsResourcesCagraBuildStatsV1(ovvsResources_t res,
+                                          ovvsCagraBuildStatsV1* stats) {
+  if (!res || !stats) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* resources = rd(res);
+  std::lock_guard<std::mutex> lock(resources->cagra_build_stats_mutex);
+  *stats = resources->cagra_build_stats;
+  stats->abi_version = OVVS_CAGRA_BUILD_STATS_ABI_V1;
   stats->struct_size = static_cast<uint32_t>(sizeof(*stats));
   return OVVS_STATUS_SUCCESS;
 }

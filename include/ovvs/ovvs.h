@@ -107,6 +107,51 @@ typedef struct ovvsIvfPqSearchStatsV1 {
   int64_t gpu_wait_calls;
 } ovvsIvfPqSearchStatsV1;
 
+#define OVVS_CAGRA_BUILD_STATS_ABI_V1 1u
+
+/* Resource-local cumulative telemetry for successful CAGRA builds. V1 is an immutable
+   256-byte ABI; use a new structure and symbol for future fields. total_wall_ns is the
+   inner build wall through persistent index materialization; it excludes the telemetry
+   merge, public handle publication, and serialization. Byte counters describe logical
+   payloads/copies, and cumulative sums saturate at INT64_MAX. The final-edge fields sum
+   each call's final value; the peak field is a maximum. Same-resource concurrent builds
+   remain unsupported. */
+typedef struct ovvsCagraBuildStatsV1 {
+  uint32_t abi_version;
+  uint32_t struct_size;
+  int64_t successful_calls;
+  int64_t rows;
+  int64_t dataset_copy_bytes;
+  int64_t initializer_graph_payload_bytes;
+  int64_t published_graph_copy_bytes;
+  int64_t nndescent_initializer_calls;
+  int64_t ivfpq_initializer_calls;
+  int64_t iterative_initializer_calls;
+  int64_t total_wall_ns;
+  int64_t dataset_copy_ns;
+  int64_t initializer_ns;
+  int64_t optimizer_prune_merge_ns;
+  int64_t index_materialize_ns;
+  int64_t initializer_final_cpu_calls;
+  int64_t initializer_final_gpu_calls;
+  int64_t initializer_final_npu_calls;
+  int64_t nndescent_gpu_iterations;
+  int64_t nndescent_gpu_converged_calls;
+  int64_t nndescent_gpu_final_changed_edges;
+  int64_t nndescent_gpu_final_pending_new_edges;
+  int64_t nndescent_gpu_instrumented_calls;
+  int64_t nndescent_gpu_allocation_calls;
+  int64_t nndescent_gpu_allocation_bytes;
+  int64_t nndescent_gpu_h2d_calls;
+  int64_t nndescent_gpu_h2d_bytes;
+  int64_t nndescent_gpu_d2h_calls;
+  int64_t nndescent_gpu_d2h_bytes;
+  int64_t nndescent_gpu_kernel_launches;
+  int64_t nndescent_gpu_submission_calls;
+  int64_t nndescent_gpu_wait_calls;
+  int64_t nndescent_gpu_peak_owned_bytes_max;
+} ovvsCagraBuildStatsV1;
+
 /* Concurrent searches may share an immutable index when each worker has a distinct
    Resources object. Do not mutate, serialize, or destroy an index concurrently. */
 
@@ -134,6 +179,8 @@ OVVS_API ovvsStatus ovvsResourcesCagraTransferStats(ovvsResources_t res, int64_t
                                                     int64_t* upload_bytes);
 OVVS_API ovvsStatus ovvsResourcesIvfPqSearchStatsV1(ovvsResources_t res,
                                                     ovvsIvfPqSearchStatsV1* stats);
+OVVS_API ovvsStatus ovvsResourcesCagraBuildStatsV1(ovvsResources_t res,
+                                                   ovvsCagraBuildStatsV1* stats);
 OVVS_API ovvsStatus ovvsResourcesSetNpuBusy(ovvsResources_t res, int32_t busy);
 OVVS_API int32_t ovvsSyclEnabled(void);
 /* Package energy in microjoules from Linux RAPL sysfs, Windows EMI (intelppm RAPL),

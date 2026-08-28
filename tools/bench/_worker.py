@@ -21,6 +21,7 @@ from _common import (
     POLICY_LABELS,
     POLICY_VALUES,
     UnavailableError,
+    fixed_cagra_build_stats_issue,
     load_dataset,
     load_ovvs,
     measure_energy,
@@ -216,7 +217,8 @@ def _energy(spec: dict[str, Any], reader: Callable[[], int | None] | None,
 
 
 def _build_ovvs_index(module: Any, resources: Any, algorithm: str, base: Any,
-                      dataset: dict[str, Any], profile: dict[str, Any]):
+                      dataset: dict[str, Any], profile: dict[str, Any],
+                      cagra_build_algo: str = "nndescent"):
     dim = dataset["dim"]
     if algorithm == "brute":
         return module.neighbors.brute_force.build(base, dim=dim, resources=resources)
@@ -242,6 +244,7 @@ def _build_ovvs_index(module: Any, resources: Any, algorithm: str, base: Any,
             graph_degree=profile["graph_degree"],
             intermediate_degree=profile["intermediate_degree"],
             resources=resources,
+            build_algo=cagra_build_algo,
         )
     raise ValueError(f"unsupported ovVS algorithm: {algorithm}")
 
@@ -442,6 +445,280 @@ def _ivfpq_search_stats_snapshot(module: Any, resources: Any) -> Any:
         return None
 
 
+_CAGRA_BUILD_STATS_COUNTERS = (
+    "successful_calls",
+    "rows",
+    "dataset_copy_bytes",
+    "initializer_graph_payload_bytes",
+    "published_graph_copy_bytes",
+    "nndescent_initializer_calls",
+    "ivfpq_initializer_calls",
+    "iterative_initializer_calls",
+    "total_wall_ns",
+    "dataset_copy_ns",
+    "initializer_ns",
+    "optimizer_prune_merge_ns",
+    "index_materialize_ns",
+    "initializer_final_cpu_calls",
+    "initializer_final_gpu_calls",
+    "initializer_final_npu_calls",
+    "nndescent_gpu_iterations",
+    "nndescent_gpu_converged_calls",
+    "nndescent_gpu_final_changed_edges",
+    "nndescent_gpu_final_pending_new_edges",
+    "nndescent_gpu_instrumented_calls",
+    "nndescent_gpu_allocation_calls",
+    "nndescent_gpu_allocation_bytes",
+    "nndescent_gpu_h2d_calls",
+    "nndescent_gpu_h2d_bytes",
+    "nndescent_gpu_d2h_calls",
+    "nndescent_gpu_d2h_bytes",
+    "nndescent_gpu_kernel_launches",
+    "nndescent_gpu_submission_calls",
+    "nndescent_gpu_wait_calls",
+    "nndescent_gpu_peak_owned_bytes_max",
+)
+
+_CAGRA_BUILD_STAGE_COUNTERS = (
+    "dataset_copy_ns",
+    "initializer_ns",
+    "optimizer_prune_merge_ns",
+    "index_materialize_ns",
+)
+
+_CAGRA_INNER_BUILD_WALL_SCOPE = (
+    "inner build wall through persistent graph materialization, excluding telemetry merge "
+    "and caller-handle publication"
+)
+
+_CAGRA_INITIALIZER_COUNTERS = {
+    "nndescent": "nndescent_initializer_calls",
+    "ivf_pq": "ivfpq_initializer_calls",
+    "iterative": "iterative_initializer_calls",
+}
+
+_CAGRA_NND_GPU_COUNTERS = tuple(
+    key for key in _CAGRA_BUILD_STATS_COUNTERS if key.startswith("nndescent_gpu_")
+)
+
+
+def _cagra_build_stats_snapshot(resources: Any) -> Any:
+    try:
+        return resources.cagra_build_stats()
+    except AttributeError:
+        return None
+    except Exception as exc:
+        return {
+            "snapshot_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _cagra_build_stats_evidence(
+    before: Any,
+    after: Any,
+    *,
+    build_succeeded: bool,
+    n: int,
+    dim: int,
+    graph_degree: int,
+    intermediate_degree: int,
+    build_algo: str,
+    build_policy: str,
+) -> dict[str, Any]:
+    scope = "one_fresh_resource_cagra_build"
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {
+            "status": "unavailable",
+            "scope": scope,
+            "before": before,
+            "after": after,
+            "reason": "CAGRA build telemetry is unavailable in this library",
+            "blocking": False,
+        }
+    if "snapshot_error" in before or "snapshot_error" in after:
+        return {
+            "status": "invalid",
+            "scope": scope,
+            "before": before,
+            "after": after,
+            "reason": "CAGRA build telemetry snapshot failed or reported an incompatible ABI",
+            "blocking": True,
+        }
+    for snapshot, label in ((before, "before"), (after, "after")):
+        if snapshot.get("abi_version") != 1 or snapshot.get("struct_size") != 256:
+            return {
+                "status": "invalid",
+                "scope": scope,
+                "before": before,
+                "after": after,
+                "reason": f"CAGRA {label} telemetry has an incompatible ABI version or size",
+                "blocking": True,
+            }
+        if not all(type(snapshot.get(key)) is int for key in _CAGRA_BUILD_STATS_COUNTERS):
+            return {
+                "status": "invalid",
+                "scope": scope,
+                "before": before,
+                "after": after,
+                "reason": f"CAGRA {label} telemetry is incomplete",
+                "blocking": True,
+            }
+        if any(snapshot[key] < 0 for key in _CAGRA_BUILD_STATS_COUNTERS):
+            return {
+                "status": "invalid",
+                "scope": scope,
+                "before": before,
+                "after": after,
+                "reason": f"CAGRA {label} telemetry contains a negative cumulative counter",
+                "blocking": True,
+            }
+
+    delta = {key: after[key] - before[key] for key in _CAGRA_BUILD_STATS_COUNTERS}
+    if any(value < 0 for value in delta.values()):
+        return {
+            "status": "invalid",
+            "scope": scope,
+            "before": before,
+            "after": after,
+            "delta": delta,
+            "reason": "CAGRA build telemetry moved backwards",
+            "blocking": True,
+        }
+
+    issues: list[str] = []
+    if any(before[key] != 0 for key in _CAGRA_BUILD_STATS_COUNTERS):
+        issues.append("CAGRA build did not start from a fresh zero-counter resource")
+
+    if not build_succeeded:
+        if any(delta.values()):
+            issues.append("failed CAGRA build changed success-only telemetry")
+        return {
+            "status": "invalid" if issues else "success",
+            "scope": scope,
+            "outcome": "failed_build_unchanged" if not issues else "failed_build_changed",
+            "before": before,
+            "after": after,
+            "delta": delta,
+            "blocking": bool(issues),
+            "reason": "; ".join(issues) or None,
+        }
+
+    if build_algo not in _CAGRA_INITIALIZER_COUNTERS:
+        issues.append(f"unknown requested CAGRA build algorithm {build_algo!r}")
+    clamped_graph_degree = max(1, min(int(graph_degree), int(n) - 1))
+    clamped_intermediate_degree = max(
+        clamped_graph_degree,
+        min(int(intermediate_degree), int(n) - 1),
+    )
+    expected = {
+        "successful_calls": 1,
+        "rows": int(n),
+        "dataset_copy_bytes": int(n) * int(dim) * 4,
+        "initializer_graph_payload_bytes": int(n) * clamped_intermediate_degree * 4,
+        "published_graph_copy_bytes": int(n) * clamped_graph_degree * 4,
+    }
+    for key, value in expected.items():
+        if delta[key] != value:
+            issues.append(f"{key} delta {delta[key]} != expected {value}")
+
+    initializer_keys = tuple(_CAGRA_INITIALIZER_COUNTERS.values())
+    selected = _CAGRA_INITIALIZER_COUNTERS.get(build_algo)
+    if sum(delta[key] for key in initializer_keys) != 1:
+        issues.append("CAGRA telemetry does not report exactly one selected initializer")
+    elif selected is not None and delta[selected] != 1:
+        issues.append(f"CAGRA telemetry initializer does not match requested {build_algo}")
+
+    final_device_keys = (
+        "initializer_final_cpu_calls",
+        "initializer_final_gpu_calls",
+        "initializer_final_npu_calls",
+    )
+    if sum(delta[key] for key in final_device_keys) != 1:
+        issues.append("CAGRA telemetry does not report exactly one initializer final device")
+
+    stage_sum = sum(delta[key] for key in _CAGRA_BUILD_STAGE_COUNTERS)
+    if delta["total_wall_ns"] <= 0:
+        issues.append(f"CAGRA {_CAGRA_INNER_BUILD_WALL_SCOPE} is not positive")
+    if stage_sum > delta["total_wall_ns"]:
+        issues.append(f"CAGRA build stage time exceeds {_CAGRA_INNER_BUILD_WALL_SCOPE}")
+
+    h2d_calls = delta["nndescent_gpu_h2d_calls"]
+    h2d_bytes = delta["nndescent_gpu_h2d_bytes"]
+    if (h2d_calls == 0) != (h2d_bytes == 0):
+        issues.append("CAGRA NN-Descent H2D calls/bytes zero-state is inconsistent")
+
+    gpu_final = delta["initializer_final_gpu_calls"] == 1
+    gpu_structural_positive = (
+        "nndescent_gpu_iterations",
+        "nndescent_gpu_allocation_calls",
+        "nndescent_gpu_allocation_bytes",
+        "nndescent_gpu_d2h_calls",
+        "nndescent_gpu_d2h_bytes",
+        "nndescent_gpu_kernel_launches",
+        "nndescent_gpu_submission_calls",
+        "nndescent_gpu_wait_calls",
+        "nndescent_gpu_peak_owned_bytes_max",
+    )
+    requires_gpu_structure = (
+        build_algo == "nndescent"
+        and build_policy == "auto"
+        and int(n) > 4_096
+        and gpu_final
+    )
+    if requires_gpu_structure:
+        if delta["nndescent_gpu_instrumented_calls"] != 1:
+            issues.append("large AUTO GPU NN-Descent build lacks one instrumented call")
+        for key in gpu_structural_positive:
+            if delta[key] <= 0:
+                issues.append(f"large AUTO GPU NN-Descent build has non-positive {key}")
+        if delta["nndescent_gpu_iterations"] > 6:
+            issues.append("large AUTO GPU NN-Descent build exceeded its six-iteration bound")
+        if (
+            delta["nndescent_gpu_allocation_bytes"]
+            < delta["nndescent_gpu_peak_owned_bytes_max"]
+        ):
+            issues.append("CAGRA NN-Descent peak-owned bytes exceed cumulative allocation bytes")
+        minimum_submissions = (
+            delta["nndescent_gpu_kernel_launches"]
+            + delta["nndescent_gpu_h2d_calls"]
+            + delta["nndescent_gpu_d2h_calls"]
+        )
+        if delta["nndescent_gpu_submission_calls"] < minimum_submissions:
+            issues.append("CAGRA NN-Descent submissions do not cover kernels and explicit copies")
+        if delta["nndescent_gpu_converged_calls"] not in (0, 1):
+            issues.append("CAGRA NN-Descent convergence count is not boolean per call")
+        elif delta["nndescent_gpu_converged_calls"] == 1:
+            change_ratio = delta["nndescent_gpu_final_changed_edges"] / float(
+                int(n) * clamped_intermediate_degree
+            )
+            if (
+                delta["nndescent_gpu_final_pending_new_edges"] != 0
+                or change_ratio >= 0.0001
+            ):
+                issues.append("CAGRA NN-Descent convergence counters violate the stopping rule")
+    elif not gpu_final and any(delta[key] != 0 for key in _CAGRA_NND_GPU_COUNTERS):
+        issues.append("CPU/fallback CAGRA initializer published GPU NN-Descent counters")
+
+    return {
+        "status": "invalid" if issues else "success",
+        "scope": scope,
+        "outcome": "successful_build",
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "expected": expected,
+        "requested_build_algo": build_algo,
+        "requested_build_policy": build_policy,
+        "clamped_graph_degree": clamped_graph_degree,
+        "clamped_intermediate_degree": clamped_intermediate_degree,
+        "stage_sum_ns": stage_sum,
+        "total_wall_ns_scope": _CAGRA_INNER_BUILD_WALL_SCOPE,
+        "gpu_structural_validation_required": requires_gpu_structure,
+        "blocking": bool(issues),
+        "reason": "; ".join(issues) or None,
+    }
+
+
 def _ivfpq_search_stats_scopes(
     snapshots: dict[str, dict[str, Any]],
     timed_expected_calls: int,
@@ -485,7 +762,9 @@ def _ivfpq_search_stats_scopes(
 
 
 def _build_record(status: str, policy: str, elapsed_ms: float, last_device: dict[str, Any],
-                  before: dict[str, Any], after: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
+                  before: dict[str, Any], after: dict[str, Any], reason: str | None = None,
+                  cagra_build_algo: str | None = None,
+                  cagra_build_stats: dict[str, Any] | None = None) -> dict[str, Any]:
     reported_devices = (
         [last_device["code"]]
         if status == "success"
@@ -500,6 +779,7 @@ def _build_record(status: str, policy: str, elapsed_ms: float, last_device: dict
         "requested_policy": POLICY_LABELS[policy],
         "requested_policy_key": policy,
         "elapsed_ms": elapsed_ms,
+        "elapsed_ms_scope": "complete Python/API build wall",
         "last_device": last_device,
         "policy_contract": policy_contract("build", policy, reported_devices),
         "resource_before": before,
@@ -514,6 +794,9 @@ def _build_record(status: str, policy: str, elapsed_ms: float, last_device: dict
     }
     if reason:
         record["reason"] = reason
+    if cagra_build_algo is not None:
+        record["build_algo"] = cagra_build_algo
+        record["cagra_build_stats"] = cagra_build_stats
     return record
 
 
@@ -559,16 +842,48 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
         truth = np.load(spec["truth_path"], allow_pickle=False).tolist() if Path(spec["truth_path"]).exists() else None
         # Every search lane uses the same independently requested construction policy.
         build_policy = spec.get("build_policy", "auto")
+        cagra_build_algo = spec.get("cagra_build_algo", "nndescent")
         resources.set_policy(POLICY_VALUES[build_policy])
         build_before = ovvs_resource_metadata(module, resources)
+        cagra_stats_before = (
+            _cagra_build_stats_snapshot(resources)
+            if lane["algorithm"] == "cagra"
+            else None
+        )
         build_started = time.perf_counter()
         try:
             index = _build_ovvs_index(
-                module, resources, lane["algorithm"], base, spec["dataset"], spec["profile"]
+                module,
+                resources,
+                lane["algorithm"],
+                base,
+                spec["dataset"],
+                spec["profile"],
+                cagra_build_algo=cagra_build_algo,
             )
         except Exception as exc:
             build_ms = (time.perf_counter() - build_started) * 1_000
             build_last_device = _last_device_evidence(resources, False)
+            cagra_stats_after = (
+                _cagra_build_stats_snapshot(resources)
+                if lane["algorithm"] == "cagra"
+                else None
+            )
+            cagra_stats = (
+                _cagra_build_stats_evidence(
+                    cagra_stats_before,
+                    cagra_stats_after,
+                    build_succeeded=False,
+                    n=spec["dataset"]["n"],
+                    dim=spec["dataset"]["dim"],
+                    graph_degree=spec["profile"].get("graph_degree", 1),
+                    intermediate_degree=spec["profile"].get("intermediate_degree", 1),
+                    build_algo=cagra_build_algo,
+                    build_policy=build_policy,
+                )
+                if lane["algorithm"] == "cagra"
+                else None
+            )
             build_after = ovvs_resource_metadata(module, resources)
             build_status = exception_point_status(exc)
             reason = f"index build under {POLICY_LABELS[build_policy]}: {exc}"
@@ -586,6 +901,8 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                     build_before,
                     build_after,
                     reason,
+                    cagra_build_algo=(cagra_build_algo if lane["algorithm"] == "cagra" else None),
+                    cagra_build_stats=cagra_stats,
                 ),
                 "points": [],
                 "implementation_metadata": {
@@ -598,10 +915,68 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
             }
         build_ms = (time.perf_counter() - build_started) * 1_000
         build_last_device = _last_device_evidence(resources, True)
+        cagra_stats_after = (
+            _cagra_build_stats_snapshot(resources)
+            if lane["algorithm"] == "cagra"
+            else None
+        )
+        cagra_stats = (
+            _cagra_build_stats_evidence(
+                cagra_stats_before,
+                cagra_stats_after,
+                build_succeeded=True,
+                n=spec["dataset"]["n"],
+                dim=spec["dataset"]["dim"],
+                graph_degree=spec["profile"].get("graph_degree", 1),
+                intermediate_degree=spec["profile"].get("intermediate_degree", 1),
+                build_algo=cagra_build_algo,
+                build_policy=build_policy,
+            )
+            if lane["algorithm"] == "cagra"
+            else None
+        )
         build_after = ovvs_resource_metadata(module, resources)
         build_record = _build_record(
-            "success", build_policy, build_ms, build_last_device, build_before, build_after
+            "success",
+            build_policy,
+            build_ms,
+            build_last_device,
+            build_before,
+            build_after,
+            cagra_build_algo=(cagra_build_algo if lane["algorithm"] == "cagra" else None),
+            cagra_build_stats=cagra_stats,
         )
+        fixed_cagra_mode = bool(spec.get("gate_only") or spec.get("preflight_only"))
+        fixed_stats_issue = (
+            fixed_cagra_build_stats_issue(build_record)
+            if lane["algorithm"] == "cagra" and fixed_cagra_mode
+            else None
+        )
+        if (
+            cagra_stats is not None
+            and cagra_stats.get("status") == "invalid"
+        ) or fixed_stats_issue:
+            reason = (
+                f"CAGRA build telemetry invalid: {cagra_stats.get('reason')}"
+                if cagra_stats is not None and cagra_stats.get("status") == "invalid"
+                else f"fixed-mode CAGRA build telemetry gate failed: {fixed_stats_issue}"
+            )
+            return {
+                **lane,
+                "status": "failed",
+                "reason": reason,
+                "started_at": started_at,
+                "elapsed_ms": (time.perf_counter() - started) * 1_000,
+                "build": build_record,
+                "points": [],
+                "implementation_metadata": {
+                    "ovvs_version": module.version(),
+                    "library": os.environ.get("OVVS_LIBRARY"),
+                    "resource_before": before,
+                    "resource_after": build_after,
+                    "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence",
+                },
+            }
         resources.set_policy(POLICY_VALUES[policy])
         points: list[dict[str, Any]] = []
         for configured in _selected_points(spec, lane["algorithm"]):
@@ -1129,6 +1504,7 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
         raise ValueError("hnsw_threads must be a positive integer")
 
     build_policy = spec.get("build_policy", "auto")
+    cagra_build_algo = spec.get("cagra_build_algo", "nndescent")
     build_started = time.perf_counter()
     resource_started = time.perf_counter()
     resources, cagra, exported = module.Resources(), None, None
@@ -1141,6 +1517,7 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
     excluded_instrumentation_ms = 0.0
     instrumentation_started = time.perf_counter()
     build_before = ovvs_resource_metadata(module, resources)
+    cagra_stats_before = _cagra_build_stats_snapshot(resources)
     excluded_instrumentation_ms += (
         time.perf_counter() - instrumentation_started
     ) * 1_000
@@ -1153,12 +1530,31 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
         stage_started = time.perf_counter()
         try:
             resources.set_policy(POLICY_VALUES[build_policy])
+            stage_started = time.perf_counter()
             cagra = _build_ovvs_index(
-                module, resources, "cagra", base, spec["dataset"], profile
+                module,
+                resources,
+                "cagra",
+                base,
+                spec["dataset"],
+                profile,
+                cagra_build_algo=cagra_build_algo,
             )
             cagra_ms = (time.perf_counter() - stage_started) * 1_000
             stages[current_stage] = {"status": "success", "elapsed_ms": cagra_ms}
             instrumentation_started = time.perf_counter()
+            cagra_stats_after = _cagra_build_stats_snapshot(resources)
+            cagra_stats = _cagra_build_stats_evidence(
+                cagra_stats_before,
+                cagra_stats_after,
+                build_succeeded=True,
+                n=spec["dataset"]["n"],
+                dim=spec["dataset"]["dim"],
+                graph_degree=profile["graph_degree"],
+                intermediate_degree=profile["intermediate_degree"],
+                build_algo=cagra_build_algo,
+                build_policy=build_policy,
+            )
             build_after = ovvs_resource_metadata(module, resources)
             cagra_record = _build_record(
                 "success",
@@ -1167,10 +1563,16 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
                 _last_device_evidence(resources, True),
                 build_before,
                 build_after,
+                cagra_build_algo=cagra_build_algo,
+                cagra_build_stats=cagra_stats,
             )
             excluded_instrumentation_ms += (
                 time.perf_counter() - instrumentation_started
             ) * 1_000
+            if cagra_stats.get("status") == "invalid":
+                raise RuntimeError(
+                    f"CAGRA build telemetry invalid: {cagra_stats.get('reason')}"
+                )
 
             current_stage = "cagra_to_hnsw"
             stage_started = time.perf_counter()
@@ -1249,6 +1651,18 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
             status = exception_point_status(exc)
             if cagra_record is None and resources is not None:
                 instrumentation_started = time.perf_counter()
+                cagra_stats_after = _cagra_build_stats_snapshot(resources)
+                cagra_stats = _cagra_build_stats_evidence(
+                    cagra_stats_before,
+                    cagra_stats_after,
+                    build_succeeded=False,
+                    n=spec["dataset"]["n"],
+                    dim=spec["dataset"]["dim"],
+                    graph_degree=profile["graph_degree"],
+                    intermediate_degree=profile["intermediate_degree"],
+                    build_algo=cagra_build_algo,
+                    build_policy=build_policy,
+                )
                 build_after = ovvs_resource_metadata(module, resources)
                 cagra_record = _build_record(
                     status,
@@ -1258,6 +1672,8 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
                     build_before,
                     build_after,
                     str(exc),
+                    cagra_build_algo=cagra_build_algo,
+                    cagra_build_stats=cagra_stats,
                 )
                 excluded_instrumentation_ms += (
                     time.perf_counter() - instrumentation_started
@@ -1279,6 +1695,7 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
                     "ovvs_version": module.version(),
                     "hnswlib_version": package_version("hnswlib"),
                     "build_policy": POLICY_LABELS[build_policy],
+                    "cagra_build_algo": cagra_build_algo,
                 },
             }
         finally:
@@ -1371,6 +1788,7 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
                 "library": os.environ.get("OVVS_LIBRARY"),
                 "producer": "ovVS CAGRA build plus single-layer hnswlib export",
                 "build_policy": POLICY_LABELS[build_policy],
+                "cagra_build_algo": cagra_build_algo,
                 "M": int(index.M),
                 "serialized_ef_construction": int(index.ef_construction),
                 "threading": "explicit" if hnsw_threads is not None else "hnswlib_default",

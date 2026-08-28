@@ -1110,7 +1110,9 @@ bool sycl_gpu_available() {
 
 ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
                                int64_t dim, ovvsMetric metric, int32_t degree,
-                               int32_t iters, int32_t* graph) {
+                               int32_t iters, int32_t* graph,
+                               NnDescentBuildStats* stats) {
+  if (stats) *stats = {};
   {
     std::lock_guard<std::mutex> lock(r.nndescent_stats_mutex);
     r.nndescent_iterations_run = 0;
@@ -1135,6 +1137,30 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
 
   try {
     auto& q = gpu_queue();
+    const auto note_submission = [&]() noexcept {
+      if (stats) stats->submission();
+    };
+    const auto note_kernel = [&]() noexcept {
+      if (stats) {
+        stats->submission();
+        stats->gpu.kernel();
+      }
+    };
+    const auto note_wait = [&]() noexcept {
+      if (stats) stats->gpu.wait();
+    };
+    const auto note_h2d = [&](size_t bytes) noexcept {
+      if (stats) {
+        stats->submission();
+        stats->gpu.h2d(bytes);
+      }
+    };
+    const auto note_d2h = [&](size_t bytes) noexcept {
+      if (stats) {
+        stats->submission();
+        stats->gpu.d2h(bytes);
+      }
+    };
     const auto device = q.get_device();
     const size_t N = static_cast<size_t>(n);
     const size_t D = static_cast<size_t>(dim);
@@ -1218,6 +1244,10 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
     if (device_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
+    if (stats) {
+      stats->gpu_instrumented = true;
+      stats->peak_owned_bytes = static_cast<int64_t>(device_bytes);
+    }
 
     size_t twice_degree = 0;
     if (!checked_product(DEG, 2u, twice_degree)) {
@@ -1250,19 +1280,20 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
       work_group_size <<= 1u;
     }
 
-    ScopedDeviceUsm<float> dataset_copy(q, dataset_direct ? 0u : dataset_count);
-    ScopedDeviceUsm<uint32_t> ids_a(q, graph_count);
-    ScopedDeviceUsm<uint32_t> ids_b(q, graph_count);
-    ScopedDeviceUsm<float> distances_a(q, graph_count);
-    ScopedDeviceUsm<float> distances_b(q, graph_count);
-    ScopedDeviceUsm<uint32_t> reverse_new(q, reverse_count);
-    ScopedDeviceUsm<uint32_t> reverse_old(q, reverse_count);
-    ScopedDeviceUsm<int32_t> inbox_links(q, link_count);
-    ScopedDeviceUsm<uint32_t> proposal_ids(q, proposal_inbox_count);
-    ScopedDeviceUsm<float> proposal_distances(q, proposal_inbox_count);
-    ScopedDeviceUsm<int32_t> heads(q, N);
-    ScopedDeviceUsm<uint32_t> active_targets(q, N);
-    ScopedDeviceUsm<int32_t> scalars(q, 2u);
+    GpuWorkStats* const gpu_stats = stats ? &stats->gpu : nullptr;
+    ScopedDeviceUsm<float> dataset_copy(q, dataset_direct ? 0u : dataset_count, gpu_stats);
+    ScopedDeviceUsm<uint32_t> ids_a(q, graph_count, gpu_stats);
+    ScopedDeviceUsm<uint32_t> ids_b(q, graph_count, gpu_stats);
+    ScopedDeviceUsm<float> distances_a(q, graph_count, gpu_stats);
+    ScopedDeviceUsm<float> distances_b(q, graph_count, gpu_stats);
+    ScopedDeviceUsm<uint32_t> reverse_new(q, reverse_count, gpu_stats);
+    ScopedDeviceUsm<uint32_t> reverse_old(q, reverse_count, gpu_stats);
+    ScopedDeviceUsm<int32_t> inbox_links(q, link_count, gpu_stats);
+    ScopedDeviceUsm<uint32_t> proposal_ids(q, proposal_inbox_count, gpu_stats);
+    ScopedDeviceUsm<float> proposal_distances(q, proposal_inbox_count, gpu_stats);
+    ScopedDeviceUsm<int32_t> heads(q, N, gpu_stats);
+    ScopedDeviceUsm<uint32_t> active_targets(q, N, gpu_stats);
+    ScopedDeviceUsm<int32_t> scalars(q, 2u, gpu_stats);
     uint32_t* const reverse_new_ptr = reverse_new.get();
     uint32_t* const reverse_old_ptr = reverse_old.get();
     int32_t* const inbox_links_ptr = inbox_links.get();
@@ -1272,11 +1303,18 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
     uint32_t* const active_targets_ptr = active_targets.get();
     int32_t* const scalars_ptr = scalars.get();
     const float* DS = dataset_direct ? dataset : dataset_copy.get();
-    if (!dataset_direct) q.memcpy(dataset_copy.get(), dataset, dataset_bytes);
+    if (!dataset_direct) {
+      note_h2d(dataset_bytes);
+      q.memcpy(dataset_copy.get(), dataset, dataset_bytes);
+    }
+    note_wait();
     q.wait_and_throw();
 
+    note_submission();
     q.fill(scalars_ptr + 1, 0, 1u);
+    note_wait();
     q.wait_and_throw();
+    note_kernel();
     q.parallel_for(sycl::range<1>(dataset_count), [=](sycl::id<1> index) {
       if (!sycl::isfinite(DS[index])) {
         sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
@@ -1285,9 +1323,12 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
         invalid.store(1);
       }
     });
+    note_wait();
     q.wait_and_throw();
     int32_t invalid_numeric = 0;
+    note_d2h(sizeof(invalid_numeric));
     q.memcpy(&invalid_numeric, scalars_ptr + 1, sizeof(invalid_numeric));
+    note_wait();
     q.wait_and_throw();
     if (invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
 
@@ -1302,6 +1343,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
       if (!checked_product(launch_vertices, work_group_size, global_size)) {
         return OVVS_STATUS_SHAPE_MISMATCH;
       }
+      note_kernel();
       q.submit([&](sycl::handler& h) {
          h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
                                          sycl::range<1>(work_group_size)),
@@ -1405,8 +1447,11 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
          });
        });
     }
+    note_wait();
     q.wait_and_throw();
+    note_d2h(sizeof(invalid_numeric));
     q.memcpy(&invalid_numeric, scalars_ptr + 1, sizeof(invalid_numeric));
+    note_wait();
     q.wait_and_throw();
     if (invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
 
@@ -1426,6 +1471,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
         if (!checked_product(launch_vertices, work_group_size, global_size)) {
           return OVVS_STATUS_SHAPE_MISMATCH;
         }
+        note_kernel();
         q.submit([&](sycl::handler& h) {
           h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
                                            sycl::range<1>(work_group_size)),
@@ -1451,19 +1497,27 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
           });
         });
       }
+      note_wait();
       q.wait_and_throw();
 
+      note_submission();
       q.fill(reverse_new_ptr, kInvalidId, reverse_count);
+      note_submission();
       q.fill(reverse_old_ptr, kInvalidId, reverse_count);
+      note_wait();
       q.wait_and_throw();
 
       const auto build_reverse = [&](bool select_new, uint32_t* reverse_graph) -> ovvsStatus {
         for (size_t source_offset = 0; source_offset < N; source_offset += reverse_chunk) {
           const size_t source_count = std::min(reverse_chunk, N - source_offset);
+          note_submission();
           q.fill(heads_ptr, -1, N);
+          note_submission();
           q.fill(scalars_ptr, 0, 1u);
+          note_wait();
           q.wait_and_throw();
 
+          note_kernel();
           q.parallel_for(sycl::range<1>(source_count), [=](sycl::id<1> source_index) {
             const size_t local_source = source_index[0];
             const size_t source = source_offset + local_source;
@@ -1492,15 +1546,19 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
               ++sample_rank;
             }
           });
+          note_wait();
           q.wait_and_throw();
 
           int32_t active_count = 0;
+          note_d2h(sizeof(active_count));
           q.memcpy(&active_count, scalars_ptr, sizeof(active_count));
+          note_wait();
           q.wait_and_throw();
           if (active_count < 0 || static_cast<size_t>(active_count) > N) {
             return OVVS_STATUS_ERROR;
           }
 
+          note_kernel();
           q.parallel_for(sycl::range<1>(static_cast<size_t>(active_count)),
                          [=](sycl::id<1> active_index) {
             const uint32_t target = active_targets_ptr[active_index];
@@ -1566,6 +1624,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
                   i < count ? best_ids[i] : kInvalidId;
             }
           });
+          note_wait();
           q.wait_and_throw();
         }
         return OVVS_STATUS_SUCCESS;
@@ -1582,10 +1641,14 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
         if (!checked_product(launch_vertices, work_group_size, global_size)) {
           return OVVS_STATUS_SHAPE_MISMATCH;
         }
+        note_submission();
         q.fill(heads_ptr, -1, N);
+        note_submission();
         q.fill(scalars_ptr, 0, 1u);
+        note_wait();
         q.wait_and_throw();
 
+        note_kernel();
         q.submit([&](sycl::handler& h) {
            sycl::local_accessor<uint32_t, 1> new_ids(sycl::range<1>(max_bi_samples), h);
            sycl::local_accessor<uint32_t, 1> old_ids(sycl::range<1>(max_bi_samples), h);
@@ -1814,10 +1877,13 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
              }
            });
          });
+        note_wait();
         q.wait_and_throw();
 
         int32_t scalar_values[2] = {0, 0};
+        note_d2h(sizeof(scalar_values));
         q.memcpy(scalar_values, scalars_ptr, sizeof(scalar_values));
+        note_wait();
         q.wait_and_throw();
         if (scalar_values[1] != 0) return OVVS_STATUS_INVALID_ARGUMENT;
         const int32_t active_count = scalar_values[0];
@@ -1825,6 +1891,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
           return OVVS_STATUS_ERROR;
         }
 
+        note_kernel();
         q.parallel_for(sycl::range<1>(static_cast<size_t>(active_count)),
                        [=](sycl::id<1> active_index) {
           const uint32_t target = active_targets_ptr[active_index];
@@ -1891,6 +1958,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
             next_distances[row + insert] = candidate_distance;
           }
         });
+        note_wait();
         q.wait_and_throw();
       }
 
@@ -1901,6 +1969,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
         if (!checked_product(launch_vertices, work_group_size, global_size)) {
           return OVVS_STATUS_SHAPE_MISMATCH;
         }
+        note_kernel();
         q.submit([&](sycl::handler& h) {
           sycl::local_accessor<int32_t, 1> row_hash(
               sycl::range<1>(convergence_hash_capacity), h);
@@ -1952,9 +2021,13 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
           });
         });
       }
+      note_wait();
       q.wait_and_throw();
+      note_d2h(N * sizeof(int32_t));
       q.memcpy(changed_per_row.data(), heads_ptr, N * sizeof(int32_t));
+      note_d2h(N * sizeof(uint32_t));
       q.memcpy(pending_new_per_row.data(), active_targets_ptr, N * sizeof(uint32_t));
+      note_wait();
       q.wait_and_throw();
 
       int64_t changed_edges = 0;
@@ -1986,12 +2059,23 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
       }
     }
 
+    note_kernel();
     q.parallel_for(sycl::range<1>(graph_count), [=](sycl::id<1> index) {
       next_ids[index] = current_ids[index] & kIdMask;
     });
+    note_wait();
     q.wait_and_throw();
+    note_d2h(graph_plane_bytes);
     q.memcpy(graph, next_ids, graph_plane_bytes);
+    note_wait();
     q.wait_and_throw();
+
+    if (stats) {
+      stats->iterations = iterations_run;
+      stats->final_changed_edges = last_changed_edges;
+      stats->final_pending_new_edges = last_pending_new_edges;
+      stats->converged = converged;
+    }
 
     {
       std::lock_guard<std::mutex> lock(r.nndescent_stats_mutex);
@@ -2017,6 +2101,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
   (void)degree;
   (void)iters;
   (void)graph;
+  (void)stats;
   return OVVS_STATUS_DEVICE_UNAVAILABLE;
 #endif
 }
