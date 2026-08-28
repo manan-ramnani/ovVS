@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from _common import (
+    DEVICE_LABELS,
+    POLICY_LABELS,
     POLICY_VALUES,
     UnavailableError,
     load_dataset,
@@ -150,6 +152,79 @@ def _build_ovvs_index(module: Any, resources: Any, algorithm: str, base: Any,
     raise ValueError(f"unsupported ovVS algorithm: {algorithm}")
 
 
+def _last_device_evidence(resources: Any, build_succeeded: bool) -> dict[str, Any]:
+    try:
+        code = int(resources.last_device())
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "code": None,
+            "label": None,
+            "scope": "final_primitive_only" if build_succeeded else "failed_build_snapshot_unavailable",
+            "reason": f"last_device unavailable: {type(exc).__name__}: {exc}",
+        }
+    evidence = {
+        "status": "reported" if build_succeeded else "snapshot_unverified_after_failure",
+        "code": code,
+        "label": DEVICE_LABELS.get(code, f"UNKNOWN({code})"),
+        "scope": "final_primitive_only" if build_succeeded else "resource_snapshot_not_verified_build_attribution",
+    }
+    if not build_succeeded:
+        evidence["reason"] = "build did not complete; last_device may be the resource default or a prior primitive"
+    return evidence
+
+
+def _fallback_telemetry(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    telemetry: dict[str, Any] = {}
+    for key in ("npu_compile_fails", "npu_fallbacks"):
+        before_value, after_value = before.get(key), after.get(key)
+        delta = after_value - before_value if isinstance(before_value, int) and isinstance(after_value, int) else None
+        telemetry[key] = {"before": before_value, "after": after_value, "delta": delta}
+    return telemetry
+
+
+def _resource_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int | None]:
+    deltas: dict[str, int | None] = {}
+    for key in sorted(set(before) | set(after)):
+        before_value, after_value = before.get(key), after.get(key)
+        if type(before_value) is int and type(after_value) is int:
+            deltas[key] = after_value - before_value
+    return deltas
+
+
+def _build_record(status: str, policy: str, elapsed_ms: float, last_device: dict[str, Any],
+                  before: dict[str, Any], after: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
+    reported_devices = (
+        [last_device["code"]]
+        if status == "success"
+        and last_device.get("status") == "reported"
+        and isinstance(last_device.get("code"), int)
+        else []
+    )
+    record = {
+        "status": status,
+        # v1 compatibility alias; new consumers should use requested_policy/key.
+        "policy": POLICY_LABELS[policy],
+        "requested_policy": POLICY_LABELS[policy],
+        "requested_policy_key": policy,
+        "elapsed_ms": elapsed_ms,
+        "last_device": last_device,
+        "policy_contract": policy_contract("build", policy, reported_devices),
+        "resource_before": before,
+        "resource_after": after,
+        "resource_deltas": _resource_deltas(before, after),
+        "fallback_telemetry": _fallback_telemetry(before, after),
+        "attribution_caveat": (
+            "last_device reports the final build primitive, not the complete build pipeline"
+            if status == "success"
+            else "build failed; last_device is an unverified resource snapshot, not build attribution"
+        ),
+    }
+    if reason:
+        record["reason"] = reason
+    return record
+
+
 def _ovvs_search(index: Any, algorithm: str, point: dict[str, Any], k: int):
     if algorithm == "brute":
         return lambda batch: index.search(batch, k=k)
@@ -181,11 +256,51 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
             raise UnavailableError("FORCE_GPU requested but the resource probe reports no GPU")
         base, queries = load_dataset(spec["dataset"])
         truth = np.load(spec["truth_path"], allow_pickle=False).tolist() if Path(spec["truth_path"]).exists() else None
-        # Search lanes use an identical host-built index. Build is deliberately separate from search policy.
-        resources.set_policy(POLICY_VALUES["cpu"])
+        # Every search lane uses the same independently requested construction policy.
+        build_policy = spec.get("build_policy", "auto")
+        resources.set_policy(POLICY_VALUES[build_policy])
+        build_before = ovvs_resource_metadata(module, resources)
         build_started = time.perf_counter()
-        index = _build_ovvs_index(module, resources, lane["algorithm"], base, spec["dataset"], spec["profile"])
+        try:
+            index = _build_ovvs_index(
+                module, resources, lane["algorithm"], base, spec["dataset"], spec["profile"]
+            )
+        except Exception as exc:
+            build_ms = (time.perf_counter() - build_started) * 1_000
+            build_last_device = _last_device_evidence(resources, False)
+            build_after = ovvs_resource_metadata(module, resources)
+            build_status = exception_point_status(exc)
+            reason = f"index build under {POLICY_LABELS[build_policy]}: {exc}"
+            return {
+                **lane,
+                "status": build_status,
+                "reason": reason,
+                "started_at": started_at,
+                "elapsed_ms": (time.perf_counter() - started) * 1_000,
+                "build": _build_record(
+                    build_status,
+                    build_policy,
+                    build_ms,
+                    build_last_device,
+                    build_before,
+                    build_after,
+                    reason,
+                ),
+                "points": [],
+                "implementation_metadata": {
+                    "ovvs_version": module.version(),
+                    "library": os.environ.get("OVVS_LIBRARY"),
+                    "resource_before": before,
+                    "resource_after": build_after,
+                    "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence",
+                },
+            }
         build_ms = (time.perf_counter() - build_started) * 1_000
+        build_last_device = _last_device_evidence(resources, True)
+        build_after = ovvs_resource_metadata(module, resources)
+        build_record = _build_record(
+            "success", build_policy, build_ms, build_last_device, build_before, build_after
+        )
         resources.set_policy(POLICY_VALUES[policy])
         points: list[dict[str, Any]] = []
         for configured in point_parameters(spec["profile"], lane["algorithm"]):
@@ -256,14 +371,14 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
             "reason": point_failure_reason(points),
             "started_at": started_at,
             "elapsed_ms": (time.perf_counter() - started) * 1_000,
-            "build": {"status": "success", "policy": "FORCE_CPU", "elapsed_ms": build_ms},
+            "build": build_record,
             "points": points,
             "implementation_metadata": {
                 "ovvs_version": module.version(),
                 "library": os.environ.get("OVVS_LIBRARY"),
                 "resource_before": before,
                 "resource_after": ovvs_resource_metadata(module, resources),
-                "routing_caveat": "last_device is final-primitive evidence, not a pipeline trace",
+                "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence",
             },
         }
     finally:

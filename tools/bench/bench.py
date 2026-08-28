@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=tuple(PROFILE_DEFAULTS), default="smoke")
     parser.add_argument("--algorithms", default="all", help="comma-separated: brute,ivf-flat,ivf-pq,cagra")
     parser.add_argument("--policies", default="all", help="comma-separated: auto,cpu,npu,gpu,hetero")
+    parser.add_argument(
+        "--build-policy",
+        default="auto",
+        help="single ovVS construction policy, independent of the search-policy lanes",
+    )
     parser.add_argument("--sift", default=str(ROOT / "data" / "sift-128-euclidean.hdf5"))
     parser.add_argument("--base", help="embedding-100k custom base .npy (at least 100000 x 768)")
     parser.add_argument("--queries", help="embedding-100k custom queries .npy (at least 32 x 768)")
@@ -62,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-unscalable-cagra",
         action="store_true",
-        help="opt in to current host CAGRA build above n=4096 under the lane timeout",
+        help="opt in to not-yet-scale-qualified CAGRA build above n=4096 under the lane timeout",
     )
     parser.add_argument(
         "--allow-partial",
@@ -186,7 +191,12 @@ def _artifact(
         "started_at": started_at,
         "finished_at": utc_now(),
         "profile": {"name": args.profile, "settings": profile},
-        "selection": {"algorithms": algorithms, "policies": [POLICY_LABELS[value] for value in policies]},
+        "selection": {
+            "algorithms": algorithms,
+            "build_policy": POLICY_LABELS[getattr(args, "build_policy", "auto")],
+            "build_policy_key": getattr(args, "build_policy", "auto"),
+            "policies": [POLICY_LABELS[value] for value in policies],
+        },
         "dataset": artifact_dataset,
         "ground_truth": ground_truth,
         "lanes": lanes,
@@ -215,8 +225,9 @@ def _artifact(
             "caveats": [
                 "Package energy covers the package, iGPU, and uncore; it is not isolated device energy.",
                 "ovVS last_device reports the final primitive, not a per-stage route trace.",
+                "ovVS construction policy is independent of each lane's search policy.",
                 "HETERO currently equals AUTO (backlog B6).",
-                "IVF-PQ FORCE_GPU may run ADC on NPU and is not a provable pure-GPU lane.",
+                "IVF-PQ FORCE_GPU is a visible expected skip because ADC has no iGPU backend and fails closed.",
                 "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
             ],
         },
@@ -227,6 +238,11 @@ def orchestrate(args: argparse.Namespace) -> int:
     try:
         algorithms = parse_selection(args.algorithms, ALGORITHM_ORDER, "algorithm")
         policies = parse_selection(args.policies, POLICY_ORDER, "policy")
+        build_policies = parse_selection(args.build_policy, POLICY_ORDER, "build policy")
+        if len(build_policies) != 1:
+            raise ValueError("exactly one build policy must be selected")
+        build_policy = build_policies[0]
+        args.build_policy = build_policy
         profile = resolved_profile(args.profile, args.warmups, args.repeats, args.timeout_seconds)
     except ValueError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -250,6 +266,7 @@ def orchestrate(args: argparse.Namespace) -> int:
             "dataset": dataset,
             "truth_path": str(directory / "exact-ground-truth.npy"),
             "lanes": [lane.as_dict() for lane in lanes],
+            "build_policy": build_policy,
             "library": args.library,
             "energy": not args.no_energy,
             "seed": args.seed,

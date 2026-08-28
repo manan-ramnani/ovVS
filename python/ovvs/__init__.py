@@ -642,8 +642,7 @@ class neighbors:
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
             rc = _lib.ovvsBruteForceBuild(res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), ctypes.byref(ix))
-            if rc != 0:
-                raise RuntimeError("brute_force.build failed")
+            _check_status(rc, "brute-force build")
             return BruteIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsBruteForceDestroy, n=n)
 
     class cagra:
@@ -662,8 +661,7 @@ class neighbors:
                 c_int32(intermediate_degree),
                 ctypes.byref(ix),
             )
-            if rc != 0:
-                raise RuntimeError("cagra.build failed")
+            _check_status(rc, "CAGRA build")
             return CagraIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsCagraDestroy, n=n)
 
     class ivf_flat:
@@ -675,8 +673,7 @@ class neighbors:
             rc = _lib.ovvsIvfFlatBuild(
                 res._h, ptr, c_int64(n), c_int64(d), c_int32(metric), c_int32(nlist), ctypes.byref(ix)
             )
-            if rc != 0:
-                raise RuntimeError("ivf_flat.build failed")
+            _check_status(rc, "IVF-Flat build")
             return IvfFlatIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsIvfFlatDestroy, n=n)
 
     class ivf_pq:
@@ -696,8 +693,7 @@ class neighbors:
                 c_int32(pq_nbits),
                 ctypes.byref(ix),
             )
-            if rc != 0:
-                raise RuntimeError("ivf_pq.build failed")
+            _check_status(rc, "IVF-PQ build")
             return IvfPqIndex(res, ix, d, own_res=resources is None, destroy=_lib.ovvsIvfPqDestroy, n=n)
 
     class ivf_rabitq:

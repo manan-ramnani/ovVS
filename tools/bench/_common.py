@@ -297,10 +297,17 @@ def enumerate_lanes(algorithms: Sequence[str], policies: Sequence[str], n: int,
                     "and cannot be reported as an NPU lane."
                 )
                 expected_skip = True
+            elif algorithm == "ivf-pq" and policy == "gpu":
+                reason = (
+                    "IVF-PQ ADC has NPU and CPU paths but no iGPU backend; FORCE_GPU fails closed and "
+                    "cannot be reported as a GPU lane."
+                )
+                expected_skip = True
             elif algorithm == "cagra" and n > 4_096 and not allow_unscalable_cagra:
                 reason = (
-                    "Known B5 scalability gate: CAGRA initialization above n=4096 uses the host NN-Descent "
-                    "join. Pass --allow-unscalable-cagra to opt in under the lane timeout."
+                    "B5 full-scale evidence gate: GPU NN-Descent is implemented, but CAGRA build quality, "
+                    "CPU-prune cost, and peak resources are not yet measured at this dataset scale. Pass "
+                    "--allow-unscalable-cagra to opt in under the lane timeout."
                 )
                 expected_skip = True
                 blocking_skip = True
@@ -755,13 +762,6 @@ def policy_contract(algorithm: str, policy: str, devices: Sequence[int]) -> dict
         return {**base, "status": "unwired_equals_auto", "conforming": False, "reason": "Backlog B6: HETERO routes as AUTO."}
     if policy == "auto":
         return {**base, "status": "not_forced", "conforming": None}
-    if algorithm == "ivf-pq" and policy == "gpu":
-        return {
-            **base,
-            "status": "known_mixed_or_unverified",
-            "conforming": False,
-            "reason": "FORCE_GPU may run IVF-PQ ADC on NPU; last_device cannot prove a pure-GPU pipeline.",
-        }
     expected = {"cpu": "CPU", "npu": "NPU", "gpu": "GPU"}[policy]
     conforming = bool(labels) and all(label == expected for label in labels)
     return {
@@ -800,8 +800,30 @@ def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: 
         if lane.get("status") != "success":
             issues.append(f"{lane_id}: {lane.get('status')} - {lane.get('reason', 'no reason')}")
             continue
-        if lane.get("build", {}).get("status") != "success":
+        build = lane.get("build", {})
+        if build.get("status") != "success":
             issues.append(f"{lane_id}: successful lane has no successful build record")
+        elif lane.get("implementation") == "ovvs":
+            build_policy_key = build.get("requested_policy_key")
+            if (
+                build_policy_key not in POLICY_LABELS
+                or build.get("requested_policy") != POLICY_LABELS[build_policy_key]
+            ):
+                issues.append(f"{lane_id}: successful ovVS build has no valid requested policy")
+            build_ms = build.get("elapsed_ms")
+            if not isinstance(build_ms, (int, float)) or not math.isfinite(build_ms) or build_ms < 0:
+                issues.append(f"{lane_id}: successful ovVS build has invalid elapsed time")
+            last_device = build.get("last_device", {})
+            if (
+                last_device.get("status") != "reported"
+                or last_device.get("label") not in ("CPU", "NPU", "GPU")
+            ):
+                issues.append(f"{lane_id}: successful ovVS build has no physical final-primitive attribution")
+            build_contract = build.get("policy_contract", {})
+            if build_policy_key in ("cpu", "npu", "gpu") and build_contract.get("conforming") is not True:
+                issues.append(f"{lane_id}: forced build policy contract {build_contract.get('status', 'missing')}")
+            if build_policy_key == "hetero" and build_contract.get("status") != "unwired_equals_auto":
+                issues.append(f"{lane_id}: HETERO build policy contract is missing")
         points = lane.get("points", [])
         if not points:
             issues.append(f"{lane_id}: successful lane has no curve points")
@@ -854,13 +876,16 @@ def render_markdown(artifact: dict[str, Any]) -> str:
         f"- Dataset: `{dataset.get('kind', 'unavailable')}`; n={dataset.get('n', '—')}, dim={dataset.get('dim', '—')}, nq={dataset.get('nq', '—')}, k={artifact['profile']['settings']['k']}",
         f"- Exact ground truth: `{artifact['ground_truth'].get('status')}` via `{artifact['ground_truth'].get('method', 'unavailable')}`",
         "- Timings exclude build and warmups. Package energy is whole-package, not isolated device energy.",
-        "- `last_device` is final-primitive evidence only. HETERO equals AUTO today; IVF-PQ FORCE_GPU may be mixed NPU+GPU.",
+        "- Build and search policies are independent; each `last_device` value is final-primitive evidence only. HETERO equals AUTO today.",
         "",
-        "| Lane | Status | Build ms | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Last primitive | Reason |",
-        "|---|---:|---:|---|---:|---:|---:|---:|---:|---|---|",
+        "| Lane | Status | Build policy | Build ms | Build last primitive | Build NPU fallbacks Δ | Curve point | Recall | QPS median | Batch p50 ms | Batch p99 ms | µJ/query | Search last primitive | Reason |",
+        "|---|---:|---|---:|---|---:|---|---:|---:|---:|---:|---:|---|---|",
     ]
     for lane in artifact["lanes"]:
-        build_ms = lane.get("build", {}).get("elapsed_ms")
+        build = lane.get("build", {})
+        build_ms = build.get("elapsed_ms")
+        build_device = build.get("last_device", {}).get("label")
+        build_fallback_delta = build.get("fallback_telemetry", {}).get("npu_fallbacks", {}).get("delta")
         points = lane.get("points") or [None]
         for point in points:
             point = point or {}
@@ -870,7 +895,10 @@ def render_markdown(artifact: dict[str, Any]) -> str:
             cells = [
                 lane["id"],
                 point.get("status", lane.get("status")),
+                build.get("requested_policy"),
                 format_number(build_ms),
+                build_device,
+                build_fallback_delta,
                 params,
                 format_number(point.get("recall", {}).get("value"), 4),
                 format_number(measurement.get("qps", {}).get("summary", {}).get("median"), 1),
