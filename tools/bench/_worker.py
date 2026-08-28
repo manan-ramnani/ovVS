@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+from array import array
+import hashlib
 import json
+import mmap
 import os
+import struct
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -961,6 +966,426 @@ def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _hnsw_export_graph_stats(path: Path) -> dict[str, Any]:
+    """Read the native hnswlib header and base graph without copying the file."""
+
+    six_size_t_struct = struct.Struct("@6N")
+    int_struct = struct.Struct("@i")
+    label_struct = struct.Struct("@N")
+    three_size_t_struct = struct.Struct("@3N")
+    double_struct = struct.Struct("@d")
+    uint_struct = struct.Struct("@I")
+    header_size = (
+        six_size_t_struct.size
+        + int_struct.size
+        + uint_struct.size
+        + three_size_t_struct.size
+        + double_struct.size
+        + label_struct.size
+    )
+    with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        if len(view) < header_size:
+            raise ValueError("exported hnswlib file is shorter than its native header")
+        cursor = 0
+        (
+            offset_level0,
+            max_elements,
+            count,
+            row_bytes,
+            label_offset,
+            data_offset,
+        ) = six_size_t_struct.unpack_from(view, cursor)
+        cursor += six_size_t_struct.size
+        max_level = int_struct.unpack_from(view, cursor)[0]
+        cursor += int_struct.size
+        entry = uint_struct.unpack_from(view, cursor)[0]
+        cursor += uint_struct.size
+        max_m, max_m0, m = three_size_t_struct.unpack_from(view, cursor)
+        cursor += three_size_t_struct.size
+        _mult = double_struct.unpack_from(view, cursor)[0]
+        cursor += double_struct.size
+        serialized_ef_construction = label_struct.unpack_from(view, cursor)[0]
+        if (
+            offset_level0 != 0
+            or count <= 0
+            or count > max_elements
+            or max_level != 0
+            or entry >= count
+            or m <= 0
+            or max_m != m
+            or max_m0 != 2 * m
+            or data_offset != uint_struct.size + max_m0 * uint_struct.size
+            or label_offset < data_offset
+            or row_bytes != label_offset + label_struct.size
+            or label_offset == data_offset
+            or (label_offset - data_offset) % struct.calcsize("@f") != 0
+        ):
+            raise ValueError("exported hnswlib header violates the base-only format contract")
+        rows_end = header_size + count * row_bytes
+        tail_end = rows_end + count * uint_struct.size
+        if tail_end != len(view):
+            raise ValueError("exported hnswlib file has an invalid base-only tail length")
+
+        degrees = array("H")
+        for node in range(count):
+            row_offset = header_size + node * row_bytes
+            link_header = uint_struct.unpack_from(view, row_offset)[0]
+            degree = link_header & 0xFFFF
+            if degree > max_m0:
+                raise ValueError(f"node {node} has {degree} links above maxM0={max_m0}")
+            if link_header & 0xFFFF0000:
+                raise ValueError(
+                    f"node {node} has deletion/reserved bits in an immutable export"
+                )
+            label = label_struct.unpack_from(view, row_offset + label_offset)[0]
+            if label != node:
+                raise ValueError(
+                    f"node {node} has label {label}; exported labels must equal base row ids"
+                )
+            links_offset = row_offset + uint_struct.size
+            for slot in range(degree):
+                neighbor = uint_struct.unpack_from(
+                    view, links_offset + slot * uint_struct.size
+                )[0]
+                if neighbor >= count:
+                    raise ValueError(
+                        f"node {node} contains out-of-range neighbor {neighbor}"
+                    )
+            degrees.append(degree)
+
+        for node in range(count):
+            upper_bytes = uint_struct.unpack_from(
+                view, rows_end + node * uint_struct.size
+            )[0]
+            if upper_bytes != 0:
+                raise ValueError(
+                    f"node {node} has a nonzero upper-layer block in a base-only export"
+                )
+
+        visited = bytearray(count)
+        visited[entry] = 1
+        queue = array("I", [entry])
+        cursor = 0
+        while cursor < len(queue):
+            node = queue[cursor]
+            cursor += 1
+            row_offset = header_size + node * row_bytes + uint_struct.size
+            for slot in range(degrees[node]):
+                neighbor = uint_struct.unpack_from(
+                    view, row_offset + slot * uint_struct.size
+                )[0]
+                if not visited[neighbor]:
+                    visited[neighbor] = 1
+                    queue.append(neighbor)
+
+        sha256 = hashlib.sha256(view).hexdigest()
+
+    reachable = len(queue)
+    return {
+        "status": "success",
+        "format": "hnswlib_native_single_layer",
+        "native_size_t_bytes": label_struct.size,
+        "file_bytes": path.stat().st_size,
+        "sha256": sha256,
+        "max_elements": int(max_elements),
+        "count": int(count),
+        "entry": int(entry),
+        "M": int(m),
+        "maxM": int(max_m),
+        "maxM0": int(max_m0),
+        "maxlevel": int(max_level),
+        "dimension": int((label_offset - data_offset) // struct.calcsize("@f")),
+        "labels_match_base_rows": True,
+        "deletion_marked_nodes": 0,
+        "upper_layer_bytes": 0,
+        "serialized_ef_construction": int(serialized_ef_construction),
+        "out_degree": {
+            "min": min(degrees),
+            "max": max(degrees),
+            "mean": sum(degrees) / float(count),
+        },
+        "entry_reachable_nodes": reachable,
+        "entry_reachable_fraction": reachable / float(count),
+    }
+
+
+def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
+    """Build with ovVS CAGRA, export, then search through unmodified hnswlib."""
+
+    import numpy as np
+
+    try:
+        import hnswlib
+    except ImportError as exc:
+        raise UnavailableError(f"hnswlib is not importable: {exc}") from exc
+
+    started_at, started = utc_now(), time.perf_counter()
+    module = load_ovvs(spec.get("library"))
+    base, queries = load_dataset(spec["dataset"])
+    truth = np.load(spec["truth_path"], allow_pickle=False).tolist() if Path(spec["truth_path"]).exists() else None
+    profile = spec["profile"]
+    hnsw_threads = spec.get("hnsw_threads")
+    if hnsw_threads is not None and (type(hnsw_threads) is not int or hnsw_threads <= 0):
+        raise ValueError("hnsw_threads must be a positive integer")
+
+    build_policy = spec.get("build_policy", "auto")
+    build_started = time.perf_counter()
+    resource_started = time.perf_counter()
+    resources, cagra, exported = module.Resources(), None, None
+    stages: dict[str, Any] = {
+        "resource_create": {
+            "status": "success",
+            "elapsed_ms": (time.perf_counter() - resource_started) * 1_000,
+        }
+    }
+    excluded_instrumentation_ms = 0.0
+    instrumentation_started = time.perf_counter()
+    build_before = ovvs_resource_metadata(module, resources)
+    excluded_instrumentation_ms += (
+        time.perf_counter() - instrumentation_started
+    ) * 1_000
+    build_after = build_before
+    cagra_record = None
+
+    with tempfile.TemporaryDirectory(prefix="ovvs-hnsw-export-") as directory:
+        path = Path(directory) / "cagra.hnsw"
+        current_stage = "ovvs_cagra_build"
+        stage_started = time.perf_counter()
+        try:
+            resources.set_policy(POLICY_VALUES[build_policy])
+            cagra = _build_ovvs_index(
+                module, resources, "cagra", base, spec["dataset"], profile
+            )
+            cagra_ms = (time.perf_counter() - stage_started) * 1_000
+            stages[current_stage] = {"status": "success", "elapsed_ms": cagra_ms}
+            instrumentation_started = time.perf_counter()
+            build_after = ovvs_resource_metadata(module, resources)
+            cagra_record = _build_record(
+                "success",
+                build_policy,
+                cagra_ms,
+                _last_device_evidence(resources, True),
+                build_before,
+                build_after,
+            )
+            excluded_instrumentation_ms += (
+                time.perf_counter() - instrumentation_started
+            ) * 1_000
+
+            current_stage = "cagra_to_hnsw"
+            stage_started = time.perf_counter()
+            exported = module.neighbors.hnsw.from_cagra(cagra, resources=resources)
+            stages[current_stage] = {
+                "status": "success",
+                "elapsed_ms": (time.perf_counter() - stage_started) * 1_000,
+            }
+
+            current_stage = "serialize"
+            stage_started = time.perf_counter()
+            exported.serialize(path)
+            stages[current_stage] = {
+                "status": "success",
+                "elapsed_ms": (time.perf_counter() - stage_started) * 1_000,
+                "file_bytes": path.stat().st_size,
+            }
+
+            current_stage = "producer_release"
+            stage_started = time.perf_counter()
+            exported.close()
+            exported = None
+            cagra.close()
+            cagra = None
+            resources.close()
+            resources = None
+            stages[current_stage] = {
+                "status": "success",
+                "elapsed_ms": (time.perf_counter() - stage_started) * 1_000,
+            }
+
+            current_stage = "hnswlib_load"
+            stage_started = time.perf_counter()
+            index = hnswlib.Index(space="l2", dim=spec["dataset"]["dim"])
+            index.load_index(str(path), max_elements=spec["dataset"]["n"])
+            if hnsw_threads is not None:
+                index.set_num_threads(hnsw_threads)
+            stages[current_stage] = {
+                "status": "success",
+                "elapsed_ms": (time.perf_counter() - stage_started) * 1_000,
+            }
+            raw_time_to_searchable_ms = (time.perf_counter() - build_started) * 1_000
+            time_to_searchable_ms = raw_time_to_searchable_ms
+            instrumentation_adjusted_ms = (
+                raw_time_to_searchable_ms - excluded_instrumentation_ms
+            )
+
+            current_stage = "graph_diagnostics"
+            stage_started = time.perf_counter()
+            graph_stats = _hnsw_export_graph_stats(path)
+            expected_n = int(spec["dataset"]["n"])
+            expected_m = int(profile["graph_degree"])
+            expected_dim = int(spec["dataset"]["dim"])
+            if (
+                graph_stats["count"] != expected_n
+                or graph_stats["max_elements"] != expected_n
+                or int(index.element_count) != expected_n
+                or int(index.M) != expected_m
+                or graph_stats["M"] != expected_m
+                or graph_stats["dimension"] != expected_dim
+            ):
+                raise ValueError(
+                    "exported/loaded hnswlib geometry does not match the requested dataset and M"
+                )
+            graph_diagnostics = {
+                "status": "success",
+                "elapsed_ms": (time.perf_counter() - stage_started) * 1_000,
+            }
+        except Exception as exc:
+            failed_stage_ms = (time.perf_counter() - stage_started) * 1_000
+            stages[current_stage] = {
+                "status": exception_point_status(exc),
+                "elapsed_ms": failed_stage_ms,
+                "reason": str(exc),
+            }
+            status = exception_point_status(exc)
+            if cagra_record is None and resources is not None:
+                instrumentation_started = time.perf_counter()
+                build_after = ovvs_resource_metadata(module, resources)
+                cagra_record = _build_record(
+                    status,
+                    build_policy,
+                    failed_stage_ms,
+                    _last_device_evidence(resources, False),
+                    build_before,
+                    build_after,
+                    str(exc),
+                )
+                excluded_instrumentation_ms += (
+                    time.perf_counter() - instrumentation_started
+                ) * 1_000
+            return {
+                **lane,
+                "status": status,
+                "reason": f"{current_stage}: {exc}",
+                "started_at": started_at,
+                "elapsed_ms": (time.perf_counter() - started) * 1_000,
+                "build": {
+                    "status": status,
+                    "elapsed_ms": (time.perf_counter() - build_started) * 1_000,
+                    "stages": stages,
+                    "ovvs_cagra": cagra_record,
+                },
+                "points": [],
+                "implementation_metadata": {
+                    "ovvs_version": module.version(),
+                    "hnswlib_version": package_version("hnswlib"),
+                    "build_policy": POLICY_LABELS[build_policy],
+                },
+            }
+        finally:
+            if exported is not None:
+                exported.close()
+            if cagra is not None:
+                cagra.close()
+            if resources is not None:
+                resources.close()
+
+        reader, energy_resources = (
+            _optional_energy_reader(spec.get("library")) if spec.get("energy") else (None, None)
+        )
+        points: list[dict[str, Any]] = []
+        try:
+            for configured in _selected_points(spec, "hnsw"):
+                point = dict(configured)
+                index.set_ef(max(point["ef"], profile["k"]))
+
+                def search(batch: Any):
+                    if hnsw_threads is not None:
+                        return index.knn_query(batch, k=profile["k"], num_threads=hnsw_threads)
+                    return index.knn_query(batch, k=profile["k"])
+
+                try:
+                    measured, ids, distances = measure_search(
+                        search,
+                        queries,
+                        point["query_batch_size"],
+                        profile["warmups"],
+                        profile["repeats"],
+                    )
+                    validation = validate_neighbors(
+                        ids, distances, spec["dataset"]["nq"], profile["k"], spec["dataset"]["n"]
+                    )
+
+                    def search_once() -> None:
+                        for batch in query_batches(queries, point["query_batch_size"]):
+                            search(batch)
+
+                    points.append(
+                        {
+                            "status": validation["status"],
+                            "parameters": point,
+                            "measurement": measured,
+                            "recall": recall_result(ids.tolist(), truth, profile["k"]),
+                            "validation": validation,
+                            "energy": _energy(spec, reader, search_once, len(queries)),
+                            "reason": "; ".join(validation["issues"]) or None,
+                        }
+                    )
+                except Exception as exc:
+                    points.append(
+                        {
+                            "status": "failed",
+                            "parameters": point,
+                            "reason": str(exc),
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+        finally:
+            if energy_resources is not None:
+                energy_resources.close()
+
+        lane_status = "success" if all(point["status"] == "success" for point in points) else "failed"
+        return {
+            **lane,
+            "status": lane_status,
+            "reason": point_failure_reason(points),
+            "started_at": started_at,
+            "elapsed_ms": (time.perf_counter() - started) * 1_000,
+            "build": {
+                "status": "success",
+                "elapsed_ms": time_to_searchable_ms,
+                "scope": "construction_pipeline_resource_creation_through_loaded_stock_hnswlib_index",
+                "instrumentation_adjusted_ms": instrumentation_adjusted_ms,
+                "excluded_instrumentation_ms": excluded_instrumentation_ms,
+                "production_stage_sum_ms": sum(
+                    stage["elapsed_ms"] for stage in stages.values()
+                ),
+                "stages": stages,
+                "diagnostics": graph_diagnostics,
+                "ovvs_cagra": cagra_record,
+                "graph": graph_stats,
+            },
+            "points": points,
+            "implementation_metadata": {
+                "ovvs_version": module.version(),
+                "hnswlib_version": package_version("hnswlib"),
+                "library": os.environ.get("OVVS_LIBRARY"),
+                "producer": "ovVS CAGRA build plus single-layer hnswlib export",
+                "build_policy": POLICY_LABELS[build_policy],
+                "M": int(index.M),
+                "serialized_ef_construction": int(index.ef_construction),
+                "threading": "explicit" if hnsw_threads is not None else "hnswlib_default",
+                "num_threads": hnsw_threads,
+                "construction_caveat": (
+                    "serialized ef_construction is file metadata, not an ovVS build knob; "
+                    "the recorded build policy is independent of stock hnswlib search, and "
+                    "final graph optimization is CPU; native M has base capacity 2*M, while "
+                    "the export currently populates only CAGRA graph_degree links, so construction "
+                    "geometry is recorded but not claimed equivalent"
+                ),
+            },
+        }
+
+
 def _error(lane: dict[str, Any], status: str, exc: Exception) -> dict[str, Any]:
     return {
         **lane,
@@ -990,6 +1415,8 @@ def run_worker(spec: dict[str, Any], lane_id: str) -> dict[str, Any]:
             return run_faiss(spec, lane)
         if lane["implementation"] == "hnswlib":
             return run_hnsw(spec, lane)
+        if lane["implementation"] == "hnswlib-export":
+            return run_hnsw_export(spec, lane)
         raise ValueError(f"unknown implementation: {lane['implementation']}")
     except UnavailableError as exc:
         return _error(lane, "unavailable", exc)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
 import unittest
 import sys
@@ -293,6 +294,7 @@ class PureHelperTests(unittest.TestCase):
                 "--repeats", "9",
                 "--seed", "99",
                 "--timeout-seconds", "7200",
+                "--include-hnsw-export",
             ]
         )
         with patch.object(bench.os, "cpu_count", return_value=20):
@@ -306,6 +308,7 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(args.hnsw_threads, 20)
         self.assertTrue(args.no_energy)
         self.assertTrue(args.allow_unscalable_cagra)
+        self.assertFalse(args.include_hnsw_export)
 
     def test_non_gate_configuration_preserves_existing_defaults(self) -> None:
         args = bench.build_parser().parse_args([])
@@ -643,6 +646,7 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
                 "--repeats", "9",
                 "--seed", "99",
                 "--timeout-seconds", "1200",
+                "--include-hnsw-export",
             ]
         )
         with patch.object(bench.os, "cpu_count", return_value=20):
@@ -655,6 +659,7 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertEqual(args.timeout_seconds, 1200)
         self.assertEqual(args.hnsw_threads, 20)
         self.assertTrue(args.no_energy)
+        self.assertFalse(args.include_hnsw_export)
         self.assertTrue(args.allow_unscalable_cagra)
 
     def test_sift_100k_missing_fixture_has_no_synthetic_fallback(self) -> None:
@@ -685,6 +690,63 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertTrue(by_id["ovvs.cagra.auto"].expected_skip)
         self.assertFalse(by_id["ovvs.cagra.npu"].blocking_skip)
         self.assertIn("hnswlib.hnsw", by_id)
+
+    def test_hnsw_export_lane_is_explicit_and_nonmandatory(self) -> None:
+        ordinary = enumerate_lanes(["cagra"], ["auto"], 2_000, False, True)
+        self.assertNotIn("hnswlib.ovvs-cagra", {lane.id for lane in ordinary})
+        selected = enumerate_lanes(
+            ["cagra"], ["auto"], 2_000, False, True, include_hnsw_export=True
+        )
+        lane = {item.id: item for item in selected}["hnswlib.ovvs-cagra"]
+        self.assertEqual(lane.implementation, "hnswlib-export")
+        self.assertFalse(lane.mandatory)
+
+    def test_hnsw_export_lane_obeys_cagra_scale_gate(self) -> None:
+        gated = enumerate_lanes(
+            ["cagra"], ["gpu"], 1_000_000, True, False, include_hnsw_export=True
+        )
+        gated_lane = {item.id: item for item in gated}["hnswlib.ovvs-cagra"]
+        self.assertTrue(gated_lane.expected_skip)
+        self.assertTrue(gated_lane.blocking_skip)
+        self.assertIn("--allow-unscalable-cagra", gated_lane.skip_reason)
+
+        opted_in = enumerate_lanes(
+            ["cagra"], ["gpu"], 1_000_000, True, True, include_hnsw_export=True
+        )
+        opted_in_lane = {item.id: item for item in opted_in}["hnswlib.ovvs-cagra"]
+        self.assertIsNone(opted_in_lane.skip_reason)
+        self.assertFalse(opted_in_lane.expected_skip)
+        self.assertFalse(opted_in_lane.blocking_skip)
+
+    def test_hnsw_export_completion_requires_nested_build_attribution(self) -> None:
+        missing = successful_lane("hnswlib.ovvs-cagra")
+        missing.update(implementation="hnswlib-export", algorithm="hnsw")
+        missing_issues = completion_issues(
+            "smoke",
+            {"status": "success", "n": 3, "dim": 2},
+            {"status": "success", "exact": True},
+            [missing],
+        )
+        self.assertTrue(any("no ovVS CAGRA build record" in issue for issue in missing_issues))
+
+        mismatched = successful_lane("hnswlib.ovvs-cagra")
+        mismatched.update(implementation="hnswlib-export", algorithm="hnsw")
+        mismatched["build"]["ovvs_cagra"] = {
+            "status": "success",
+            "requested_policy": "FORCE_GPU",
+            "requested_policy_key": "gpu",
+            "elapsed_ms": 1.0,
+            "last_device": {"status": "reported", "code": 1, "label": "CPU"},
+            "policy_contract": {"status": "mismatch", "conforming": False},
+        }
+        mismatch_issues = completion_issues(
+            "smoke",
+            {"status": "success", "n": 3, "dim": 2},
+            {"status": "success", "exact": True},
+            [mismatched],
+        )
+        self.assertTrue(any("forced build policy contract mismatch" in issue
+                            for issue in mismatch_issues))
 
     def test_full_b5_skip_makes_completion_partial(self) -> None:
         lane = enumerate_lanes(["cagra"], ["auto"], 1_000_000, True, False)[0].as_dict()
@@ -1028,6 +1090,125 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
 
 
 class HnswThreadingTests(unittest.TestCase):
+    def test_export_graph_stats_validate_header_and_entry_reachability(self) -> None:
+        uint = struct.Struct("@I")
+        count, m, max_m0 = 3, 2, 4
+        data_offset = uint.size + max_m0 * uint.size
+        label_offset = data_offset + 2 * struct.calcsize("@f")
+        row_bytes = label_offset + struct.calcsize("@N")
+        header = b"".join(
+            (
+                struct.pack(
+                    "@6N", 0, count, count, row_bytes, label_offset, data_offset
+                ),
+                struct.pack("@i", 0),
+                struct.pack("@I", 0),
+                struct.pack("@3N", m, max_m0, m),
+                struct.pack("@d", 1.0),
+                struct.pack("@N", 200),
+            )
+        )
+        payload = bytearray(header)
+        for node, neighbor in enumerate((1, 2, 0)):
+            row = bytearray(row_bytes)
+            uint.pack_into(row, 0, 1)
+            uint.pack_into(row, uint.size, neighbor)
+            row[label_offset : label_offset + struct.calcsize("@N")] = struct.pack("@N", node)
+            payload.extend(row)
+        payload.extend(uint.pack(0) * count)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "fixture.hnsw"
+            path.write_bytes(payload)
+            stats = _worker._hnsw_export_graph_stats(path)
+        self.assertEqual(stats["status"], "success")
+        self.assertEqual(stats["max_elements"], count)
+        self.assertEqual(stats["entry_reachable_nodes"], count)
+        self.assertEqual(stats["entry_reachable_fraction"], 1.0)
+        self.assertEqual(stats["dimension"], 2)
+        self.assertEqual(stats["native_size_t_bytes"], struct.calcsize("@N"))
+        self.assertTrue(stats["labels_match_base_rows"])
+        self.assertEqual(stats["deletion_marked_nodes"], 0)
+        self.assertEqual(stats["upper_layer_bytes"], 0)
+        self.assertEqual(len(stats["sha256"]), 64)
+        self.assertEqual(stats["out_degree"], {"min": 1, "max": 1, "mean": 1.0})
+
+        bad_label = bytearray(payload)
+        first_label = len(header) + label_offset
+        bad_label[first_label : first_label + struct.calcsize("@N")] = struct.pack("@N", 2)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "bad-label.hnsw"
+            path.write_bytes(bad_label)
+            with self.assertRaisesRegex(ValueError, "labels must equal base row ids"):
+                _worker._hnsw_export_graph_stats(path)
+
+        deleted = bytearray(payload)
+        deleted[len(header) + 2] = 1
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "deleted.hnsw"
+            path.write_bytes(deleted)
+            with self.assertRaisesRegex(ValueError, "deletion/reserved bits"):
+                _worker._hnsw_export_graph_stats(path)
+
+        upper_layer = bytearray(payload)
+        uint.pack_into(upper_layer, len(upper_layer) - count * uint.size, uint.size)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "upper-layer.hnsw"
+            path.write_bytes(upper_layer)
+            with self.assertRaisesRegex(ValueError, "nonzero upper-layer block"):
+                _worker._hnsw_export_graph_stats(path)
+
+    def test_hybrid_markdown_exposes_topology_timing_and_attribution(self) -> None:
+        artifact = {
+            "profile": {"name": "smoke", "settings": {"k": 10}},
+            "started_at": "2026-08-28T00:00:00Z",
+            "completion": {"status": "complete", "issues": []},
+            "dataset": {"kind": "synthetic", "n": 3, "dim": 2, "nq": 1},
+            "ground_truth": {"status": "success", "method": "exact"},
+            "lanes": [
+                {
+                    "id": "hnswlib.ovvs-cagra",
+                    "implementation": "hnswlib-export",
+                    "status": "success",
+                    "build": {
+                        "status": "success",
+                        "elapsed_ms": 12.0,
+                        "scope": "construction_pipeline_resource_creation_through_loaded_stock_hnswlib_index",
+                        "instrumentation_adjusted_ms": 11.5,
+                        "production_stage_sum_ms": 11.0,
+                        "ovvs_cagra": {
+                            "requested_policy": "AUTO",
+                            "elapsed_ms": 8.0,
+                            "last_device": {"label": "CPU"},
+                            "fallback_telemetry": {"npu_fallbacks": {"delta": 0}},
+                        },
+                        "stages": {"ovvs_cagra_build": {"status": "success", "elapsed_ms": 8.0}},
+                        "graph": {
+                            "count": 3,
+                            "entry_reachable_nodes": 2,
+                            "entry_reachable_fraction": 2 / 3,
+                            "M": 2,
+                            "maxM0": 4,
+                            "maxlevel": 0,
+                            "dimension": 2,
+                            "out_degree": {"min": 1, "mean": 1.0, "max": 1},
+                            "file_bytes": 128,
+                            "sha256": "abc",
+                            "labels_match_base_rows": True,
+                            "deletion_marked_nodes": 0,
+                            "upper_layer_bytes": 0,
+                        },
+                    },
+                    "points": [],
+                    "implementation_metadata": {"construction_caveat": "base-only"},
+                }
+            ],
+        }
+        markdown = _common.render_markdown(artifact)
+        self.assertIn("## HNSW export diagnostics", markdown)
+        self.assertIn("reachable=2/3 (0.6667)", markdown)
+        self.assertIn("policy=`AUTO`", markdown)
+        self.assertIn("Construction caveat: base-only", markdown)
+
     def test_explicit_hnsw_threads_apply_to_build_and_search_and_are_recorded(self) -> None:
         class FakeIndex:
             def __init__(self, **_kwargs) -> None:

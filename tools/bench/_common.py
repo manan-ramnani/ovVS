@@ -102,6 +102,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "hnsw_ef_construction": 200,
         "hnsw_points": [
             {"ef": 32, "query_batch_size": 32},
+            {"ef": 40, "query_batch_size": 32},
+            {"ef": 48, "query_batch_size": 32},
+            {"ef": 56, "query_batch_size": 32},
             {"ef": 64, "query_batch_size": 32},
         ],
     },
@@ -320,8 +323,16 @@ def resolved_profile(name: str, warmups: int | None = None, repeats: int | None 
 
 
 def enumerate_lanes(algorithms: Sequence[str], policies: Sequence[str], n: int,
-                    full_profile: bool, allow_unscalable_cagra: bool) -> list[Lane]:
+                    full_profile: bool, allow_unscalable_cagra: bool,
+                    include_hnsw_export: bool = False) -> list[Lane]:
     lanes: list[Lane] = []
+    cagra_scale_reason = (
+        "B5 full-scale evidence gate: GPU NN-Descent is implemented, but CAGRA build quality, "
+        "CPU-prune cost, and peak resources are not yet measured at this dataset scale. Pass "
+        "--allow-unscalable-cagra to opt in under the lane timeout."
+        if n > 4_096 and not allow_unscalable_cagra
+        else None
+    )
     for algorithm in algorithms:
         for policy in policies:
             reason = None
@@ -333,12 +344,8 @@ def enumerate_lanes(algorithms: Sequence[str], policies: Sequence[str], n: int,
                     "and cannot be reported as an NPU lane."
                 )
                 expected_skip = True
-            elif algorithm == "cagra" and n > 4_096 and not allow_unscalable_cagra:
-                reason = (
-                    "B5 full-scale evidence gate: GPU NN-Descent is implemented, but CAGRA build quality, "
-                    "CPU-prune cost, and peak resources are not yet measured at this dataset scale. Pass "
-                    "--allow-unscalable-cagra to opt in under the lane timeout."
-                )
+            elif algorithm == "cagra" and cagra_scale_reason is not None:
+                reason = cagra_scale_reason
                 expected_skip = True
                 blocking_skip = True
             lanes.append(
@@ -354,6 +361,18 @@ def enumerate_lanes(algorithms: Sequence[str], policies: Sequence[str], n: int,
         "cagra": ("hnswlib.hnsw", "hnswlib", "hnsw"),
     }
     lanes.extend(Lane(*comparators[algorithm], mandatory=full_profile) for algorithm in algorithms)
+    if include_hnsw_export and "cagra" in algorithms:
+        lanes.append(
+            Lane(
+                "hnswlib.ovvs-cagra",
+                "hnswlib-export",
+                "hnsw",
+                mandatory=False,
+                skip_reason=cagra_scale_reason,
+                expected_skip=cagra_scale_reason is not None,
+                blocking_skip=cagra_scale_reason is not None,
+            )
+        )
     return lanes
 
 
@@ -1438,23 +1457,119 @@ def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: 
         build = lane.get("build", {})
         if build.get("status") != "success":
             issues.append(f"{lane_id}: successful lane has no successful build record")
-        elif lane.get("implementation") == "ovvs":
-            build_policy_key = build.get("requested_policy_key")
-            if (
-                build_policy_key not in POLICY_LABELS
-                or build.get("requested_policy") != POLICY_LABELS[build_policy_key]
-            ):
-                issues.append(f"{lane_id}: successful ovVS build has no valid requested policy")
+        else:
             build_ms = build.get("elapsed_ms")
             if not isinstance(build_ms, (int, float)) or not math.isfinite(build_ms) or build_ms < 0:
+                issues.append(f"{lane_id}: successful build has invalid elapsed time")
+        ovvs_build = None
+        if lane.get("implementation") == "ovvs":
+            ovvs_build = build
+        elif lane.get("implementation") == "hnswlib-export":
+            candidate = build.get("ovvs_cagra")
+            if isinstance(candidate, dict):
+                ovvs_build = candidate
+                if candidate.get("status") != "success":
+                    issues.append(f"{lane_id}: successful hybrid build has failed ovVS CAGRA evidence")
+            else:
+                issues.append(f"{lane_id}: successful hybrid build has no ovVS CAGRA build record")
+            expected_stages = {
+                "resource_create",
+                "ovvs_cagra_build",
+                "cagra_to_hnsw",
+                "serialize",
+                "producer_release",
+                "hnswlib_load",
+            }
+            stages = build.get("stages", {})
+            if (
+                not isinstance(stages, dict)
+                or not expected_stages.issubset(stages)
+                or any(
+                    not isinstance(stages[name], dict)
+                    or stages[name].get("status") != "success"
+                    for name in expected_stages
+                )
+            ):
+                issues.append(f"{lane_id}: successful hybrid build has incomplete stage evidence")
+            timing_values = {
+                key: build.get(key)
+                for key in (
+                    "elapsed_ms",
+                    "instrumentation_adjusted_ms",
+                    "excluded_instrumentation_ms",
+                    "production_stage_sum_ms",
+                )
+            }
+            if (
+                build.get("scope")
+                != "construction_pipeline_resource_creation_through_loaded_stock_hnswlib_index"
+                or any(
+                    not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value < 0
+                    for value in timing_values.values()
+                )
+                or (
+                    all(isinstance(value, (int, float)) for value in timing_values.values())
+                    and (
+                        timing_values["instrumentation_adjusted_ms"] > timing_values["elapsed_ms"]
+                        or timing_values["production_stage_sum_ms"] > timing_values["elapsed_ms"]
+                    )
+                )
+            ):
+                issues.append(f"{lane_id}: successful hybrid build has invalid timing scope/evidence")
+            graph = build.get("graph", {})
+            if not isinstance(graph, dict):
+                graph = {}
+            digest = graph.get("sha256")
+            graph_count = graph.get("count")
+            graph_m = graph.get("M")
+            graph_valid = (
+                graph.get("status") == "success"
+                and isinstance(graph_count, int)
+                and graph_count > 0
+                and graph_count == dataset.get("n")
+                and graph.get("max_elements") == graph_count
+                and graph.get("dimension") == dataset.get("dim")
+                and isinstance(graph_m, int)
+                and graph_m > 0
+                and graph_m == graph.get("maxM")
+                and graph.get("maxM0") == 2 * graph_m
+                and graph.get("maxlevel") == 0
+                and graph.get("labels_match_base_rows") is True
+                and graph.get("deletion_marked_nodes") == 0
+                and graph.get("upper_layer_bytes") == 0
+                and isinstance(digest, str)
+                and len(digest) == 64
+                and all(character in "0123456789abcdef" for character in digest)
+                and build.get("diagnostics", {}).get("status") == "success"
+            )
+            if not graph_valid:
+                issues.append(f"{lane_id}: successful hybrid build has invalid graph diagnostics")
+            caveat = lane.get("implementation_metadata", {}).get("construction_caveat")
+            if not isinstance(caveat, str) or not caveat.strip():
+                issues.append(f"{lane_id}: successful hybrid build has no construction caveat")
+        if ovvs_build is not None:
+            build_policy_key = ovvs_build.get("requested_policy_key")
+            if (
+                build_policy_key not in POLICY_LABELS
+                or ovvs_build.get("requested_policy") != POLICY_LABELS[build_policy_key]
+            ):
+                issues.append(f"{lane_id}: successful ovVS build has no valid requested policy")
+            ovvs_build_ms = ovvs_build.get("elapsed_ms")
+            if (
+                not isinstance(ovvs_build_ms, (int, float))
+                or not math.isfinite(ovvs_build_ms)
+                or ovvs_build_ms < 0
+            ):
                 issues.append(f"{lane_id}: successful ovVS build has invalid elapsed time")
-            last_device = build.get("last_device", {})
+            last_device = ovvs_build.get("last_device", {})
             if (
                 last_device.get("status") != "reported"
                 or last_device.get("label") not in ("CPU", "NPU", "GPU")
             ):
                 issues.append(f"{lane_id}: successful ovVS build has no physical final-primitive attribution")
-            build_contract = build.get("policy_contract", {})
+            build_contract = ovvs_build.get("policy_contract", {})
             if build_policy_key in ("cpu", "npu", "gpu") and build_contract.get("conforming") is not True:
                 issues.append(f"{lane_id}: forced build policy contract {build_contract.get('status', 'missing')}")
             if build_policy_key == "hetero" and build_contract.get("status") != "unwired_equals_auto":
@@ -1581,9 +1696,10 @@ def render_markdown(artifact: dict[str, Any]) -> str:
         ]
     for lane in artifact["lanes"]:
         build = lane.get("build", {})
+        attributed_build = build.get("ovvs_cagra") or build
         build_ms = build.get("elapsed_ms")
-        build_device = build.get("last_device", {}).get("label")
-        build_fallback_delta = build.get("fallback_telemetry", {}).get("npu_fallbacks", {}).get("delta")
+        build_device = attributed_build.get("last_device", {}).get("label")
+        build_fallback_delta = attributed_build.get("fallback_telemetry", {}).get("npu_fallbacks", {}).get("delta")
         points = lane.get("points") or [None]
         for point in points:
             point = point or {}
@@ -1593,7 +1709,7 @@ def render_markdown(artifact: dict[str, Any]) -> str:
             cells = [
                 lane["id"],
                 point.get("status", lane.get("status")),
-                build.get("requested_policy"),
+                attributed_build.get("requested_policy"),
                 format_number(build_ms),
                 build_device,
                 build_fallback_delta,
@@ -1608,6 +1724,58 @@ def render_markdown(artifact: dict[str, Any]) -> str:
                 point.get("reason") or lane.get("reason"),
             ]
             lines.append("| " + " | ".join(markdown_escape(cell) for cell in cells) + " |")
+    hybrid_lanes = [
+        lane for lane in artifact["lanes"] if lane.get("implementation") == "hnswlib-export"
+    ]
+    if hybrid_lanes:
+        lines.extend(
+            [
+                "",
+                "## HNSW export diagnostics",
+                "",
+                "These experimental lanes use a base-only graph in stock hnswlib. They do not prove "
+                "hierarchical-HNSW equivalence or GPU construction; the reported build device covers "
+                "only the final ovVS build primitive.",
+            ]
+        )
+        for lane in hybrid_lanes:
+            build = lane.get("build", {})
+            cagra = build.get("ovvs_cagra") or {}
+            graph = build.get("graph") or {}
+            metadata = lane.get("implementation_metadata") or {}
+            stages = build.get("stages") or {}
+            stage_summary = ", ".join(
+                f"{name}={format_number(stage.get('elapsed_ms'))} ms ({stage.get('status', 'unknown')})"
+                for name, stage in stages.items()
+            ) or "unavailable"
+            out_degree = graph.get("out_degree") or {}
+            lines.extend(
+                [
+                    "",
+                    f"### `{lane.get('id', 'hnswlib export')}`",
+                    "",
+                    f"- Lane status: `{lane.get('status', 'unknown')}`.",
+                    f"- Construction wall: {format_number(build.get('elapsed_ms'))} ms; "
+                    f"instrumentation-adjusted={format_number(build.get('instrumentation_adjusted_ms'))} ms; "
+                    f"stage-sum={format_number(build.get('production_stage_sum_ms'))} ms; "
+                    f"scope=`{build.get('scope', 'unavailable')}`.",
+                    f"- CAGRA build: policy=`{cagra.get('requested_policy', 'unavailable')}`; "
+                    f"elapsed={format_number(cagra.get('elapsed_ms'))} ms; final primitive="
+                    f"`{cagra.get('last_device', {}).get('label', 'unavailable')}`.",
+                    f"- Graph: reachable={graph.get('entry_reachable_nodes', '—')}/"
+                    f"{graph.get('count', '—')} ({format_number(graph.get('entry_reachable_fraction'), 4)}); "
+                    f"M={graph.get('M', '—')}; maxM0={graph.get('maxM0', '—')}; "
+                    f"maxlevel={graph.get('maxlevel', '—')}; dimension={graph.get('dimension', '—')}; "
+                    f"out-degree min/mean/max={out_degree.get('min', '—')}/"
+                    f"{format_number(out_degree.get('mean'))}/{out_degree.get('max', '—')}.",
+                    f"- File: {graph.get('file_bytes', '—')} bytes; sha256=`{graph.get('sha256', 'unavailable')}`; "
+                    f"identity-labels={graph.get('labels_match_base_rows', '—')}; "
+                    f"deletion-marked={graph.get('deletion_marked_nodes', '—')}; "
+                    f"upper-layer-bytes={graph.get('upper_layer_bytes', '—')}.",
+                    f"- Stages: {stage_summary}.",
+                    f"- Construction caveat: {metadata.get('construction_caveat', 'unavailable')}",
+                ]
+            )
     if artifact["completion"]["issues"]:
         lines.extend(["", "## Incomplete evidence", ""])
         lines.extend(f"- {issue}" for issue in artifact["completion"]["issues"])

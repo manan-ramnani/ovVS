@@ -84,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="explicit hnswlib build/search threads; fixed modes default to os.cpu_count()",
     )
+    parser.add_argument(
+        "--include-hnsw-export",
+        action="store_true",
+        help="add an experimental ovVS-CAGRA-build/export plus stock-hnswlib-search lane",
+    )
     parser.add_argument("--no-energy", action="store_true")
     parser.add_argument(
         "--allow-unscalable-cagra",
@@ -118,6 +123,7 @@ def normalize_gate_configuration(args: argparse.Namespace) -> None:
     args.seed = 7
     args.no_energy = True
     args.allow_unscalable_cagra = True
+    args.include_hnsw_export = False
     if args.hnsw_threads is None:
         args.hnsw_threads = max(1, os.cpu_count() or 1)
 
@@ -138,6 +144,7 @@ def normalize_preflight_configuration(args: argparse.Namespace) -> None:
     args.seed = 7
     args.no_energy = True
     args.allow_unscalable_cagra = True
+    args.include_hnsw_export = False
     if args.hnsw_threads is None:
         args.hnsw_threads = max(1, os.cpu_count() or 1)
 
@@ -294,6 +301,7 @@ def _artifact(
                 else None
             ),
             "hnswlib_threads": getattr(args, "hnsw_threads", None),
+            "include_hnsw_export": bool(getattr(args, "include_hnsw_export", False)),
             "seed": getattr(args, "seed", 7),
             "energy": not getattr(args, "no_energy", False),
         },
@@ -335,6 +343,16 @@ def _artifact(
                 "IVF-PQ FORCE_GPU uses the fused iGPU scan/select path; AUTO remains evidence-gated.",
                 "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
                 "SIFT-100k is a noncanonical prefix preflight and cannot close the SIFT1M quality gate.",
+                *(
+                    [
+                        "The hnswlib export lane's construction wall covers ovVS resource creation "
+                        "through a loaded stock index and includes instrumentation snapshots; an "
+                        "instrumentation-adjusted value and the production-stage sum are also retained. "
+                        "Peak RSS includes bounded graph diagnostics."
+                    ]
+                    if getattr(args, "include_hnsw_export", False)
+                    else []
+                ),
                 *(
                     [
                         "Gate-only CAGRA recall reports timing but decides only on matched-point recall; "
@@ -384,6 +402,7 @@ def orchestrate(args: argparse.Namespace) -> int:
             int(dataset.get("n", profile["expected_n"])),
             full_profile,
             args.allow_unscalable_cagra,
+            args.include_hnsw_export,
         )
         spec = {
             "schema_version": SCHEMA_VERSION,
@@ -407,6 +426,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                 else {}
             ),
             "hnsw_threads": getattr(args, "hnsw_threads", None),
+            "include_hnsw_export": bool(getattr(args, "include_hnsw_export", False)),
         }
         spec_path = directory / "run-spec.json"
         spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
