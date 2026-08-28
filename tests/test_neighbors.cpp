@@ -261,6 +261,52 @@ static void require_ivfpq_test_gpu(ovvsResources_t resources) {
   if (!gpu) skip_test("GPU device unavailable");
 }
 
+OVVS_TEST(pq_adc_auto_respects_npu_busy) {
+  Res res;
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_CPU),
+                "PQ ADC busy-gate build policy");
+  constexpr int64_t n = 64;
+  constexpr int64_t dim = 8;
+  constexpr int64_t nq = 2;
+  constexpr int64_t k = 5;
+  constexpr int32_t nlist = 8;
+  constexpr int32_t pq_m = 4;
+  auto data = make_data(n, dim, 412);
+  auto queries = make_data(nq, dim, 413);
+  ovvsIvfPqIndex_t index = nullptr;
+  expect_status(ovvsIvfPqBuild(res.r, data.data(), n, dim,
+                               OVVS_METRIC_L2_EXPANDED, nlist, pq_m, 4,
+                               &index),
+                "PQ ADC busy-gate build");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO),
+                "PQ ADC AUTO policy");
+  expect_status(ovvsResourcesSetNpuBusy(res.r, 1), "mark NPU busy");
+  std::vector<int64_t> ids(static_cast<size_t>(nq * k), -1);
+  std::vector<float> distances(static_cast<size_t>(nq * k),
+                               std::numeric_limits<float>::infinity());
+  const PqAdcStatsSnapshot before = pq_adc_stats(res.r);
+
+  expect_status(ovvsIvfPqSearch(res.r, index, queries.data(), nq, k, nlist,
+                                static_cast<int32_t>(n), nullptr, ids.data(),
+                                distances.data()),
+                "busy AUTO IVF-PQ search");
+  const PqAdcStatsSnapshot after = pq_adc_stats(res.r);
+  expect(after.npu_requests == before.npu_requests &&
+             after.npu_rows == before.npu_rows,
+         "busy AUTO PQ ADC must not submit NPU work");
+  expect(after.cpu_rows > before.cpu_rows,
+         "busy AUTO PQ ADC must complete on CPU");
+  expect(ovvs::impl::rd(res.r)->last_device == OVVS_DEVICE_CPU,
+         "busy AUTO PQ ADC must report CPU");
+  expect(std::all_of(ids.begin(), ids.end(),
+                     [](int64_t id) { return id >= 0 && id < n; }) &&
+             std::all_of(distances.begin(), distances.end(),
+                         [](float distance) { return std::isfinite(distance); }),
+         "busy AUTO IVF-PQ search must publish valid results");
+  ovvsIvfPqDestroy(index);
+}
+
 static void expect_ivfpq_results_equal(const std::vector<int64_t>& actual_ids,
                                        const std::vector<float>& actual_distances,
                                        const std::vector<int64_t>& expected_ids,

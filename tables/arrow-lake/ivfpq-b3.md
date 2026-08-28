@@ -1,6 +1,6 @@
 # Arrow Lake IVF-PQ B3 evidence
 
-Status: **correctness guarded; persistent storage, synchronous fixed buckets, forced affine-range execution, shortlist-only ID resolution, and fused FORCE_GPU scan/select complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
+Status: **correctness guarded; persistent storage, synchronous fixed buckets, forced affine-range execution, shortlist-only ID resolution, fused FORCE_GPU scan/select, and complete-call telemetry are complete; Q/T and nonzero Arrow Lake NPU work are retained negative evidence; iGPU throughput and end-to-end competitor gates remain open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
 
 The latest clean-code artifacts are `out/bench/ivfpq-fused-clean-r1.json` through `r3.json` at `a23de6a`. The matched shortlist-only A/B artifacts remain `out/bench/ivfpq-idmap-baseline-r1.json` through `r3.json` at `f4336a7` and `out/bench/ivfpq-idmap-clean-r1.json` through `r3.json` at `4e0bf87`. Earlier guarded, packed, and fixed-bucket artifacts remain local history. The latest runs are complete for FORCE_CPU, FORCE_GPU, and FAISS; energy was disabled. The ignored earliest baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
 
@@ -108,7 +108,7 @@ Live deterministic cases establish the bounded contract:
 | 131,072 | 0.4363 ms (0.4258–0.6352) | 46.2097 ms (46.0634–46.5929) | 105.9× |
 | 524,288 | 2.5255 ms (2.5000–2.5357) | 185.1460 ms (184.8050–185.3009) | 73.3× |
 
-GPU is unavailable for PQ ADC. Package-energy readings bracketed the complete multi-policy tool process and cannot be attributed to a lane. This is a strong negative result for the present Gather+ReduceSum dataflow, not for the NPU generally. The path still pays for expanded i32 indices, synchronous request traffic, and full score readback, but stage telemetry has not isolated their individual shares. The current diagnostic fails the AUTO promotion gate. The next speed path is iGPU variable-length fused scan/select, while the request cache is bounded/versioned and stage telemetry is added. Depth 2/4 remains a secondary bakeoff rather than a production default.
+At this historical checkpoint GPU PQ ADC was not yet integrated. Package-energy readings bracketed the complete multi-policy tool process and could not be attributed to a lane. The result was strong negative evidence for Gather+ReduceSum, not for the NPU generally: expanded i32 indices, request traffic, and full score readback remained. The subsequent fused iGPU path and complete-call telemetry are documented below; later corrected direct-Level-Zero/request-depth evidence also parked further Arrow Lake NPU work.
 
 ## Shortlist-only ID resolution
 
@@ -155,17 +155,30 @@ Three fresh sequential processes at clean commit `6a0f4c5` used the bounded SIFT
 
 The native wall is the median of each run's cumulative timed delta divided by five calls; stage percentages are medians of per-run shares. Harness QPS includes the surrounding Python call boundary. One GPU `nprobe=8` run fell to 1,064.1 QPS and 30.06 ms batch p50, so the result supports bottleneck selection but not a speedup or regression claim. Against the earlier clean checkpoint, CPU median QPS changed by -1.05%/+0.59% at `nprobe=2/8`, within run variance. Raw FAISS remains lower recall because it lacks equivalent refinement.
 
-The raw-row cap produces 3/11 blocks per 32-query call at `nprobe=2/8`, inspecting 143.2/536.2 real candidates per query. FORCE_GPU issues 27/99 allocations, 104/120 logical kernel submissions, and 134/230 waits per call; explicit queued traffic is 514.6/2,058.2 KiB H2D and 4.1/4.2 KiB D2H. These counts make the next order evidence-based: factor CPU LUT work first; batch/fuse GPU exact refinement before treating allocation reuse as sufficient.
+The raw-row cap produces 3/11 blocks per 32-query call at `nprobe=2/8`, inspecting 143.2/536.2 real candidates per query. FORCE_GPU issues 27/99 allocations, 104/120 logical kernel submissions, and 134/230 waits per call; explicit queued traffic is 514.6/2,058.2 KiB H2D and 4.1/4.2 KiB D2H. These counts originally made Q/T and batched/fused GPU refinement the next bounded experiments. The Q/T result below supersedes its promotion; the GPU structural work remains open.
 
 Residual-PQ admits `||q-c_l-w||^2 = ||q-c_l||^2 - 2q·w + (||w||^2 + 2c_l·w)`, allowing one query term plus a derived persistent list term. The identity is exact over reals, but f32 reassociation and cancellation can change near ties. Promotion therefore requires a conservative score-error band smaller than the shortlist cutoff gap, followed by exact validation; otherwise the call must use the current direct LUT. Fixed oversampling is not a proof. Derived terms remain rebuildable from `IPQ1` v1 data, including after extend.
 
+## Residual-PQ Q/T retained negative
+
+The bounded Q/T experiment implemented the identity with persistent derived `T`, one `Q=-2q·W` projection per query, an error-band/cutoff-gap certificate, and fail-closed direct-LUT fallback. The retained fixtures produced 262,144 and 1,048,576 bit-equal scores at 131,072 and 524,288 candidates; an intentional rank-32/33 tie exercised the exact fallback without partial publication. Synthetic joined-stage measurements then rejected the speed path:
+
+| Joined-stage path | 131,072 rows | 524,288 rows |
+|---|---:|---:|
+| Direct scalar LUT oracle | 0.4479 ms | 1.5405 ms |
+| CPU-Q + iGPU factorized scan/select | 0.8631 ms | 2.7617 ms |
+| iGPU-Q + iGPU factorized scan/select | 0.9629 ms | 2.7867 ms |
+| NPU-Q + iGPU factorized scan/select | 1.3384 ms | 3.0663 ms |
+
+The scope includes Q production, visible handoff, persistent iGPU scan/local top-k, bounded readback, final selection, direct selected-set rescore, and synchronization; it excludes coarse assignment and exact-vector refinement and is not end-to-end IVF search. The best factorized path was 1.93×/1.79× slower than direct at 131K/524K rows. NPU-Q was another 1.55×/1.11× slower than the best factorized producer. Corrected direct Level Zero also lost reused OpenVINO at both sizes/depths 1/2/4 in refill+execute+consume scope, while every measured nonzero NPU+iGPU partition lost its complete experimental composition scope. Q/T is therefore retained algebraic/correctness evidence, not an integration candidate; Arrow Lake receives zero active NPU optimization capacity. Details and immutable artifacts: `tables/arrow-lake/npu-igpu-escape-routes.md`.
+
 ## Remaining B3 gate
 
-1. Factor residual-PQ tables into persistent list terms plus one query term with a cutoff-gap certificate and direct-LUT fallback.
-2. Replace the raw-candidate block cap with an explicit descriptor/LUT/workspace byte budget so batch size is not coupled to list fanout.
-3. Batch or fuse exact GPU refinement, then reuse the stabilized layout through a bounded resource-owned GPU workspace.
-4. Validate the bounded affine NPU transform on production LUTs through shortlist survival and final recall. Bound/version the request cache before measuring depths 1/2/4; depth one stays default.
+1. Replace the raw-candidate block cap with an explicit descriptor/LUT/workspace byte budget so batch size is not coupled to list fanout.
+2. Implement hierarchical SIMD16 iGPU top-k with one device-global merge and one final readback; retain a measured fallback for unfavorable query/batch geometry.
+3. Pack true 4/6/8-bit codes in aligned AoSoA16 layouts and place direct residual FP32 or range-validated FP16 LUTs in SLM with a global-memory fallback.
+4. Batch or fuse exact GPU refinement, then reuse the stabilized layout through a bounded resource-owned workspace.
 5. Compare raw ovVS and raw FAISS at identical `nlist`, `nprobe`, `pq_m`, `nbits`, and `krefine=k`; refined comparisons need an equivalent FAISS refinement lane.
-6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, and package-energy evidence before claiming a win.
+6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, bytes, allocations, submissions, waits, and package-energy evidence before claiming a win.
 
-Latest checkpoint verification: 92/92 accelerator-enabled native tests with zero skips, 7/7 CTest lanes, and 66/66 benchmark-harness tests. Python compilation, a real Windows Python/FAISS/ovVS import, and diff checks also pass. Three clean benchmark artifacts completed with FORCE_CPU, FORCE_GPU, and FAISS all successful; energy was disabled. CTest re-runs native subsets plus the two consumers, so its count is not additive.
+Latest checkpoint verification: 93/93 accelerator-enabled native tests with zero skips, 8/8 configured CTest lanes, and 71/71 benchmark-harness tests. The added live routing regression proves `NpuBusy` makes AUTO IVF-PQ submit zero NPU requests and complete on CPU; FORCE_NPU remains explicit. All four opt-in escape-route targets compile against current main, and their eight retained JSON artifacts parse and match the manifest hashes. The clean IVF-PQ benchmark artifacts completed with FORCE_CPU, FORCE_GPU, and FAISS successful; energy was disabled. CTest re-runs native subsets plus the two consumers, so its count is not additive.

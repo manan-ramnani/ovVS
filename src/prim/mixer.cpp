@@ -358,7 +358,8 @@ ovvsStatus prim_pq_adc_batch(ResourcesData& r, const PqAdcTask* tasks, int64_t t
 
     /* There is no iGPU ADC backend. FORCE_GPU must not punch through to NPU. */
     if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
-    if (r.policy != OVVS_POLICY_FORCE_CPU) {
+    const bool npu_allowed = r.policy == OVVS_POLICY_FORCE_NPU || !r.npu_busy;
+    if (r.policy != OVVS_POLICY_FORCE_CPU && npu_allowed) {
       if (npu_pq_adc_batch(r, chunks.data(), static_cast<int64_t>(chunks.size()), pq_m,
                            ks, staged.data())) {
         std::memcpy(out, staged.data(), staged.size() * sizeof(float));

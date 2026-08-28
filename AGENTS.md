@@ -32,10 +32,10 @@ bindings → C ABI (libovvs) → C++ algorithms → mixer/planner
 
 - Algorithms call `ovvs::prim`, never OpenVINO or SYCL directly.
 - Default tensor home: USM shared (CPU + iGPU). NPU sees tiles/bound host buffers, not a second index copy as source of truth.
-- Graph ANN (CAGRA/Vamana/NN-Descent walk) lives on **iGPU**. NPU may score a padded candidate slab if bakeoff says so.
-- Dense GEMM / coarse IVF assign / k-means assign: **CPU oneMKL** on Arrow Lake (bakeoff). PQ ADC: range-safe LUTs may use NPU; FORCE_NPU can affine-center and scale a bounded unsafe span, while AUTO keeps the CPU fallback until the complete search wins. Graph walk: **iGPU**. NPU Parameter MatMul is kept for FORCE_NPU and for SKUs whose `gemm_large.json` names NPU.
+- Graph ANN (CAGRA/Vamana/NN-Descent walk) lives on **iGPU**. Arrow Lake NPU candidate-slab offload is parked under the zero-capacity decision; no retained artifact claims a CAGRA-specific candidate-slab benchmark. Another SKU may reopen it through a new bakeoff.
+- Dense GEMM / coarse IVF assign / k-means assign: **CPU oneMKL** on Arrow Lake (bakeoff). PQ ADC retains its existing range-safe AUTO attempt, unsafe CPU fallback, and FORCE_NPU numeric-correctness coverage, but no Arrow Lake NPU expansion is active after direct-Level-Zero refill+execute+consume, NPU+iGPU composition, and Q/T joined-stage losses. Graph walk: **iGPU**. NPU Parameter MatMul remains for FORCE_NPU and SKUs whose `gemm_large.json` names NPU.
 
-**Device split (canonical):** `docs/hw-split.md`. AUTO GEMM / TopK / Gather → CPU (oneMKL `cblas_sgemm` beats NPU wall and iGPU XMX on Arrow Lake). CAGRA walk → iGPU. Range-safe PQ ADC may use NPU; unsafe AUTO tables use CPU, while bounded FORCE_NPU affine execution runs or fails unavailable. `FORCE_*` never silently falls back.
+**Device split (canonical):** `docs/hw-split.md`. Arrow Lake AUTO GEMM / TopK / Gather → CPU; CAGRA walk → iGPU. Existing range-safe PQ ADC may still attempt NPU before CPU fallback, while the fused iGPU and bounded FORCE_NPU paths remain honest forced-device coverage; none is a measured AUTO winner. `FORCE_*` never silently falls back.
 
 Details, knobs, and CAGRA mapping: the plan §4–§6.
 
@@ -43,7 +43,7 @@ Details, knobs, and CAGRA mapping: the plan §4–§6.
 
 ## NPU contract (do not forget)
 
-The DPU is **not** broken. Arrow Lake 265K `PERF_COUNT`: MatMul is **21 µs** on DPU for 64³ and **5.3 ms** for `1e5×32×768`. Wall times of 0.5–170 ms are SHAVE copies + Level Zero + **new InferRequest per call**. Table: `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`.
+The DPU is **not** broken. Arrow Lake 265K `PERF_COUNT`: MatMul is **21 µs** on DPU for 64³ and **5.3 ms** for `1e5×32×768`. Historical 0.5–170 ms walls included SHAVE copies, Level Zero work, and new-request overhead. Reused requests and request-owned L0 buffers are mandatory but insufficient: corrected direct-Level-Zero refill+execute+consume still loses reused OpenVINO. Table: `tables/arrow-lake/npu-gemm-dpu-vs-wall.md`; disposition: `tables/arrow-lake/npu-igpu-escape-routes.md`.
 
 Intel added an **inference engine** (compiled graph, weight-stationary, ~4 MB scratchpad), not cuBLAS.
 
@@ -51,7 +51,7 @@ Intel added an **inference engine** (compiled graph, weight-stationary, ~4 MB sc
 2. **Feed L0 tensors via `get_input_tensor` / `get_output_tensor`.** The plugin allocates Level Zero buffers at request creation. `memcpy` into those. `set_tensor` on a malloc/USM host pointer **forces a SHAVE copy** (intel_npu README). That copy is the 35 ms “SHAVE A” in `PERF_COUNT`, not a broken DPU.
 3. **Reuse the request’s L0 buffers.** `memcpy` unless `nbytes ≥ 64 KiB` and a 32-sample fingerprint matches (search dataset). Pointer-identity alone is unsafe: k-means/ScaNN mutate centroids. Scratchpad is **4 MB** (`1e5×768` f16 ≈ 150 MB does not fit).
 4. **INT8 is NNCF Low Precision IR** (FakeQuantize on activations **and Constant weights**). Raw `si8` MatMul is illegal. Two live fp32 Parameters will not light INT8 MACs. TOPS on this SKU are INT8; FP16 is half-rate. Compile with `NPU_TURBO` + `optimization-level=2 performance-hint-override=latency`.
-5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (18 ms vs NPU 45 ms vs GPU 221 ms at 1e5×32×768). Graph walk → iGPU. Range-safe ADC may use NPU; unsafe AUTO ADC falls back to CPU. The forced centered/scaled ADC lane is correctness evidence, not an AUTO win. NPU DPU is still 5.3 ms; Parameter DMA is why wall loses to MKL.
+5. **Device split:** `docs/hw-split.md`. AUTO dense GEMM / TopK / Gather → CPU oneMKL on Arrow Lake (GEMM: 18 ms CPU vs 45 ms NPU vs 221 ms GPU at 1e5×32×768). Graph walk → iGPU. Existing range-safe PQ ADC may still attempt NPU; unsafe AUTO uses CPU and forced routes stay honest. Corrected direct-Level-Zero lost every refill+execute+consume cell, every nonzero NPU+iGPU partition lost its joined experimental scope, and certified Q/T lost its joined stage, so Arrow Lake receives zero active NPU optimization capacity. Keep correctness paths and immutable evidence, but do not manufacture a nonzero share. NPU DPU is still 5.3 ms; graph/DMA/tile movement makes wall lose to MKL.
 6. **Do not bake B as an IR Constant just to be clever.** That made DPU 10× faster and wall 10× *slower* (UMD/constant reload). Sticky Parameter + reused request + L0 `get_tensor` is the path.
 7. **Fail closed on numeric range.** Arrow Lake f32 graph IO can exhibit FP16-range saturation. GEMM and TopK reject unsafe bounds. PQ ADC uses raw LUTs below `sum_m max_code(abs(lut[m, code])) < 65,504`; FORCE_NPU may subtract each subspace minimum, scale the remaining total span to 60,000, and restore the bias only when the scale is at least 0.5. Non-finite values, wider transforms, or invalid outputs return `DEVICE_UNAVAILABLE` without publication. AUTO deliberately retains the unsafe-range CPU fallback.
 
@@ -63,16 +63,16 @@ If a change “uses the NPU” but creates a request per call, `set_tensor`s hos
 
 Work the plan’s phases in sequence. **v0.2.0 already has C ABI symbols through the plan’s algorithm list** (brute, IVF family, CAGRA, NN-Descent, Vamana, ScaNN, HNSW export, cluster, quantizers, pairwise). Do not scaffold more names.
 
-`prim::gemm`, `prim::topk`, and `prim::gather` exist. Remaining work is **accelerated quality and scale**, not first implementations. Current critical path (2026-08-28, `.claude/backlog.md`):
+`prim::gemm`, `prim::topk`, and `prim::gather` exist. Remaining work is **accelerated quality and scale**, not first implementations. Current critical path (2026-08-29, `.claude/backlog.md`):
 
-1. B1 harness core and the current-code matched SIFT1M CAGRA gate are complete; full curves/energy and the real 100K×768 corpus remain open.
-2. B2/B5 pass the SIFT1M recall-closeness gate (0.9036 versus hnswlib 0.8915), but ≥0.95 recall, CAGRA QPS, NN-Descent convergence, and GPU prune remain open.
-3. **Next implementation:** IVF-PQ persistent CSR, fixed ADC buckets, the bounded affine NPU lane, shortlist-only IDs, fused FORCE_GPU scan/select, and complete-call telemetry are complete. At bounded `nprobe=8`, LUT construction is 73.6% of CPU wall; fused ADC plus final per-query TopK is 85.5% of GPU wall. Continue B3 with certified exact Q/T factorization, a workspace-byte block budget, persistent GPU workspaces, and batched/fused refinement. Bound/version the NPU request cache before any depth 1/2/4 experiment, and require joined end-to-end wall before giving NPU Q work capacity. Then correct and accelerate RaBitQ (B4). Keep this software-only; do not require BIOS changes.
-4. Continue CAGRA throughput work only from profiling evidence; never weaken hnswlib settings.
-5. HETERO stage overlap (B6); NPU L0 dataset-home experiment (B7); Lunar Lake bakeoff when hardware exists (B8)
-6. Then plan v1.0 polish (B9–B20). Vamana/ScaNN/SLINK/bindings are v1.1 (B21+) — do not start them ahead of B2
+1. Add explicit, versioned, success-only CAGRA build-stage telemetry before attributing the 185.3 s SIFT1M construction wall to initializer, NN-Descent iterations, optimizer/prune/merge, or copies.
+2. Use that evidence to accelerate CAGRA/NN-Descent construction and graph optimize/prune/merge on the iGPU. The stock-hnswlib export is valid and fully reachable, but its measured SIFT100K build and nearest comparable-recall search both lost; do not tune it as the active acceleration route.
+3. Continue CAGRA search from profiling: a deterministic SIMD16 selection portfolio, multi-work-group/query for small batches, one-work-group/query for large batches, and a bounded fallback. Never weaken hnswlib settings.
+4. Continue IVF-PQ with hierarchical iGPU top-k plus one global merge/readback, packed AoSoA 4/6/8-bit codes, direct residual FP32 or validated-FP16 SLM LUTs, a workspace-byte planner, and batched/fused exact refinement with bounded persistent workspaces. Q/T and Arrow Lake NPU request-depth work are retained negative evidence, not active tasks.
+5. Add latency-/throughput-/deadline-aware dynamic batching, size-gated CPU+iGPU composition, nonnegative squared-L2 early abandonment, and a held-out multi-objective per-SKU tuner. Correct and accelerate RaBitQ without assuming Arrow Lake NPU promotion.
+6. In parallel, finish B1 curves/energy and the real 100K×768 corpus. Bake off Lunar Lake only when that hardware exists, then continue v1.0/v1.1 work in plan order.
 
-Phase 23 (npu_compiler / SHAVE) is a **parallel** track, not a reason to stall iGPU kernels. Unsigned SHAVE inject is parked after a real attempt; ActShave already runs inside compiler graphs.
+Phase 23 (npu_compiler / SHAVE) is parked on Arrow Lake after the public gate found the real MoviTools/source/descriptor boundary. ActShave already runs inside compiler graphs, but that is not a public custom-kernel path. Reopen only with the missing public toolchain inputs or a new SKU/runtime capability; algorithms continue on iGPU/CPU.
 
 ---
 
