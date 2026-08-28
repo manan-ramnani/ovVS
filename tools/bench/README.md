@@ -8,6 +8,9 @@
 # Bounded default: at most 2,000 base vectors, 32 queries, three repeats.
 python tools/bench/bench.py
 
+# Fixed noncanonical resource/quality preflight on the first 100,000 SIFT vectors.
+python tools/bench/bench.py --preflight-only cagra-sift100k --hnsw-threads 20
+
 # Full SIFT base; no fallback if the HDF5 file or dependencies are absent.
 python tools/bench/bench.py --profile sift1m
 
@@ -25,6 +28,10 @@ python -m pip install numpy h5py faiss-cpu hnswlib
 ```
 
 Use `--algorithms` and `--policies` for a subset, for example `--algorithms brute,ivf-flat --policies auto,cpu,gpu`. Defaults include AUTO, FORCE_CPU, FORCE_NPU, FORCE_GPU, and HETERO. `--build-policy` independently selects one construction policy for every ovVS lane and defaults to AUTO; for example, `--build-policy force-cpu` restores CPU-only construction while leaving search lanes unchanged. HETERO is recorded honestly as equivalent to AUTO until B6 lands. `--allow-unscalable-cagra` is an explicit opt-in to CAGRA above 4,096 vectors while full-scale build quality, CPU-prune cost, and peak-resource evidence remain open; otherwise those lanes stay resource-gated. CAGRA FORCE_NPU remains visible but skipped because there is no NPU graph-walk path. IVF-PQ FORCE_GPU is likewise a visible nonblocking skip: ADC deliberately has no iGPU backend and now fails closed.
+
+`sift-100k` reads the checksum-pinned SIFT HDF5 but selects only the first 100,000 base vectors and 1,000 queries. Its exact oracle is recomputed with FAISS because the file's official neighbors apply to the complete 1M base. The dedicated preflight fixes AUTO construction, FORCE_GPU CAGRA search, one matched CAGRA/hnswlib effort point, one warmup, five measured passes, seed 7, and disables energy. It records isolated-worker peak RSS, build/search timing, recall, QPS, device attribution, and the derived `192/192/0/0` direct-walk/zero-upload transfer delta. Peak RSS includes the dataset, runtime, and index; it is not device-only allocation telemetry.
+
+The preflight exits zero only when its dataset, truth, two lanes, fixed settings, measurements, transfer counters, and memory evidence validate. Recall is reported but has no pass threshold. The artifact remains `partial`, `canonical_b1_evidence=false`, and noncanonical even when the preflight completes; the full SIFT1M quality gate remains required. A timeout or resource failure is retained explicitly and exits nonzero. When `--hnsw-threads` is omitted, all logical CPUs reported by `os.cpu_count()` are used and recorded.
 
 The narrow CAGRA quality checkpoint has a dedicated mode:
 

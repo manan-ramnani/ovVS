@@ -24,6 +24,7 @@ from _common import (
     ALGORITHM_ORDER,
     CAGRA_RECALL_GATE,
     CAGRA_RECALL_GATE_POINTS,
+    CAGRA_SIFT100K_PREFLIGHT,
     LANE_STATUSES,
     POLICY_LABELS,
     POLICY_ORDER,
@@ -32,6 +33,7 @@ from _common import (
     SCHEMA_VERSION,
     WORKER_PREFIX,
     cagra_recall_gate_result,
+    cagra_sift100k_preflight_result,
     completion_issues,
     default_output_path,
     enumerate_lanes,
@@ -50,10 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--profile", choices=tuple(PROFILE_DEFAULTS), default="smoke")
-    parser.add_argument(
+    fixed_mode = parser.add_mutually_exclusive_group()
+    fixed_mode.add_argument(
         "--gate-only",
         choices=(CAGRA_RECALL_GATE,),
         help="run one noncanonical SIFT1M quality checkpoint instead of a full curve",
+    )
+    fixed_mode.add_argument(
+        "--preflight-only",
+        choices=(CAGRA_SIFT100K_PREFLIGHT,),
+        help="run one noncanonical 100K SIFT runtime/memory/quality diagnostic",
     )
     parser.add_argument("--algorithms", default="all", help="comma-separated: brute,ivf-flat,ivf-pq,cagra")
     parser.add_argument("--policies", default="all", help="comma-separated: auto,cpu,npu,gpu,hetero")
@@ -74,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hnsw-threads",
         type=int,
-        help="explicit hnswlib build/search threads; gate-only defaults to os.cpu_count()",
+        help="explicit hnswlib build/search threads; fixed modes default to os.cpu_count()",
     )
     parser.add_argument("--no-energy", action="store_true")
     parser.add_argument(
@@ -114,8 +122,32 @@ def normalize_gate_configuration(args: argparse.Namespace) -> None:
         args.hnsw_threads = max(1, os.cpu_count() or 1)
 
 
+def normalize_preflight_configuration(args: argparse.Namespace) -> None:
+    """Apply the fixed selection for the bounded SIFT-prefix preflight."""
+
+    if getattr(args, "hnsw_threads", None) is not None and args.hnsw_threads <= 0:
+        raise ValueError("hnsw threads must be positive")
+    if getattr(args, "preflight_only", None) != CAGRA_SIFT100K_PREFLIGHT:
+        return
+    args.profile = "sift-100k"
+    args.algorithms = "cagra"
+    args.policies = "gpu"
+    args.build_policy = "auto"
+    args.warmups = 1
+    args.repeats = 5
+    args.seed = 7
+    args.no_energy = True
+    args.allow_unscalable_cagra = True
+    if args.hnsw_threads is None:
+        args.hnsw_threads = max(1, os.cpu_count() or 1)
+
+
 def gate_exit_code(artifact: dict[str, Any]) -> int:
     return 0 if artifact.get("quality_gate", {}).get("status") == "pass" else 3
+
+
+def preflight_exit_code(artifact: dict[str, Any]) -> int:
+    return 0 if artifact.get("preflight", {}).get("status") == "complete" else 3
 
 
 def _tail(value: str | bytes | None, limit: int = 4_000) -> str | None:
@@ -213,7 +245,9 @@ def _artifact(
 ) -> dict[str, Any]:
     issues = completion_issues(args.profile, dataset, ground_truth, lanes)
     gate_only = getattr(args, "gate_only", None)
+    preflight_only = getattr(args, "preflight_only", None)
     quality_gate = None
+    preflight = None
     if gate_only == CAGRA_RECALL_GATE:
         quality_gate = cagra_recall_gate_result(
             dataset, ground_truth, profile, lanes, getattr(args, "hnsw_threads", None)
@@ -222,10 +256,19 @@ def _artifact(
             "gate-only cagra-recall is a noncanonical two-point quality checkpoint; it does not "
             "satisfy B1 full recall-QPS curves or package-energy evidence"
         )
+    if preflight_only == CAGRA_SIFT100K_PREFLIGHT:
+        preflight = cagra_sift100k_preflight_result(
+            dataset, ground_truth, profile, lanes, getattr(args, "hnsw_threads", None)
+        )
     if args.profile == "embedding-100k" and dataset.get("kind") == "synthetic":
         issues.append(
             "embedding-100k uses the provisional synthetic workload; this exercises the B1 harness but "
             "does not satisfy the real 768-d corpus requirement in B20"
+        )
+    if args.profile == "sift-100k":
+        issues.append(
+            "sift-100k is a noncanonical prefix preflight for resource, build, and quality diagnosis; "
+            "it does not satisfy the full SIFT1M B1/B2 gate"
         )
     artifact_dataset = json.loads(json.dumps(dataset))
     if artifact_dataset.get("kind") == "synthetic":
@@ -240,13 +283,14 @@ def _artifact(
         "profile": {"name": args.profile, "settings": profile},
         "selection": {
             "gate_only": gate_only,
+            "preflight_only": preflight_only,
             "algorithms": algorithms,
             "build_policy": POLICY_LABELS[getattr(args, "build_policy", "auto")],
             "build_policy_key": getattr(args, "build_policy", "auto"),
             "policies": [POLICY_LABELS[value] for value in policies],
             "point_selection": (
                 {key: [value] for key, value in CAGRA_RECALL_GATE_POINTS.items()}
-                if gate_only == CAGRA_RECALL_GATE
+                if gate_only == CAGRA_RECALL_GATE or preflight_only == CAGRA_SIFT100K_PREFLIGHT
                 else None
             ),
             "hnswlib_threads": getattr(args, "hnsw_threads", None),
@@ -261,7 +305,10 @@ def _artifact(
             "issues": issues,
             "lane_counts": counts,
             "full_profile_strict": (
-                args.profile != "smoke" and not args.allow_partial and gate_only is None
+                args.profile not in ("smoke", "sift-100k")
+                and not getattr(args, "allow_partial", False)
+                and gate_only is None
+                and preflight_only is None
             ),
         },
         "metadata": {
@@ -287,6 +334,7 @@ def _artifact(
                 "HETERO currently equals AUTO (backlog B6).",
                 "IVF-PQ FORCE_GPU is a visible expected skip because ADC has no iGPU backend and fails closed.",
                 "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
+                "SIFT-100k is a noncanonical prefix preflight and cannot close the SIFT1M quality gate.",
                 *(
                     [
                         "Gate-only CAGRA recall reports timing but decides only on matched-point recall; "
@@ -302,12 +350,18 @@ def _artifact(
         artifact["selection"]["canonical"] = False
         artifact["completion"]["canonical_b1_evidence"] = False
         artifact["quality_gate"] = quality_gate
+    if args.profile == "sift-100k":
+        artifact["selection"]["canonical"] = False
+        artifact["completion"]["canonical_b1_evidence"] = False
+    if preflight is not None:
+        artifact["preflight"] = preflight
     return artifact
 
 
 def orchestrate(args: argparse.Namespace) -> int:
     try:
         normalize_gate_configuration(args)
+        normalize_preflight_configuration(args)
         algorithms = parse_selection(args.algorithms, ALGORITHM_ORDER, "algorithm")
         policies = parse_selection(args.policies, POLICY_ORDER, "policy")
         build_policies = parse_selection(args.build_policy, POLICY_ORDER, "build policy")
@@ -343,9 +397,13 @@ def orchestrate(args: argparse.Namespace) -> int:
             "energy": not args.no_energy,
             "seed": args.seed,
             "gate_only": getattr(args, "gate_only", None),
+            "preflight_only": getattr(args, "preflight_only", None),
             "point_selection": (
                 {key: [value] for key, value in CAGRA_RECALL_GATE_POINTS.items()}
-                if getattr(args, "gate_only", None) == CAGRA_RECALL_GATE
+                if (
+                    getattr(args, "gate_only", None) == CAGRA_RECALL_GATE
+                    or getattr(args, "preflight_only", None) == CAGRA_SIFT100K_PREFLIGHT
+                )
                 else {}
             ),
             "hnsw_threads": getattr(args, "hnsw_threads", None),
@@ -398,15 +456,23 @@ def orchestrate(args: argparse.Namespace) -> int:
             f"(hnswlib-CAGRA recall={gate['recall']['hnswlib_minus_cagra']})"
         )
         return gate_exit_code(artifact)
+    if getattr(args, "preflight_only", None) == CAGRA_SIFT100K_PREFLIGHT:
+        preflight = artifact["preflight"]
+        print(
+            f"Preflight: {preflight['status']} "
+            f"(hnswlib-CAGRA recall={preflight['recall']['hnswlib_minus_cagra']})"
+        )
+        return preflight_exit_code(artifact)
     if full_profile and artifact["completion"]["issues"] and not args.allow_partial:
         return 3
     return 0
 
 
 def worker_main(spec_path: Path, lane_id: str) -> int:
-    from _worker import run_worker
+    from _worker import process_peak_rss, run_worker
 
     result = run_worker(json.loads(spec_path.read_text(encoding="utf-8")), lane_id)
+    result["process_memory"] = process_peak_rss()
     print(WORKER_PREFIX + json.dumps(result, sort_keys=True))
     return 0 if result["status"] in ("success", "unavailable") else 1
 

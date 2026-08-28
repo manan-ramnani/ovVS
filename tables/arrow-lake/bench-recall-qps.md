@@ -1,8 +1,23 @@
 # Arrow Lake 265K recall–QPS (icx SYCL + oneMKL)
 
 Source: `tools/bench/bench.py` against `build-icpx` `ovvs.dll` (`OVVS_WITH_SYCL=ON`, `OVVS_WITH_MKL=ON`).
-Dataset: `data/sift-128-euclidean.hdf5` slice n=2000 dim=128 nq=32 k=10.
+Dataset: checksum-pinned `data/sift-128-euclidean.hdf5`; each section states its selected base/query geometry.
 Comparators: faiss-cpu 1.15.0, hnswlib 0.8.0.
+
+## SIFT100K current-code scale preflight
+
+Noncanonical intermediate run after the query-seed, host graph-optimizer, and bounded NEW/OLD reverse-join changes: checksum-pinned SIFT prefix `n=100,000`, `dim=128`, `nq=1,000`, `k=10`; exact FAISS `IndexFlatL2` truth recomputed against the prefix; M=16, seed 7, one warmup and five measured passes. ovVS used AUTO construction followed by FORCE_GPU search at `itopk=32`, width=1, batch=32. hnswlib 0.8.0 used `ef_construction=200`, `ef=32`, batch=32, and 20 explicit threads.
+
+The table reports medians across three independent full preflight processes; parentheses give the observed range.
+
+| Lane | Recall@10 | Build wall | Median QPS | Isolated peak RSS | Validity |
+|---|---:|---:|---:|---:|---|
+| ovVS CAGRA | 0.9718 (same in all runs) | 8.686 s (8.672–8.800); final primitive CPU | 3,923.6 (3,874.5–3,941.5) | 398.4 MiB (398.2–398.5) | 192/192 GPU attributions per run; `192/192/0/0` transfer |
+| hnswlib | 0.9510 (0.9504–0.9525) | 1.682 s (1.643–1.695) | 22,142.6 (22,104.8–22,978.9) | 201.2 MiB (201.0–202.7) | 20 explicit threads; finite unique output |
+
+CAGRA returned 208 more exact top-10 hits than the median hnswlib run across the 10,000-result oracle, an absolute recall advantage of 0.0208. Recall is reported rather than thresholded because this prefix is not the plan's SIFT1M quality gate. By the three-run medians, hnswlib remained 5.64× faster in search and 5.16× faster to build, while CAGRA used 1.98× the isolated peak process RSS. The CAGRA peak includes the dataset, runtime, and index; it is not device-allocation telemetry. AUTO construction ends in the CPU host optimizer, so the reported final build primitive does not describe the complete mixed build pipeline.
+
+The preflight contract completed in all three runs with both lanes successful, exact truth, five QPS samples per lane, all 192 CAGRA searches per run attributed to GPU, zero NPU fallbacks, and zero explicit index uploads. Energy was disabled and no in-run device-occupancy trace was captured. These walls are therefore retained as diagnostic current-code measurements, not a publishable isolated performance baseline. Every artifact remains partial and noncanonical; the older full SIFT1M result below is still the latest full-scale measurement.
 
 ## SIFT1M matched quality gate
 

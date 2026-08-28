@@ -25,6 +25,7 @@ WORKER_PREFIX = "__OVVS_BENCH_RESULT__="
 LANE_STATUSES = {"success", "unavailable", "failed", "timeout", "skipped"}
 CAGRA_RECALL_GATE = "cagra-recall"
 CAGRA_RECALL_GATE_MAX_GAP = 0.0200
+CAGRA_SIFT100K_PREFLIGHT = "cagra-sift100k"
 CAGRA_RECALL_GATE_POINTS = {
     "cagra": {"itopk_size": 32, "search_width": 1, "query_batch_size": 32},
     "hnsw": {"ef": 32, "query_batch_size": 32},
@@ -73,6 +74,35 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
             {"ef": 32, "query_batch_size": 32},
             {"ef": 64, "query_batch_size": 32},
             {"ef": 64, "query_batch_size": 1, "purpose": "b1_latency"},
+        ],
+    },
+    "sift-100k": {
+        "description": "Noncanonical 100,000-vector SIFT prefix for scale preflight before SIFT1M.",
+        "expected_n": 100_000,
+        "expected_dim": 128,
+        "nq": 1_000,
+        "k": 10,
+        "query_batch_size": 32,
+        "warmups": 1,
+        "repeats": 5,
+        "timeout_seconds": 1_800.0,
+        "energy_min_seconds": 0.5,
+        "energy_max_passes": 3,
+        "nlist": 1_024,
+        "nprobes": [8, 16, 32, 64],
+        "pq_m": 16,
+        "pq_nbits": 8,
+        "krefine": 64,
+        "graph_degree": 16,
+        "intermediate_degree": 32,
+        "cagra_points": [
+            {"itopk_size": 32, "search_width": 1, "query_batch_size": 32},
+            {"itopk_size": 64, "search_width": 2, "query_batch_size": 32},
+        ],
+        "hnsw_ef_construction": 200,
+        "hnsw_points": [
+            {"ef": 32, "query_batch_size": 32},
+            {"ef": 64, "query_batch_size": 32},
         ],
     },
     "sift1m": {
@@ -467,12 +497,12 @@ def _synthetic(directory: Path, n: int, dim: int, nq: int, seed: int, label: str
 
 
 def _hdf5(path: Path, profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        raise UnavailableError(f"SIFT HDF5 is absent: {path}; run tools/data/fetch.py")
     try:
         import h5py
     except ImportError as exc:
         raise UnavailableError(f"h5py is required to read {path}: {exc}") from exc
-    if not path.exists():
-        raise UnavailableError(f"SIFT HDF5 is absent: {path}; run tools/data/fetch.py")
     actual_sha256 = sha256_file(path)
     if actual_sha256.lower() != SIFT_SHA256:
         raise UnavailableError(
@@ -587,11 +617,11 @@ def _custom(base_path: Path, query_path: Path, profile: dict[str, Any]) -> dict[
 
 
 def prepare_dataset(args: Any, profile: dict[str, Any], directory: Path) -> dict[str, Any]:
-    if args.profile in ("smoke", "sift1m"):
+    if args.profile in ("smoke", "sift-100k", "sift1m"):
         try:
             return _hdf5(Path(args.sift).expanduser(), args.profile, profile)
         except (UnavailableError, OSError, ValueError) as exc:
-            if args.profile == "sift1m":
+            if args.profile != "smoke":
                 return {"status": "unavailable", "reason": str(exc), "requested_path": args.sift}
             try:
                 result = _synthetic(
@@ -990,6 +1020,339 @@ def cagra_recall_gate_result(
     }
 
 
+def cagra_sift100k_preflight_result(
+    dataset: dict[str, Any],
+    ground_truth: dict[str, Any],
+    profile: dict[str, Any],
+    lanes: Sequence[dict[str, Any]],
+    hnsw_threads: int | None,
+) -> dict[str, Any]:
+    """Validate the fixed 100K SIFT CAGRA/hnswlib diagnostic contract."""
+
+    issues: list[str] = []
+    expected_profile = {
+        "expected_n": 100_000,
+        "expected_dim": 128,
+        "nq": 1_000,
+        "k": 10,
+        "graph_degree": 16,
+        "intermediate_degree": 32,
+        "hnsw_ef_construction": 200,
+        "warmups": 1,
+        "repeats": 5,
+    }
+    for key, expected in expected_profile.items():
+        if profile.get(key) != expected:
+            issues.append(f"profile {key}={profile.get(key)!r}, expected {expected!r}")
+
+    expected_dataset = {
+        "status": "success",
+        "kind": "sift_prefix",
+        "n": 100_000,
+        "source_n": 1_000_000,
+        "dim": 128,
+        "nq": 1_000,
+        "source_nq": 10_000,
+        "metric": "squared_l2",
+    }
+    for key, expected in expected_dataset.items():
+        if dataset.get(key) != expected:
+            issues.append(f"dataset {key}={dataset.get(key)!r}, expected {expected!r}")
+    source = dataset.get("source", {})
+    if (
+        source.get("checksum_valid") is not True
+        or source.get("sha256") != SIFT_SHA256
+        or source.get("expected_sha256") != SIFT_SHA256
+    ):
+        issues.append("dataset is not the checksum-pinned canonical SIFT HDF5")
+    hint = dataset.get("ground_truth_hint", {})
+    if hint.get("hdf5_neighbors_eligible") is not False:
+        issues.append("SIFT-prefix selection incorrectly permits full-base HDF5 neighbors")
+    if hint.get("method") != "faiss_index_flat_l2":
+        issues.append("SIFT-prefix exact truth is not assigned to FAISS IndexFlatL2")
+
+    truth_validation = ground_truth.get("validation", {})
+    expected_truth_shape = [profile.get("nq"), profile.get("k")]
+    if ground_truth.get("status") != "success" or ground_truth.get("exact") is not True:
+        issues.append("exact SIFT-prefix ground truth is unavailable")
+    if ground_truth.get("method") != "faiss_index_flat_l2":
+        issues.append("SIFT-prefix ground truth did not use FAISS IndexFlatL2")
+    if ground_truth.get("shape") != expected_truth_shape:
+        issues.append(
+            f"ground-truth shape {ground_truth.get('shape')!r}, expected {expected_truth_shape!r}"
+        )
+    expected_ids = int(profile.get("nq", 0)) * int(profile.get("k", 0))
+    if truth_validation.get("id_count") != expected_ids:
+        issues.append(f"ground truth does not contain exactly {expected_ids} neighbor IDs")
+    if truth_validation.get("selected_base_count") != 100_000:
+        issues.append("ground truth was not validated against the 100,000-vector prefix")
+    if truth_validation.get("source_base_count") != 1_000_000:
+        issues.append("ground truth source base count is not one million")
+    if truth_validation.get("invalid_id_count") != 0:
+        issues.append("ground truth contains invalid neighbor IDs")
+    if truth_validation.get("duplicate_row_count") != 0:
+        issues.append("ground truth contains duplicate neighbor IDs")
+
+    expected_lane_ids = {"ovvs.cagra.gpu", "hnswlib.hnsw"}
+    lane_by_id = {str(lane.get("id")): lane for lane in lanes}
+    if len(lanes) != 2 or len(lane_by_id) != 2 or set(lane_by_id) != expected_lane_ids:
+        issues.append(
+            f"preflight lanes {sorted(lane_by_id)}, expected exactly {sorted(expected_lane_ids)}"
+        )
+
+    warmups = profile.get("warmups")
+    repeats = profile.get("repeats")
+    nq = profile.get("nq")
+
+    def one_successful_point(lane_id: str, expected: dict[str, Any]) -> dict[str, Any]:
+        lane = lane_by_id.get(lane_id, {})
+        if lane.get("status") != "success":
+            issues.append(f"{lane_id} is not successful")
+        points = lane.get("points")
+        if not isinstance(points, list) or len(points) != 1:
+            issues.append(f"{lane_id} must contain exactly one point")
+            return {}
+        point = points[0]
+        if point.get("parameters") != expected:
+            issues.append(
+                f"{lane_id} parameters {point.get('parameters')!r}, expected {expected!r}"
+            )
+        if point.get("status") != "success" or point.get("validation", {}).get("status") != "success":
+            issues.append(f"{lane_id} point or neighbor validation is not successful")
+        measurement = point.get("measurement", {})
+        measurement_contract = {
+            "warmup_passes": warmups,
+            "measured_passes": repeats,
+            "query_count_per_pass": nq,
+            "query_batch_size": expected["query_batch_size"],
+        }
+        if any(measurement.get(key) != value for key, value in measurement_contract.items()):
+            issues.append(f"{lane_id} does not match the fixed preflight measurement contract")
+        pass_samples = measurement.get("pass_latency_ms", {}).get("samples")
+        qps_samples = measurement.get("qps", {}).get("samples")
+        if (
+            measurement.get("pass_latency_ms", {}).get("summary", {}).get("count") != repeats
+            or measurement.get("qps", {}).get("summary", {}).get("count") != repeats
+            or not isinstance(pass_samples, list)
+            or len(pass_samples) != repeats
+            or not isinstance(qps_samples, list)
+            or len(qps_samples) != repeats
+        ):
+            issues.append(f"{lane_id} does not contain exactly {repeats} latency and QPS samples")
+        memory = lane.get("process_memory", {})
+        peak_rss = memory.get("peak_rss_bytes")
+        if (
+            memory.get("status") != "success"
+            or type(peak_rss) is not int
+            or peak_rss <= 0
+        ):
+            issues.append(f"{lane_id} has no valid isolated-process peak RSS evidence")
+        return point
+
+    cagra_lane = lane_by_id.get("ovvs.cagra.gpu", {})
+    cagra_point = one_successful_point(
+        "ovvs.cagra.gpu", CAGRA_RECALL_GATE_POINTS["cagra"]
+    )
+    build = cagra_lane.get("build", {})
+    if (
+        cagra_lane.get("implementation") != "ovvs"
+        or cagra_lane.get("algorithm") != "cagra"
+        or cagra_lane.get("policy_key") != "gpu"
+        or cagra_lane.get("policy") != "FORCE_GPU"
+    ):
+        issues.append("ovVS preflight lane is not CAGRA FORCE_GPU search")
+    if (
+        build.get("status") != "success"
+        or build.get("requested_policy_key") != "auto"
+        or build.get("requested_policy") != "AUTO"
+        or build.get("policy_contract", {}).get("status") != "not_forced"
+        or build.get("last_device", {}).get("status") != "reported"
+        or build.get("last_device", {}).get("label") not in ("CPU", "NPU", "GPU")
+    ):
+        issues.append("ovVS CAGRA build lacks successful AUTO-policy attribution")
+    contract = cagra_point.get("policy_contract", {})
+    if (
+        contract.get("requested") != "FORCE_GPU"
+        or contract.get("conforming") is not True
+        or contract.get("reported_last_primitive_devices") != ["GPU"]
+    ):
+        issues.append("ovVS CAGRA search lacks conforming FORCE_GPU attribution")
+    transfer = cagra_point.get("cagra_transfer", {})
+    delta = transfer.get("delta", {})
+    batch_size = CAGRA_RECALL_GATE_POINTS["cagra"]["query_batch_size"]
+    expected_walks = (
+        ((int(nq) + batch_size - 1) // batch_size) * (int(warmups) + int(repeats))
+        if isinstance(nq, int) and isinstance(warmups, int) and isinstance(repeats, int)
+        else None
+    )
+    if (
+        transfer.get("status") != "success"
+        or transfer.get("contract", {}).get("conforming") is not True
+        or not all(
+            type(delta.get(key)) is int
+            for key in ("walks", "direct_walks", "index_upload_calls", "index_upload_bytes")
+        )
+        or delta.get("walks") != expected_walks
+        or delta.get("direct_walks") != expected_walks
+        or delta.get("index_upload_calls") != 0
+        or delta.get("index_upload_bytes") != 0
+    ):
+        issues.append(
+            "ovVS CAGRA search lacks the derived direct zero-upload transfer delta "
+            f"{expected_walks}/{expected_walks}/0/0"
+        )
+    attribution = cagra_point.get("device_attribution", {})
+    if (
+        attribution.get("search_calls") != expected_walks
+        or attribution.get("successful_observations") != expected_walks
+        or attribution.get("failures") != 0
+    ):
+        issues.append(
+            "ovVS CAGRA search lacks exact device attribution for all "
+            f"{expected_walks} walk calls"
+        )
+
+    hnsw_lane = lane_by_id.get("hnswlib.hnsw", {})
+    hnsw_point = one_successful_point(
+        "hnswlib.hnsw", CAGRA_RECALL_GATE_POINTS["hnsw"]
+    )
+    hnsw_metadata = hnsw_lane.get("implementation_metadata", {})
+    if hnsw_lane.get("implementation") != "hnswlib" or hnsw_lane.get("algorithm") != "hnsw":
+        issues.append("comparator preflight lane is not hnswlib HNSW")
+    if hnsw_lane.get("build", {}).get("status") != "success":
+        issues.append("hnswlib build is not successful")
+    if (
+        type(hnsw_threads) is not int
+        or hnsw_threads <= 0
+        or hnsw_metadata.get("threading") != "explicit"
+        or hnsw_metadata.get("num_threads") != hnsw_threads
+    ):
+        issues.append("hnswlib thread count was not pinned and recorded")
+    if (
+        hnsw_metadata.get("M") != 16
+        or hnsw_metadata.get("ef_construction") != 200
+        or hnsw_metadata.get("random_seed") != 7
+    ):
+        issues.append("hnswlib construction did not use M=16, ef_construction=200, seed=7")
+
+    for lane_id, lane in (
+        ("ovvs.cagra.gpu", cagra_lane),
+        ("hnswlib.hnsw", hnsw_lane),
+    ):
+        build_ms = lane.get("build", {}).get("elapsed_ms")
+        elapsed_ms = lane.get("elapsed_ms")
+        if (
+            not isinstance(build_ms, (int, float))
+            or not math.isfinite(float(build_ms))
+            or build_ms <= 0
+        ):
+            issues.append(f"{lane_id} has no valid positive build-wall measurement")
+        if (
+            not isinstance(elapsed_ms, (int, float))
+            or not math.isfinite(float(elapsed_ms))
+            or elapsed_ms <= 0
+        ):
+            issues.append(f"{lane_id} has no valid positive lane-wall measurement")
+
+    def metric(point: dict[str, Any], path: Sequence[str]) -> float | None:
+        value: Any = point
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        return (
+            float(value)
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+            else None
+        )
+
+    cagra_recall = metric(cagra_point, ("recall", "value"))
+    hnsw_recall = metric(hnsw_point, ("recall", "value"))
+    for lane_id, value in (
+        ("ovvs.cagra.gpu", cagra_recall),
+        ("hnswlib.hnsw", hnsw_recall),
+    ):
+        if value is None or not 0 <= value <= 1:
+            issues.append(f"{lane_id} has no valid recall result")
+    cagra_qps = metric(cagra_point, ("measurement", "qps", "summary", "median"))
+    hnsw_qps = metric(hnsw_point, ("measurement", "qps", "summary", "median"))
+    for lane_id, value in (
+        ("ovvs.cagra.gpu", cagra_qps),
+        ("hnswlib.hnsw", hnsw_qps),
+    ):
+        if value is None or value <= 0:
+            issues.append(f"{lane_id} has no valid positive median QPS")
+
+    observed_statuses = {lane.get("status") for lane in lanes}
+    truth_status = ground_truth.get("status")
+    if not issues:
+        status = "complete"
+    elif truth_status == "timeout":
+        status = "timeout"
+    elif truth_status == "failed":
+        status = "failed"
+    elif dataset.get("status") == "unavailable" or truth_status == "unavailable" or "unavailable" in observed_statuses or "skipped" in observed_statuses:
+        status = "unavailable"
+    elif "timeout" in observed_statuses:
+        status = "timeout"
+    elif "failed" in observed_statuses:
+        status = "failed"
+    else:
+        status = "invalid"
+
+    def lane_scalar(lane: dict[str, Any], *path: str) -> float | int | None:
+        value: Any = lane
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        return value if isinstance(value, (int, float)) and math.isfinite(float(value)) else None
+
+    recall_gap = (
+        hnsw_recall - cagra_recall
+        if cagra_recall is not None and hnsw_recall is not None
+        else None
+    )
+    return {
+        "id": CAGRA_SIFT100K_PREFLIGHT,
+        "status": status,
+        "completed": status == "complete",
+        "canonical": False,
+        "scope": "intermediate_scale_runtime_memory_and_quality_diagnostic",
+        "verdict_metric": "contract_validity_only",
+        "recall": {
+            "cagra": cagra_recall,
+            "hnswlib": hnsw_recall,
+            "hnswlib_minus_cagra": recall_gap,
+            "used_for_verdict": False,
+        },
+        "qps_median": {
+            "cagra": cagra_qps,
+            "hnswlib": hnsw_qps,
+            "used_for_verdict": False,
+        },
+        "build_ms": {
+            "cagra": lane_scalar(cagra_lane, "build", "elapsed_ms"),
+            "hnswlib": lane_scalar(hnsw_lane, "build", "elapsed_ms"),
+        },
+        "lane_elapsed_ms": {
+            "cagra": lane_scalar(cagra_lane, "elapsed_ms"),
+            "hnswlib": lane_scalar(hnsw_lane, "elapsed_ms"),
+        },
+        "peak_rss_bytes": {
+            "cagra": lane_scalar(cagra_lane, "process_memory", "peak_rss_bytes"),
+            "hnswlib": lane_scalar(hnsw_lane, "process_memory", "peak_rss_bytes"),
+            "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+        },
+        "expected_cagra_transfer_delta": {
+            "walks": expected_walks,
+            "direct_walks": expected_walks,
+            "index_upload_calls": 0,
+            "index_upload_bytes": 0,
+        },
+        "hnswlib_threads": hnsw_threads,
+        "effective_settings": {**expected_profile, "seed": 7},
+        "full_sift1m_gate_required": True,
+        "validation": {"status": "success" if not issues else "failed", "issues": issues},
+    }
+
+
 def point_failure_reason(points: Sequence[dict[str, Any]]) -> str | None:
     failures: list[str] = []
     for point in points:
@@ -1190,6 +1553,15 @@ def render_markdown(artifact: dict[str, Any]) -> str:
             f"- Quality gate: **{gate['status']}**; noncanonical single-point checkpoint",
             f"- Recall: CAGRA={format_number(gate['recall']['cagra'], 4)}, hnswlib={format_number(gate['recall']['hnswlib'], 4)}, gap={format_number(gate['recall']['hnswlib_minus_cagra'], 4)} (maximum 0.0200)",
             f"- QPS median (reported, not part of verdict): CAGRA={format_number(gate['qps_median']['cagra'], 1)}, hnswlib={format_number(gate['qps_median']['hnswlib'], 1)}",
+        ]
+    preflight = artifact.get("preflight")
+    if preflight:
+        lines[8:8] = [
+            f"- Preflight: **{preflight['status']}**; noncanonical intermediate-scale diagnostic",
+            f"- Recall (reported, not a verdict): CAGRA={format_number(preflight['recall']['cagra'], 4)}, hnswlib={format_number(preflight['recall']['hnswlib'], 4)}, gap={format_number(preflight['recall']['hnswlib_minus_cagra'], 4)}",
+            f"- QPS median (reported, not a verdict): CAGRA={format_number(preflight['qps_median']['cagra'], 1)}, hnswlib={format_number(preflight['qps_median']['hnswlib'], 1)}",
+            f"- Isolated-process peak RSS bytes: CAGRA={preflight['peak_rss_bytes']['cagra'] or '—'}, hnswlib={preflight['peak_rss_bytes']['hnswlib'] or '—'}",
+            "- The full SIFT1M quality gate remains required.",
         ]
     for lane in artifact["lanes"]:
         build = lane.get("build", {})

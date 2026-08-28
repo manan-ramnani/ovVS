@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -32,6 +34,66 @@ from _common import (
 
 def exception_point_status(exc: Exception) -> str:
     return "unavailable" if getattr(exc, "status", None) == 7 else "failed"
+
+
+def process_peak_rss() -> dict[str, Any]:
+    """Return peak RSS for this isolated worker using platform-native counters."""
+
+    try:
+        if sys.platform.startswith("win"):
+            from ctypes import wintypes
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ProcessMemoryCounters),
+                wintypes.DWORD,
+            ]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            if not psapi.GetProcessMemoryInfo(
+                kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+            ):
+                raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+            peak_bytes = int(counters.PeakWorkingSetSize)
+            source = "GetProcessMemoryInfo.PeakWorkingSetSize"
+        else:
+            import resource
+
+            peak_native = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            peak_bytes = peak_native if sys.platform == "darwin" else peak_native * 1024
+            source = "getrusage.RUSAGE_SELF.ru_maxrss"
+        if peak_bytes <= 0:
+            raise RuntimeError("platform peak RSS counter returned a non-positive value")
+        return {
+            "status": "success",
+            "peak_rss_bytes": peak_bytes,
+            "source": source,
+            "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"peak RSS unavailable: {type(exc).__name__}: {exc}",
+            "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+        }
 
 
 def compute_ground_truth(spec: dict[str, Any]) -> dict[str, Any]:
@@ -97,9 +159,15 @@ def compute_ground_truth(spec: dict[str, Any]) -> dict[str, Any]:
         labels.append(ids)
     truth = np.concatenate(labels).astype(np.int64, copy=False)
     search_ms = (time.perf_counter() - search_started) * 1_000
+    expected_shape = (int(dataset["nq"]), int(profile["k"]))
+    if tuple(truth.shape) != expected_shape:
+        raise RuntimeError(f"FAISS exact ground-truth shape {tuple(truth.shape)} != {expected_shape}")
     bad = int(np.count_nonzero((truth < 0) | (truth >= dataset["n"])))
     if bad:
         raise RuntimeError(f"FAISS exact ground truth contains {bad} invalid IDs")
+    duplicate_rows = sum(len(set(int(value) for value in row)) != profile["k"] for row in truth)
+    if duplicate_rows:
+        raise RuntimeError(f"FAISS exact ground truth contains duplicate IDs in {duplicate_rows} rows")
     np.save(truth_path, truth, allow_pickle=False)
     return {
         "status": "success",
@@ -107,6 +175,15 @@ def compute_ground_truth(spec: dict[str, Any]) -> dict[str, Any]:
         "exact": True,
         "faiss_version": package_version("faiss-cpu") or getattr(faiss, "__version__", None),
         "shape": list(truth.shape),
+        "validation": {
+            "complete_base_selected": dataset["n"] == dataset.get("source_n"),
+            "selected_base_count": int(dataset["n"]),
+            "source_base_count": int(dataset.get("source_n", dataset["n"])),
+            "query_prefix_selected": True,
+            "id_count": int(truth.size),
+            "invalid_id_count": bad,
+            "duplicate_row_count": duplicate_rows,
+        },
         "build_ms": build_ms,
         "search_ms": search_ms,
         "elapsed_ms": (time.perf_counter() - started) * 1_000,
@@ -308,8 +385,9 @@ def _ovvs_search(index: Any, algorithm: str, point: dict[str, Any], k: int):
 def _selected_points(spec: dict[str, Any], algorithm: str) -> list[dict[str, Any]]:
     selection = spec.get("point_selection", {}).get(algorithm)
     points = point_parameters(spec["profile"], algorithm, selection)
-    if spec.get("gate_only") and len(points) != 1:
-        raise ValueError(f"gate-only {algorithm} selector produced {len(points)} points, expected 1")
+    fixed_mode = spec.get("gate_only") or spec.get("preflight_only")
+    if fixed_mode and len(points) != 1:
+        raise ValueError(f"fixed-mode {algorithm} selector produced {len(points)} points, expected 1")
     return points
 
 
@@ -381,6 +459,8 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                 point["krefine"] = spec["profile"]["krefine"]
             raw_search = _ovvs_search(index, lane["algorithm"], point, spec["profile"]["k"])
             observed: list[int] = []
+            attribution_failures = 0
+            search_calls = 0
             transfer_before = (
                 _cagra_transfer_snapshot(module, resources)
                 if lane["algorithm"] == "cagra"
@@ -388,11 +468,13 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
             )
 
             def search(batch: Any):
+                nonlocal attribution_failures, search_calls
                 result = raw_search(batch)
+                search_calls += 1
                 try:
                     observed.append(resources.last_device())
                 except Exception:
-                    pass
+                    attribution_failures += 1
                 return result
 
             try:
@@ -432,6 +514,11 @@ def run_ovvs(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                     "validation": validation,
                     "energy": energy,
                     "policy_contract": contract,
+                    "device_attribution": {
+                        "search_calls": search_calls,
+                        "successful_observations": len(observed),
+                        "failures": attribution_failures,
+                    },
                     "reason": "; ".join(validation["issues"])
                     or (contract.get("reason") if status == "failed" else None),
                 }
@@ -512,7 +599,9 @@ def run_faiss(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     build_started = time.perf_counter()
     index = _faiss_index(faiss, lane["algorithm"], base, spec["dataset"]["dim"], spec["profile"])
     build_ms = (time.perf_counter() - build_started) * 1_000
-    reader, energy_resources = _optional_energy_reader(spec.get("library"))
+    reader, energy_resources = (
+        _optional_energy_reader(spec.get("library")) if spec.get("energy") else (None, None)
+    )
     points: list[dict[str, Any]] = []
     try:
         for point in _selected_points(spec, lane["algorithm"]):
@@ -600,7 +689,9 @@ def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     else:
         index.add_items(base, np.arange(spec["dataset"]["n"], dtype=np.int64))
     build_ms = (time.perf_counter() - build_started) * 1_000
-    reader, energy_resources = _optional_energy_reader(spec.get("library"))
+    reader, energy_resources = (
+        _optional_energy_reader(spec.get("library")) if spec.get("energy") else (None, None)
+    )
     points: list[dict[str, Any]] = []
     try:
         for point in _selected_points(spec, "hnsw"):

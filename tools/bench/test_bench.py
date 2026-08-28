@@ -13,14 +13,16 @@ import numpy as np
 import bench
 import _common
 import _worker
-from _worker import _cagra_transfer_evidence, exception_point_status
+from _worker import _cagra_transfer_evidence, exception_point_status, process_peak_rss
 from _common import (
     ALGORITHM_ORDER,
     CAGRA_RECALL_GATE_POINTS,
+    CAGRA_SIFT100K_PREFLIGHT,
     POLICY_ORDER,
     ROOT,
     SIFT_SHA256,
     cagra_recall_gate_result,
+    cagra_sift100k_preflight_result,
     completion_issues,
     default_output_path,
     duplicate_safe_recall,
@@ -158,6 +160,72 @@ def gate_lanes(cagra_recall: float = 0.88, hnsw_recall: float = 0.90,
         "num_threads": threads,
     }
     return [cagra, hnsw]
+
+
+def preflight_dataset() -> dict:
+    return {
+        "status": "success",
+        "kind": "sift_prefix",
+        "n": 100_000,
+        "source_n": 1_000_000,
+        "dim": 128,
+        "nq": 1_000,
+        "source_nq": 10_000,
+        "metric": "squared_l2",
+        "source": {
+            "checksum_valid": True,
+            "sha256": SIFT_SHA256,
+            "expected_sha256": SIFT_SHA256,
+        },
+        "ground_truth_hint": {
+            "method": "faiss_index_flat_l2",
+            "hdf5_neighbors_eligible": False,
+        },
+    }
+
+
+def preflight_truth() -> dict:
+    return {
+        "status": "success",
+        "method": "faiss_index_flat_l2",
+        "exact": True,
+        "shape": [1_000, 10],
+        "validation": {
+            "selected_base_count": 100_000,
+            "source_base_count": 1_000_000,
+            "id_count": 10_000,
+            "invalid_id_count": 0,
+            "duplicate_row_count": 0,
+        },
+    }
+
+
+def preflight_lanes(cagra_recall: float = 0.40, hnsw_recall: float = 0.88,
+                    walks: int = 192, threads: int = 20) -> list[dict]:
+    lanes = gate_lanes(cagra_recall, hnsw_recall, walks, threads)
+    measurement = {
+        "warmup_passes": 1,
+        "measured_passes": 5,
+        "query_count_per_pass": 1_000,
+        "query_batch_size": 32,
+        "pass_latency_ms": {"samples": [1.0] * 5, "summary": {"count": 5}},
+        "qps": {"samples": [100.0] * 5, "summary": {"count": 5, "median": 100.0}},
+    }
+    for lane in lanes:
+        lane["elapsed_ms"] = 2.0
+        lane["process_memory"] = {
+            "status": "success",
+            "peak_rss_bytes": 64 * 1024 * 1024,
+            "source": "test",
+            "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+        }
+        lane["points"][0]["measurement"] = json.loads(json.dumps(measurement))
+    lanes[0]["points"][0]["device_attribution"] = {
+        "search_calls": walks,
+        "successful_observations": walks,
+        "failures": 0,
+    }
+    return lanes
 
 
 class PureHelperTests(unittest.TestCase):
@@ -307,6 +375,75 @@ class PureHelperTests(unittest.TestCase):
         for status in ("fail", "invalid", "unavailable", None):
             self.assertEqual(bench.gate_exit_code({"quality_gate": {"status": status}}), 3)
 
+    def test_sift_100k_preflight_is_completion_not_recall_verdict(self) -> None:
+        result = cagra_sift100k_preflight_result(
+            preflight_dataset(), preflight_truth(), resolved_profile("sift-100k"),
+            preflight_lanes(cagra_recall=0.40, hnsw_recall=0.88), 20,
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["recall"]["used_for_verdict"])
+        self.assertAlmostEqual(result["recall"]["hnswlib_minus_cagra"], 0.48)
+        self.assertEqual(result["expected_cagra_transfer_delta"]["walks"], 192)
+
+    def test_sift_100k_preflight_rejects_missing_memory_and_wrong_transfer(self) -> None:
+        lanes = preflight_lanes(walks=191)
+        lanes[1]["process_memory"] = {"status": "unavailable"}
+        result = cagra_sift100k_preflight_result(
+            preflight_dataset(), preflight_truth(), resolved_profile("sift-100k"), lanes, 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("192/192/0/0" in issue for issue in result["validation"]["issues"]))
+        self.assertTrue(any("peak RSS" in issue for issue in result["validation"]["issues"]))
+
+    def test_sift_100k_preflight_requires_every_device_attribution(self) -> None:
+        lanes = preflight_lanes()
+        lanes[0]["points"][0]["device_attribution"] = {
+            "search_calls": 192,
+            "successful_observations": 191,
+            "failures": 1,
+        }
+        result = cagra_sift100k_preflight_result(
+            preflight_dataset(), preflight_truth(), resolved_profile("sift-100k"), lanes, 20
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("all 192 walk calls" in issue
+                            for issue in result["validation"]["issues"]))
+
+    def test_sift_100k_preflight_propagates_truth_terminal_status(self) -> None:
+        for truth_status in ("timeout", "failed"):
+            with self.subTest(truth_status=truth_status):
+                truth = preflight_truth()
+                truth["status"] = truth_status
+                result = cagra_sift100k_preflight_result(
+                    preflight_dataset(), truth, resolved_profile("sift-100k"),
+                    preflight_lanes(), 20,
+                )
+                self.assertEqual(result["status"], truth_status)
+
+    def test_preflight_exit_code_requires_complete_contract(self) -> None:
+        self.assertEqual(bench.preflight_exit_code({"preflight": {"status": "complete"}}), 0)
+        for status in ("invalid", "unavailable", "timeout", "failed", None):
+            self.assertEqual(bench.preflight_exit_code({"preflight": {"status": status}}), 3)
+
+    def test_peak_rss_uses_platform_counter(self) -> None:
+        result = process_peak_rss()
+        self.assertEqual(result["status"], "success")
+        self.assertGreater(result["peak_rss_bytes"], 0)
+
+    def test_unix_peak_rss_normalizes_kib_to_bytes(self) -> None:
+        fake_resource = SimpleNamespace(
+            RUSAGE_SELF=0,
+            getrusage=lambda _scope: SimpleNamespace(ru_maxrss=123),
+        )
+        with (
+            patch.object(_worker.sys, "platform", "linux"),
+            patch.dict(sys.modules, {"resource": fake_resource}),
+        ):
+            result = process_peak_rss()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["peak_rss_bytes"], 123 * 1024)
+
     def test_hash_helper_is_content_stable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "fixture.bin"
@@ -392,6 +529,58 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertLessEqual(profile["timeout_seconds"], 30)
         self.assertGreaterEqual(profile["repeats"], 2)
         self.assertEqual(args.build_policy, "auto")
+
+    def test_sift_100k_profile_is_bounded_preflight(self) -> None:
+        profile = resolved_profile("sift-100k")
+        self.assertEqual((profile["expected_n"], profile["expected_dim"], profile["nq"]),
+                         (100_000, 128, 1_000))
+        self.assertEqual(profile["graph_degree"], 16)
+        self.assertEqual(profile["intermediate_degree"], 32)
+        self.assertEqual(len(profile["cagra_points"]), 2)
+        self.assertLess(profile["timeout_seconds"], resolved_profile("sift1m")["timeout_seconds"])
+
+    def test_sift_100k_preflight_normalizes_conflicting_selection(self) -> None:
+        args = bench.build_parser().parse_args(
+            [
+                "--preflight-only", CAGRA_SIFT100K_PREFLIGHT,
+                "--profile", "smoke",
+                "--algorithms", "brute",
+                "--policies", "cpu",
+                "--build-policy", "gpu",
+                "--warmups", "9",
+                "--repeats", "9",
+                "--seed", "99",
+                "--timeout-seconds", "1200",
+            ]
+        )
+        with patch.object(bench.os, "cpu_count", return_value=20):
+            bench.normalize_preflight_configuration(args)
+        self.assertEqual(args.profile, "sift-100k")
+        self.assertEqual(args.algorithms, "cagra")
+        self.assertEqual(args.policies, "gpu")
+        self.assertEqual(args.build_policy, "auto")
+        self.assertEqual((args.warmups, args.repeats, args.seed), (1, 5, 7))
+        self.assertEqual(args.timeout_seconds, 1200)
+        self.assertEqual(args.hnsw_threads, 20)
+        self.assertTrue(args.no_energy)
+        self.assertTrue(args.allow_unscalable_cagra)
+
+    def test_sift_100k_missing_fixture_has_no_synthetic_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            result = prepare_dataset(
+                SimpleNamespace(
+                    profile="sift-100k",
+                    base=None,
+                    queries=None,
+                    sift=str(directory / "missing.hdf5"),
+                    seed=7,
+                ),
+                resolved_profile("sift-100k"),
+                directory,
+            )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("SIFT HDF5 is absent", result["reason"])
 
     def test_default_artifact_is_in_ignored_out_tree(self) -> None:
         path = default_output_path("smoke", "2026-08-28T01:02:03Z")
@@ -611,6 +800,58 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertNotIn("base_path", artifact["dataset"])
         self.assertNotIn("query_path", artifact["dataset"])
         self.assertEqual(artifact["dataset"]["runtime_storage"], "ephemeral_files_deleted_after_run")
+
+    def test_sift_100k_artifact_is_always_noncanonical(self) -> None:
+        artifact = bench._artifact(
+            SimpleNamespace(
+                profile="sift-100k",
+                gate_only=None,
+                hnsw_threads=20,
+                build_policy="auto",
+                no_energy=False,
+                allow_partial=True,
+            ),
+            resolved_profile("sift-100k"),
+            ["cagra"],
+            ["gpu"],
+            {"status": "success", "kind": "sift_prefix", "n": 100_000, "dim": 128, "nq": 1_000},
+            {"status": "success", "exact": True},
+            [successful_lane()],
+            "2026-08-28T00:00:00Z",
+        )
+        self.assertEqual(artifact["completion"]["status"], "partial")
+        self.assertTrue(any("noncanonical prefix preflight" in issue
+                            for issue in artifact["completion"]["issues"]))
+        self.assertFalse(artifact["selection"]["canonical"])
+        self.assertFalse(artifact["completion"]["canonical_b1_evidence"])
+        self.assertFalse(artifact["completion"]["full_profile_strict"])
+
+    def test_completed_sift_100k_preflight_artifact_stays_partial(self) -> None:
+        artifact = bench._artifact(
+            SimpleNamespace(
+                profile="sift-100k",
+                gate_only=None,
+                preflight_only=CAGRA_SIFT100K_PREFLIGHT,
+                hnsw_threads=20,
+                build_policy="auto",
+                no_energy=True,
+                allow_partial=False,
+                seed=7,
+            ),
+            resolved_profile("sift-100k"),
+            ["cagra"],
+            ["gpu"],
+            preflight_dataset(),
+            preflight_truth(),
+            preflight_lanes(),
+            "2026-08-28T00:00:00Z",
+        )
+        self.assertEqual(artifact["preflight"]["status"], "complete")
+        self.assertEqual(artifact["completion"]["status"], "partial")
+        self.assertNotIn("quality_gate", artifact)
+        markdown = _common.render_markdown(artifact)
+        self.assertIn("Recall (reported, not a verdict)", markdown)
+        self.assertIn("full SIFT1M quality gate remains required", markdown)
 
     def test_gate_artifact_is_partial_noncanonical_even_when_gate_passes(self) -> None:
         artifact = bench._artifact(
@@ -939,6 +1180,10 @@ class OvvsBuildPolicyTests(unittest.TestCase):
         self.assertEqual(transfer["delta"]["direct_walks"], 3)
         self.assertEqual(transfer["delta"]["index_upload_calls"], 0)
         self.assertEqual(transfer["delta"]["index_upload_bytes"], 0)
+        self.assertEqual(
+            result["points"][0]["device_attribution"],
+            {"search_calls": 3, "successful_observations": 3, "failures": 0},
+        )
 
     def test_failed_cagra_point_preserves_partial_transfer_delta(self) -> None:
         resources = self.FakeResources()
