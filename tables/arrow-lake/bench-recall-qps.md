@@ -13,7 +13,7 @@ Commit `93e688b`; pinned full SIFT1M (`n=1,000,000`, `dim=128`, `nq=1,000`, `k=1
 | ovVS CAGRA | 0.4057 | 830.0 s; final primitive CPU | 1,549.7 | FORCE_GPU search; valid finite unique output; `192/192/0/0` transfer |
 | hnswlib | 0.8903 | 61.7 s | 10,568.7 | valid finite unique output |
 
-The quality gate **failed**: `0.8903 - 0.4057 = 0.4846`, versus a maximum allowed absolute gap of 0.0200. Exact truth was 1,000×10 with 10,000 valid, duplicate-free IDs. Both lanes succeeded; ovVS recorded zero NPU fallbacks and no explicit dataset/graph uploads. This is a valid algorithm-quality failure, not a fixture, policy, or transfer failure.
+The quality gate **failed**: `0.8903 - 0.4057 = 0.4846`, versus a maximum allowed absolute gap of 0.0200. Exact truth was 1,000×10 with 10,000 valid, duplicate-free IDs against the full 1M-vector index. Both lanes succeeded; ovVS recorded zero NPU fallbacks and no explicit dataset/graph uploads. This is a valid algorithm-quality failure, not a fixture, policy, or transfer failure. It predates the query-content seed fix and host detour-rank optimizer and has not been rerun, so it remains the latest measured failure rather than a current-code recall claim.
 
 The timing columns are diagnostic only. Preflight sampled about 62.7% unrelated iGPU 3D load (WUDFHost, ChatGPT, and DWM), so neither QPS nor build wall is a publishable isolated-performance baseline. The recall gap is far from the threshold; the near-boundary hnswlib rerun rule did not apply. The artifact remains intentionally partial because this single pair omits the full curves and package energy.
 

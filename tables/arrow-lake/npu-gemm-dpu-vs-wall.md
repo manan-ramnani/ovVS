@@ -32,7 +32,7 @@ CPU f32 64×64×32 was 0.016 ms in `gemm.json`. NPU DPU is in the same µs band;
 | 1e5×32×768 f16 | NPU C API | 39 / 42 |
 | 1e5×32×768 i8 FQ | NPU C API | 231 / 223 |
 
-Fingerprint-sticky skips host memcpy of unchanged ≥64 KiB operands. The remaining NPU wall vs DPU is **device DMA of the Parameter into SRAM**, not a second plugin copy. oneMKL `cblas_sgemm` reads the same DRAM faster than that DMA. AUTO GEMM is CPU on this SKU. Closing the DPU gap needs weights that already live in NPU SRAM (compiled Constant that does not regress wall, or `create_l0_host_tensor` as tensor home).
+Fingerprint-sticky skips host memcpy of unchanged ≥64 KiB operands. The remaining NPU wall vs DPU is **device DMA of the Parameter into SRAM**, not a second plugin copy. oneMKL `cblas_sgemm` reads the same DRAM faster than that DMA. AUTO GEMM is CPU on this SKU. The installed OpenVINO 2025.3 headers expose `create_l0_host_tensor`, but remote host memory may only change application copies, buffer ownership, or cold-path cost; it does not make a large operand scratchpad-resident or prove a steady-state wall reduction. B7 must measure those effects separately. A compiled Constant also remains rejected unless end-to-end wall improves.
 
 SRAM on this NPU is **4 MB**. `1e5×768` f16 is ~150 MB, so the big operand never lives in scratchpad. `2000×128` f16 is ~0.5 MB and would fit; we still pay SHAVE/L0 to get it there every infer unless it is a compiled Constant, and Constant-B made **wall** worse on 64 and 256 even though DPU got 5–10× faster.
 

@@ -83,16 +83,17 @@ Arrow Lake dense GEMM is an AVX-512 / AMX problem that oneMKL already owns. Ship
 6. Compile: `NPU_TURBO`, `PERFORMANCE_HINT=LATENCY`, `optimization-level=2 performance-hint-override=latency`.
 7. Fail closed when conservative GEMM/TopK bounds or outputs reach FP16 range (65,504); scaled execution is not implemented yet.
 
-Remaining NPU gap: cold wall vs DPU (`54 ms` vs `5.3 ms` on 1e5×32×768) is the first memcpy of A into L0. Closing it means the **canonical dataset lives in an NPU L0 tensor** (remote `create_l0_host_tensor`), not a second copy. Unsigned SHAVE ELF inject is still unsupported; ActShave already runs inside compiler graphs.
+Remaining NPU gap: after fingerprint-sticky inputs skip the hot host memcpy, wall still remains about `45–54 ms` versus `5.3 ms` of profiled DPU work on 1e5×32×768. The remaining cost is principally device DMA/tile movement into a 4 MB scratchpad; a roughly 150 MB f16 operand cannot remain resident there. A canonical remote L0 tensor may reduce application copies, duplicate request buffers, or cold-path ownership cost, but it does not by itself prove lower steady-state DMA or wall time. Unsigned SHAVE ELF inject is still unsupported; ActShave already runs inside compiler graphs.
 
-### OpenVINO 2026 opportunities (not measured in ovVS)
+### Runtime opportunities and boundaries (not measured in ovVS)
 
-The current measured Windows build links OpenVINO **2025.3.0**. OpenVINO 2026 documentation therefore defines upgrade experiments, not current capability or performance:
+The current measured Windows build links OpenVINO **2025.3.0** with Intel NPU driver **32.0.100.4841**. Its installed headers already expose NPU `ZeroContext`, `create_l0_host_tensor`, shared native-buffer wrapping, and mapped-file tensors. OpenVINO 2026 adds broader documented paths such as CPU virtual-address import and optional strided IO. All remain experiments until ovVS probes and measures them:
 
-- NPU `RemoteContext` / `RemoteTensor` can wrap or allocate Level Zero-accessible memory, including `create_l0_host_tensor`, native handles, mapped files, and CPU virtual addresses. B7 must first upgrade in an isolated build, query runtime/driver support, then compare bytes copied and end-to-end wall against the current request-owned `get_input_tensor` path.
+- Start B7 on the current stack: compile a minimal `create_l0_host_tensor`/shared-buffer probe, bind it to a compiled request, validate lifetime and correctness, then compare allocated bytes, application copies, cold wall, and hot wall against the current request-owned `get_input_tensor` path. Upgrade in an isolated build only for capabilities absent from 2025.3. A remote tensor is not evidence that the NPU scratchpad retains the full index between inferences.
 - Optional strided NPU IO can avoid repacking non-contiguous buffers, but only when `ov::supported_properties` advertises it. Test packed IVF list/code layouts; do not enable all ports by default because the device docs warn of a performance cost.
 - OpenVINO model caching is already enabled through `CACHE_DIR`. An explicit exported blob is useful only if measured startup/import improves and the cache key records OpenVINO, compiler, driver, device, shape, dtype, and compile properties. It does not improve steady-state inference by itself.
-- The NPU plugin exposes one optimal request in latency mode and four in throughput mode. A small reusable request pool plus `start_async` is a B6 experiment for independent ADC tiles; the current single cached request and mutex deliberately serialize a shape. Measure queueing, overlap, energy, and tail latency before retaining a pool.
+- The current NPU plugin reports one optimal request in latency mode and four in throughput mode. A small reusable request pool plus `start_async` is immediately testable for independent ADC tiles; the current single cached request and mutex deliberately serialize a shape. This is a primitive concurrency experiment, not a HETERO pipeline claim. Measure queueing, overlap, energy, and tail latency before retaining a pool.
+- The in-process request map is currently unbounded and keyed by exact operation/shape/dtype strings, not every compile property. Before adding throughput variants, bound its residency and key by performance mode plus effective compile properties. `compile_on` also retries after removing optimization parameters and then turbo; expose the effective property set and fallback counter instead of silently benchmarking a weakened compile.
 - An OpenVINO custom `ov::Op` supplies graph semantics, shape inference, serialization, and optional CPU evaluation. It does **not** provide a public NPU kernel implementation. GPU custom operations separately require OpenCL kernel code; ovVS keeps ANN hot loops in SYCL and the compiler/SHAVE track rather than treating `add_extension` as NPU support.
 
 The archived Intel NPU Acceleration Library is reference material only; Intel directs users to OpenVINO/OpenVINO GenAI. Its useful confirmation is architectural: static/tiled graphs, managed DMA/cache, and quantized/mixed-precision paths. ovVS will not add it as a dependency. From OpenVINO GenAI, only the bounded scheduler, persistent compiled state, and explicit performance telemetry generalize. Token/KV/prefix caches, paged attention, and speculative decoding are LLM-specific and are not ANN index techniques.
@@ -118,11 +119,12 @@ AUTO:
 
 `FORCE_NPU` / `FORCE_GPU` still hit that device or return `DEVICE_UNAVAILABLE`. CPU is never reported as an NPU/GPU win.
 
-## Hetero (NPU ∥ iGPU)
+## Hetero stage DAG (NPU ∥ iGPU)
 
 Not a third GEMM backend. It is **stage overlap**:
 
-- Independent queries in a batch: NPU can score query *i+1* while iGPU walks query *i* (CAGRA). Not wired yet; `OVVS_POLICY_HETERO` currently equals AUTO (backlog B6, `.claude/backlog.md`).
+- `OVVS_POLICY_HETERO` currently equals AUTO. `prim_pq_adc` is an IVF-PQ stage and `prim_graph_walk` is a CAGRA stage; merely running them concurrently would mix algorithms rather than form a same-query pipeline.
+- Define the producer/consumer DAG, data ownership, and event dependencies before implementation. The first concrete candidate is NPU ADC tile *i+1* while iGPU scans/selects IVF-PQ tile *i* after B3. A CAGRA candidate-slab scoring pipeline is a later candidate after B9.
 - Use bounded queues and reusable device requests/events. Report per-stage execution, queue wait, copied bytes, and overlap; a faster isolated NPU primitive is not a hetero win unless total query wall or energy improves.
 - Do not ping-pong the same buffer NPU↔iGPU inside one stage. Scores stay host-visible USM; TopK is CPU.
 
