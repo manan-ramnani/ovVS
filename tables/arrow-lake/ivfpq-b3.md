@@ -1,8 +1,8 @@
 # Arrow Lake IVF-PQ B3 evidence
 
-Status: **correctness guarded; persistent storage, synchronous fixed buckets, and a forced affine-range lane complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
+Status: **correctness guarded; persistent storage, synchronous fixed buckets, forced affine-range execution, and shortlist-only unfiltered ID resolution complete; throughput and end-to-end competitor gates open**. Hardware is the repository's Core Ultra 7 265K with OpenVINO 2025.3.0 and NPU driver 32.0.100.4841. No BIOS or firmware setting was changed.
 
-The current clean-code artifacts are `out/bench/ivfpq-b3-batched-sift-postcommit-r1.json` through `r3.json`, with sibling Markdown files. Earlier baseline, guarded, and packed artifacts remain local negative history. Every run is overall **partial** because the forced-NPU end-to-end lane is explicitly unavailable at `nprobe=2/8`; that lane is retained rather than filtered. The ignored baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
+The latest matched clean-code artifacts are `out/bench/ivfpq-idmap-baseline-r1.json` through `r3.json` at `f4336a7` and `out/bench/ivfpq-idmap-clean-r1.json` through `r3.json` at `4e0bf87`. Earlier guarded, packed, and fixed-bucket artifacts remain local history. The latest runs are complete for AUTO, FORCE_CPU, and FAISS; energy was disabled. The ignored earliest baseline artifact predates the fixture-label correction and says `float32_normalized_on_load`; the loader only cast raw SIFT values. Later artifacts emit the corrected `float32_cast_on_load` label.
 
 ## Numeric defect and correction
 
@@ -52,7 +52,7 @@ Three repeated pre-batching smokes retained recall 0.6375 and 0.946875 at `nprob
 | AUTO | 12,910.5 (12,381.5–13,015.5) | 3,479.1 (3,389.5–3,513.9) |
 | FORCE_CPU | 74,888.8 (66,445.2–78,817.7) | 31,815.5 (25,153.3–32,245.1) |
 
-One earlier guarded run measured FORCE_CPU at 63,103.9/23,463.9 QPS, but that single run plus the observed variance is not a controlled A/B. Direct persistent code spans and zero unfiltered host list-code scratch are proven; final candidate-ID aggregation and backend/request copies are not measured. At this checkpoint AUTO was 9.14× slower than FORCE_CPU at `nprobe=8`, consistent with repeated per-list AUTO attempts plus allocation and dispatch overhead. The fixed-bucket checkpoint below supersedes it while retaining the result as negative history; no retained stage timing isolates one cause.
+One earlier guarded run measured FORCE_CPU at 63,103.9/23,463.9 QPS, but that single run plus the observed variance is not a controlled A/B. Direct persistent code spans and zero unfiltered host list-code scratch are proven; at this checkpoint final candidate-ID aggregation and backend/request copies were not measured. The shortlist-only ID checkpoint below later removes the unfiltered dense ID copy. At this checkpoint AUTO was 9.14× slower than FORCE_CPU at `nprobe=8`, consistent with repeated per-list AUTO attempts plus allocation and dispatch overhead. The fixed-bucket checkpoint below supersedes it while retaining the result as negative history; no retained stage timing isolates one cause.
 
 ## Batched descriptors and fixed buckets
 
@@ -110,6 +110,19 @@ Live deterministic cases establish the bounded contract:
 
 GPU is unavailable for PQ ADC. Package-energy readings bracketed the complete multi-policy tool process and cannot be attributed to a lane. This is a strong negative result for the present Gather+ReduceSum dataflow, not for the NPU generally. The path still pays for expanded i32 indices, synchronous request traffic, and full score readback, but stage telemetry has not isolated their individual shares. The current diagnostic fails the AUTO promotion gate. The next speed path is iGPU variable-length fused scan/select, while the request cache is bounded/versioned and stage telemetry is added. Depth 2/4 remains a secondary bakeoff rather than a production default.
 
+## Shortlist-only ID resolution
+
+Unfiltered search no longer allocates and fills an `int64` ID array parallel to every ADC score. TopK still consumes the same dense score order. Only the selected `krefine` offsets are resolved through the ordered block descriptors to persistent list-major IDs; filtered search retains its compact allowed-ID/code storage. Resource counters record avoided candidate-ID bytes and selected-ID resolutions only after successful search publication.
+
+Native regressions cover exact unfiltered parity, filtered-path counter isolation, and 33 queries crossing the 32-query block boundary. A matched three-run clean A/B used the bounded SIFT prefix (`n=2,000`, `nq=32`, `dim=128`, `k=10`, `nlist=32`, `pq_m=8`, `krefine=32`), one warmup, five measured passes, and identical runner settings:
+
+| Policy | nprobe 2 baseline → post QPS | Ratio | nprobe 8 baseline → post QPS | Ratio | Recall@10 nprobe 2/8 |
+|---|---:|---:|---:|---:|---:|
+| AUTO | 57,224.6 → 58,856.0 | 1.03× | 19,573.1 → 21,627.5 | 1.10× | 0.6375 / 0.946875 |
+| FORCE_CPU | 80,120.2 → 80,685.8 | 1.01× | 29,157.2 → 32,679.7 | 1.12× | 0.6375 / 0.946875 |
+
+The values are medians of the three per-run medians. Post-change run ranges were 52,709.6–61,574.0 / 21,244.1–22,945.6 QPS for AUTO and 79,188.3–82,516.8 / 32,064.1–33,239.8 for FORCE_CPU at `nprobe=2/8`. Median process RSS was about 140.8 MiB for both policies versus 141.1/141.0 MiB before. Current CPU remains 1.37×/1.51× faster than AUTO. The result is a bounded diagnostic, not a SIFT1M or matched FAISS win: FAISS is unrefined, recall is unmatched, and energy was disabled.
+
 ## Remaining B3 gate
 
 1. Validate the bounded affine transform on production LUTs through shortlist survival and final recall; do not promote AUTO unless complete search wall or energy beats CPU.
@@ -119,4 +132,4 @@ GPU is unavailable for PQ ADC. Package-energy readings bracketed the complete mu
 5. Compare raw ovVS and raw FAISS at identical `nlist`, `nprobe`, `pq_m`, `nbits`, and `krefine=k`; refined comparisons need an equivalent FAISS refinement lane.
 6. Require repeated end-to-end SIFT1M recall, QPS, tail latency, peak RSS, and package-energy evidence before claiming a win.
 
-Latest checkpoint verification: 82/82 accelerator-enabled native tests with zero skips and 6/6 CTest lanes. The unchanged benchmark harness and SIFT fetcher were not rerun at the affine checkpoint; their latest completed counts remain 57/57 and 6/6. CTest re-runs native subsets plus the two consumers, so its count is not additive.
+Latest checkpoint verification: 82/82 accelerator-enabled native tests with zero skips and 6/6 CTest lanes. Six matched benchmark executions completed with no failed or skipped lanes; energy was disabled. The unchanged benchmark harness and SIFT fetcher were not unit-tested again; their latest completed counts remain 57/57 and 6/6. CTest re-runs native subsets plus the two consumers, so its count is not additive.
