@@ -1,0 +1,357 @@
+diff --git a/src/prim/gpu/backend_gpu.cpp b/src/prim/gpu/backend_gpu.cpp
+index 402ec91..87fb851 100644
+--- a/src/prim/gpu/backend_gpu.cpp
++++ b/src/prim/gpu/backend_gpu.cpp
+@@ -3,11 +3,13 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <new>
++#include <type_traits>
+ 
+ #if defined(OVVS_WITH_SYCL)
+ #include <sycl/sycl.hpp>
+@@ -125,6 +127,34 @@ class ScopedDeviceUsm {
+   GpuWorkStats* stats_ = nullptr;
+ };
+ 
++struct NnDescentScalarState {
++  int32_t active_count = 0;
++  int32_t invalid_numeric = 0;
++};
++
++struct alignas(8) NnDescentConvergenceSummary {
++  uint64_t changed_edges = 0;
++  uint64_t pending_new_edges = 0;
++  uint32_t processed_rows = 0;
++  uint32_t flags = 0;
++};
++
++struct alignas(8) NnDescentControlBlock {
++  NnDescentScalarState scalars;
++  NnDescentConvergenceSummary convergence;
++};
++
++static_assert(std::is_standard_layout_v<NnDescentScalarState>);
++static_assert(std::is_standard_layout_v<NnDescentConvergenceSummary>);
++static_assert(std::is_standard_layout_v<NnDescentControlBlock>);
++static_assert(std::is_trivially_copyable_v<NnDescentScalarState>);
++static_assert(std::is_trivially_copyable_v<NnDescentConvergenceSummary>);
++static_assert(std::is_trivially_copyable_v<NnDescentControlBlock>);
++static_assert(sizeof(NnDescentScalarState) == 8);
++static_assert(sizeof(NnDescentConvergenceSummary) == 24);
++static_assert(offsetof(NnDescentControlBlock, convergence) == 8);
++static_assert(sizeof(NnDescentControlBlock) == 32);
++
+ static bool gpu_pointer_accessible(sycl::queue& q, const void* ptr) {
+   if (!ptr) return false;
+   try {
+@@ -1172,6 +1202,8 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     constexpr uint32_t kNewMask = 0x80000000u;
+     constexpr uint32_t kIdMask = 0x7fffffffu;
+     constexpr uint32_t kInvalidId = 0x7fffffffu;
++    constexpr uint32_t kConvergenceChangedOutOfRange = 1u << 0u;
++    constexpr uint32_t kConvergencePendingOutOfRange = 1u << 1u;
+     constexpr double kTerminationThreshold = 0.0001;
+     const size_t sample_count = std::min(DEG, kSampleCap);
+     const size_t max_bi_samples = sample_count * 2u;
+@@ -1236,7 +1268,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+         !add_device_bytes(reverse_plane_bytes) || !add_device_bytes(reverse_plane_bytes) ||
+         !add_device_bytes(link_bytes) || !add_device_bytes(proposal_id_bytes) ||
+         !add_device_bytes(proposal_distance_bytes) || !add_device_bytes(row_bytes) ||
+-        !add_device_bytes(row_bytes) || !add_device_bytes(2u * sizeof(int32_t))) {
++        !add_device_bytes(row_bytes) || !add_device_bytes(sizeof(NnDescentControlBlock))) {
+       return OVVS_STATUS_SHAPE_MISMATCH;
+     }
+     const uint64_t global_mem = device.get_info<sycl::info::device::global_mem_size>();
+@@ -1293,7 +1325,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     ScopedDeviceUsm<float> proposal_distances(q, proposal_inbox_count, gpu_stats);
+     ScopedDeviceUsm<int32_t> heads(q, N, gpu_stats);
+     ScopedDeviceUsm<uint32_t> active_targets(q, N, gpu_stats);
+-    ScopedDeviceUsm<int32_t> scalars(q, 2u, gpu_stats);
++    ScopedDeviceUsm<NnDescentControlBlock> control(q, 1u, gpu_stats);
+     uint32_t* const reverse_new_ptr = reverse_new.get();
+     uint32_t* const reverse_old_ptr = reverse_old.get();
+     int32_t* const inbox_links_ptr = inbox_links.get();
+@@ -1301,7 +1333,10 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     float* const proposal_distances_ptr = proposal_distances.get();
+     int32_t* const heads_ptr = heads.get();
+     uint32_t* const active_targets_ptr = active_targets.get();
+-    int32_t* const scalars_ptr = scalars.get();
++    NnDescentControlBlock* const control_ptr = control.get();
++    int32_t* const active_count_ptr = &control_ptr->scalars.active_count;
++    int32_t* const invalid_numeric_ptr = &control_ptr->scalars.invalid_numeric;
++    NnDescentConvergenceSummary* const convergence_ptr = &control_ptr->convergence;
+     const float* DS = dataset_direct ? dataset : dataset_copy.get();
+     if (!dataset_direct) {
+       note_h2d(dataset_bytes);
+@@ -1311,7 +1346,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     q.wait_and_throw();
+ 
+     note_submission();
+-    q.fill(scalars_ptr + 1, 0, 1u);
++    q.fill(invalid_numeric_ptr, 0, 1u);
+     note_wait();
+     q.wait_and_throw();
+     note_kernel();
+@@ -1319,7 +1354,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+       if (!sycl::isfinite(DS[index])) {
+         sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                          sycl::access::address_space::global_space>
+-            invalid(scalars_ptr[1]);
++            invalid(*invalid_numeric_ptr);
+         invalid.store(1);
+       }
+     });
+@@ -1327,7 +1362,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     q.wait_and_throw();
+     int32_t invalid_numeric = 0;
+     note_d2h(sizeof(invalid_numeric));
+-    q.memcpy(&invalid_numeric, scalars_ptr + 1, sizeof(invalid_numeric));
++    q.memcpy(&invalid_numeric, invalid_numeric_ptr, sizeof(invalid_numeric));
+     note_wait();
+     q.wait_and_throw();
+     if (invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+@@ -1412,7 +1447,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+                sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                 sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>
+-                   invalid(scalars_ptr[1]);
++                   invalid(*invalid_numeric_ptr);
+                invalid.store(1);
+                distance = std::numeric_limits<float>::max();
+              }
+@@ -1450,13 +1485,11 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     note_wait();
+     q.wait_and_throw();
+     note_d2h(sizeof(invalid_numeric));
+-    q.memcpy(&invalid_numeric, scalars_ptr + 1, sizeof(invalid_numeric));
++    q.memcpy(&invalid_numeric, invalid_numeric_ptr, sizeof(invalid_numeric));
+     note_wait();
+     q.wait_and_throw();
+     if (invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+ 
+-    std::vector<int32_t> changed_per_row(N);
+-    std::vector<uint32_t> pending_new_per_row(N);
+     int32_t iterations_run = 0;
+     int64_t last_changed_edges = 0;
+     int64_t last_pending_new_edges = 0;
+@@ -1513,7 +1546,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+           note_submission();
+           q.fill(heads_ptr, -1, N);
+           note_submission();
+-          q.fill(scalars_ptr, 0, 1u);
++          q.fill(active_count_ptr, 0, 1u);
+           note_wait();
+           q.wait_and_throw();
+ 
+@@ -1539,7 +1572,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+                 sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                  sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+-                    active_count(scalars_ptr[0]);
++                    active_count(*active_count_ptr);
+                 const int32_t active_slot = active_count.fetch_add(1);
+                 active_targets_ptr[static_cast<size_t>(active_slot)] = target;
+               }
+@@ -1551,7 +1584,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+ 
+           int32_t active_count = 0;
+           note_d2h(sizeof(active_count));
+-          q.memcpy(&active_count, scalars_ptr, sizeof(active_count));
++          q.memcpy(&active_count, active_count_ptr, sizeof(active_count));
+           note_wait();
+           q.wait_and_throw();
+           if (active_count < 0 || static_cast<size_t>(active_count) > N) {
+@@ -1644,7 +1677,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+         note_submission();
+         q.fill(heads_ptr, -1, N);
+         note_submission();
+-        q.fill(scalars_ptr, 0, 1u);
++        q.fill(active_count_ptr, 0, 1u);
+         note_wait();
+         q.wait_and_throw();
+ 
+@@ -1763,7 +1796,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+                 sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                  sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+-                    invalid(scalars_ptr[1]);
++                    invalid(*invalid_numeric_ptr);
+                 invalid.store(1);
+                 return std::numeric_limits<float>::max();
+               };
+@@ -1813,7 +1846,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space>
+-                       active_count(scalars_ptr[0]);
++                       active_count(*active_count_ptr);
+                    const int32_t active_slot = active_count.fetch_add(1);
+                    active_targets_ptr[static_cast<size_t>(active_slot)] = target;
+                  }
+@@ -1880,13 +1913,13 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+         note_wait();
+         q.wait_and_throw();
+ 
+-        int32_t scalar_values[2] = {0, 0};
++        NnDescentScalarState scalar_values{};
+         note_d2h(sizeof(scalar_values));
+-        q.memcpy(scalar_values, scalars_ptr, sizeof(scalar_values));
++        q.memcpy(&scalar_values, &control_ptr->scalars, sizeof(scalar_values));
+         note_wait();
+         q.wait_and_throw();
+-        if (scalar_values[1] != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+-        const int32_t active_count = scalar_values[0];
++        if (scalar_values.invalid_numeric != 0) return OVVS_STATUS_INVALID_ARGUMENT;
++        const int32_t active_count = scalar_values.active_count;
+         if (active_count < 0 || static_cast<size_t>(active_count) > N) {
+           return OVVS_STATUS_ERROR;
+         }
+@@ -1962,6 +1995,8 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+         q.wait_and_throw();
+       }
+ 
++      std::vector<sycl::event> convergence_events;
++      convergence_events.reserve(1u + (N - 1u) / kVertexGroupsPerLaunch);
+       for (size_t vertex_offset = 0; vertex_offset < N;
+            vertex_offset += kVertexGroupsPerLaunch) {
+         const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
+@@ -1970,7 +2005,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+           return OVVS_STATUS_SHAPE_MISMATCH;
+         }
+         note_kernel();
+-        q.submit([&](sycl::handler& h) {
++        convergence_events.push_back(q.submit([&](sycl::handler& h) {
+           sycl::local_accessor<int32_t, 1> row_hash(
+               sycl::range<1>(convergence_hash_capacity), h);
+           h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
+@@ -2019,27 +2054,75 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+               active_targets_ptr[vertex] = row_pending_new;
+             }
+           });
+-        });
++        }));
+       }
+-      note_wait();
+-      q.wait_and_throw();
+-      note_d2h(N * sizeof(int32_t));
+-      q.memcpy(changed_per_row.data(), heads_ptr, N * sizeof(int32_t));
+-      note_d2h(N * sizeof(uint32_t));
+-      q.memcpy(pending_new_per_row.data(), active_targets_ptr, N * sizeof(uint32_t));
+-      note_wait();
+-      q.wait_and_throw();
+ 
+-      int64_t changed_edges = 0;
+-      int64_t pending_new_edges = 0;
+-      for (const int32_t row_changed : changed_per_row) {
+-        if (row_changed < 0 || row_changed > degree) return OVVS_STATUS_ERROR;
+-        changed_edges += static_cast<int64_t>(row_changed);
+-      }
+-      for (const uint32_t row_pending_new : pending_new_per_row) {
+-        if (row_pending_new > static_cast<uint32_t>(degree)) return OVVS_STATUS_ERROR;
+-        pending_new_edges += static_cast<int64_t>(row_pending_new);
++      note_kernel();
++      const sycl::event reduction_event = q.submit([&](sycl::handler& h) {
++        h.depends_on(convergence_events);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(work_group_size),
++                                         sycl::range<1>(work_group_size)),
++                       [=](sycl::nd_item<1> item) {
++          const size_t lid = item.get_local_linear_id();
++          uint64_t local_changed = 0;
++          uint64_t local_pending_new = 0;
++          uint32_t local_processed = 0;
++          uint32_t local_flags = 0;
++          for (size_t row = lid; row < N; row += work_group_size) {
++            const int32_t row_changed = heads_ptr[row];
++            const uint32_t row_pending_new = active_targets_ptr[row];
++            ++local_processed;
++            if (row_changed < 0 || row_changed > degree) {
++              local_flags |= kConvergenceChangedOutOfRange;
++            } else {
++              local_changed += static_cast<uint64_t>(row_changed);
++            }
++            if (row_pending_new > static_cast<uint32_t>(degree)) {
++              local_flags |= kConvergencePendingOutOfRange;
++            } else {
++              local_pending_new += static_cast<uint64_t>(row_pending_new);
++            }
++          }
++
++          const auto group = item.get_group();
++          const uint64_t changed_edges =
++              sycl::reduce_over_group(group, local_changed, sycl::plus<uint64_t>());
++          const uint64_t pending_new_edges =
++              sycl::reduce_over_group(group, local_pending_new, sycl::plus<uint64_t>());
++          const uint32_t processed_rows =
++              sycl::reduce_over_group(group, local_processed, sycl::plus<uint32_t>());
++          const uint32_t flags =
++              sycl::reduce_over_group(group, local_flags, sycl::bit_or<uint32_t>());
++          if (lid == 0) {
++            convergence_ptr->changed_edges = changed_edges;
++            convergence_ptr->pending_new_edges = pending_new_edges;
++            convergence_ptr->processed_rows = processed_rows;
++            convergence_ptr->flags = flags;
++          }
++        });
++      });
++
++      NnDescentConvergenceSummary convergence{};
++      note_d2h(sizeof(convergence));
++      sycl::event convergence_copy = q.submit([&](sycl::handler& h) {
++        h.depends_on(reduction_event);
++        h.memcpy(&convergence, convergence_ptr, sizeof(convergence));
++      });
++      note_wait();
++      convergence_copy.wait_and_throw();
++      if (convergence.flags != 0 ||
++          convergence.processed_rows != static_cast<uint32_t>(N) ||
++          convergence.changed_edges > static_cast<uint64_t>(graph_count) ||
++          convergence.pending_new_edges > static_cast<uint64_t>(graph_count) ||
++          convergence.changed_edges >
++              static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
++          convergence.pending_new_edges >
++              static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
++        return OVVS_STATUS_ERROR;
+       }
++      const int64_t changed_edges = static_cast<int64_t>(convergence.changed_edges);
++      const int64_t pending_new_edges =
++          static_cast<int64_t>(convergence.pending_new_edges);
+       const double change_ratio =
+           static_cast<double>(changed_edges) / static_cast<double>(graph_count);
+       if (!std::isfinite(change_ratio) || change_ratio < 0.0 || change_ratio > 1.0) {
+diff --git a/tests/test_neighbors.cpp b/tests/test_neighbors.cpp
+index e8756a1..e07534b 100644
+--- a/tests/test_neighbors.cpp
++++ b/tests/test_neighbors.cpp
+@@ -3156,17 +3156,21 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
+              build_stats.nndescent_gpu_final_pending_new_edges <= n * 16,
+          "large CAGRA build publishes bounded GPU NN-Descent convergence values");
+   const int64_t gpu_iterations = build_stats.nndescent_gpu_iterations;
++  const int64_t expected_d2h_bytes =
++      n * 16 * static_cast<int64_t>(sizeof(int32_t)) +
++      2 * static_cast<int64_t>(sizeof(int32_t)) +
++      gpu_iterations * (4 * static_cast<int64_t>(sizeof(int32_t)) + 24);
+   expect(build_stats.nndescent_gpu_allocation_calls == 12 &&
+              build_stats.nndescent_gpu_allocation_bytes > 0 &&
+              build_stats.nndescent_gpu_allocation_bytes ==
+                  build_stats.nndescent_gpu_peak_owned_bytes_max &&
+              build_stats.nndescent_gpu_h2d_calls == 0 &&
+              build_stats.nndescent_gpu_h2d_bytes == 0 &&
+-             build_stats.nndescent_gpu_d2h_calls == 3 + 5 * gpu_iterations &&
+-             build_stats.nndescent_gpu_d2h_bytes > 0 &&
+-             build_stats.nndescent_gpu_kernel_launches == 3 + 8 * gpu_iterations &&
++             build_stats.nndescent_gpu_d2h_calls == 3 + 4 * gpu_iterations &&
++             build_stats.nndescent_gpu_d2h_bytes == expected_d2h_bytes &&
++             build_stats.nndescent_gpu_kernel_launches == 3 + 9 * gpu_iterations &&
+              build_stats.nndescent_gpu_submission_calls == 7 + 21 * gpu_iterations &&
+-             build_stats.nndescent_gpu_wait_calls == 20 + 16 * gpu_iterations,
++             build_stats.nndescent_gpu_wait_calls == 20 + 15 * gpu_iterations,
+          "fixed large CAGRA fixture publishes exact explicit GPU work counters");
+   expect(build_stats.total_wall_ns >= cagra_named_stage_ns(build_stats),
+          "large CAGRA named stage sum must not exceed total build wall");

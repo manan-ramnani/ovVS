@@ -69,7 +69,7 @@ are not claimed.
 
 Only one valid SIFT1M pair was run. The admission result was already decisive
 against the required improvement, so additional promotion repetitions would
-have spent time refining a losing design. The next bounded experiment keeps
-the original dynamic active-count consumer ranges and targets only the large
-per-iteration convergence readbacks, with exact integer reduction and a small
-validated summary returned to the host.
+have spent time refining a losing design. The subsequent convergence-only
+experiment kept the original dynamic active-count consumer ranges and reduced
+the large per-iteration readbacks to a validated summary, but also lost; see
+[`nndescent-convergence-reduction-v1.md`](nndescent-convergence-reduction-v1.md).
