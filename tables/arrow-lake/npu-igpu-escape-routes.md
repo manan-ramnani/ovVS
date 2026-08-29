@@ -321,11 +321,14 @@ The Arrow Lake optimization track proceeds in this order:
    merge wall, export wall/bytes, peak host/device memory, graph quality and
    connectivity, and resulting CPU-search recall/QPS against honest hnswlib and
    optimized CPU construction controls.
-2. **CAGRA search-kernel portfolio.** Add a SIMD16 multi-work-group-per-query
-   path for single/small batches, retain one work-group/query for larger batches,
-   add a multi-kernel fallback, and bound a persistent-kernel/request-ring
-   experiment. Replace leader-serial insertion, worst-element scans, expansion
-   selection, and final selection-sort with subgroup-cooperative primitives.
+2. **CAGRA search-kernel portfolio.** Retain one workgroup/query on this Arrow
+   Lake stack: the separate four-workgroup cooperative capacity gate reported
+   one group versus four required. Continue the SIMD16 portfolio with
+   one-workgroup and bounded multi-kernel/persistent-ring designs that do not
+   require unsupported cross-workgroup synchronization. Reopen a cooperative
+   multi-workgroup/query path only on a materially different measured
+   capability result. Replace remaining leader-serial insertion, expansion,
+   and selection work only behind exact output and complete-wall gates.
 3. **Hierarchical PQ selection.** Replace the 256-element bitonic sort, three
    readbacks, and CPU merge with SIMD16 register top-k, subgroup merge,
    work-group local top-k, a second GPU global top-k, and one final k-row

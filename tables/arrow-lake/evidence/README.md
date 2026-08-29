@@ -59,5 +59,6 @@ explicitly non-canonical context. The public compiler boundary is retained in
 Other evidence manifests: [`cagra-build-v1/`](cagra-build-v1/README.md),
 [`cagra-search-v1/`](cagra-search-v1/README.md),
 [`cagra-cached-worst-v1/`](cagra-cached-worst-v1/README.md),
-[`cagra-frontier-v1/`](cagra-frontier-v1/README.md), and
-[`cagra-cooperative-pick-v1/`](cagra-cooperative-pick-v1/README.md).
+[`cagra-frontier-v1/`](cagra-frontier-v1/README.md),
+[`cagra-cooperative-pick-v1/`](cagra-cooperative-pick-v1/README.md), and
+[`gpu-root-group-canary-v1/`](gpu-root-group-canary-v1/README.md).

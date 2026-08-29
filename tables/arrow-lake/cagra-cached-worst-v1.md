@@ -63,9 +63,11 @@ the product objective:
 This frozen cohort remains the promotion evidence for cached-worst tracking.
 The later prefix-sort/frontier and cooperative multi-pick checkpoints supersede
 its current performance status; the stable one-pass pick was exact but
-rejected. A bounded owner/helper route is the next separate gate. No NPU share
-is implied on Arrow Lake. Current result:
-[`cagra-cooperative-pick-v1.md`](cagra-cooperative-pick-v1.md).
+rejected. The later bounded owner/helper capacity gate also failed closed and
+parked that route on the measured Arrow Lake stack. No NPU share is implied on
+Arrow Lake. Current results:
+[`cagra-cooperative-pick-v1.md`](cagra-cooperative-pick-v1.md) and
+[`gpu-root-group-canary-v1.md`](gpu-root-group-canary-v1.md).
 
 Raw artifacts and producer hashes:
 [`evidence/cagra-cached-worst-v1/`](evidence/cagra-cached-worst-v1/README.md).

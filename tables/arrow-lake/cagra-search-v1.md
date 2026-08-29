@@ -46,7 +46,9 @@ baseline values above remain historical evidence and are not rewritten.
 The exact cached-worst candidate passed its repeated complete-wall gate and is
 retained. The later prefix-sort/frontier and cooperative multi-pick checkpoints
 also passed; the stable one-pass pick was exact but rejected. A measured
-multi-work-group/query small-batch route remains a separate change. hnswlib
-settings remain unchanged, and no kernel-only timing can establish a product
-win. Current result:
-[`cagra-cooperative-pick-v1.md`](cagra-cooperative-pick-v1.md).
+four-workgroup/query small-batch capacity gate later reported one cooperative
+workgroup versus four required and parked that route on the measured Arrow Lake
+stack. hnswlib settings remain unchanged, and no kernel-only timing can
+establish a product win. Current results:
+[`cagra-cooperative-pick-v1.md`](cagra-cooperative-pick-v1.md) and
+[`gpu-root-group-canary-v1.md`](gpu-root-group-canary-v1.md).

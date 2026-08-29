@@ -82,10 +82,12 @@ outlier at `ef=64`: 6,036.4 QPS and 14.509 ms p99 versus 6,784–6,799 QPS and
 candidate CAGRA multi-pick QPS range is disjoint from its serial baseline
 range, so the promotion survives this disclosed comparator noise.
 
-The next B2 experiment is a bounded owner/helper multi-work-group route for
-batch-one or very small batches. It must fail closed when the required SYCL
-root-group capability is absent and must keep the current one-work-group path
-for larger batches. It is not part of this promotion.
+The next proposed B2 experiment was a bounded owner/helper multi-workgroup
+route for batch one or very small batches. Its subsequent fail-closed
+named-kernel gate reported one cooperative workgroup versus four required, so
+that route is parked on the measured Arrow Lake stack without changing this
+promotion or the current one-workgroup path. See
+[`gpu-root-group-canary-v1.md`](gpu-root-group-canary-v1.md).
 
 Raw artifacts and producer hashes:
 [`evidence/cagra-cooperative-pick-v1/`](evidence/cagra-cooperative-pick-v1/README.md).
