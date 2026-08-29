@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <new>
 
@@ -2102,6 +2103,419 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
   (void)iters;
   (void)graph;
   (void)stats;
+  return OVVS_STATUS_DEVICE_UNAVAILABLE;
+#endif
+}
+
+ovvsStatus gpu_cagra_optimize_ranked(ResourcesData& r, const int32_t* initial,
+                                      int64_t n, int32_t initial_degree,
+                                      int32_t final_degree,
+                                      std::vector<int32_t>& output) {
+  output.clear();
+#if defined(OVVS_WITH_SYCL)
+  (void)r;
+  constexpr size_t kMaxInitialDegree = 64u;
+  constexpr size_t kMaxReverseTake = kMaxInitialDegree / 2u;
+  if (!initial || n <= 1 || initial_degree <= 0 || final_degree <= 0 ||
+      final_degree > initial_degree || initial_degree >= n || final_degree >= n) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  if (n > std::numeric_limits<int32_t>::max()) return OVVS_STATUS_SHAPE_MISMATCH;
+  if (static_cast<size_t>(initial_degree) > kMaxInitialDegree) {
+    return OVVS_STATUS_UNSUPPORTED;
+  }
+  if (!sycl_gpu_available()) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+
+  try {
+    auto& q = gpu_queue();
+    const auto device = q.get_device();
+    if (!device.has(sycl::aspect::usm_device_allocations)) {
+      return OVVS_STATUS_UNSUPPORTED;
+    }
+    const size_t N = static_cast<size_t>(n);
+    const size_t I = static_cast<size_t>(initial_degree);
+    const size_t F = static_cast<size_t>(final_degree);
+    const size_t reverse_take_limit = F / 2u;
+    const size_t padded = next_power_of_two(I);
+    size_t initial_count = 0;
+    size_t final_count = 0;
+    size_t global_items = 0;
+    if (padded == 0 || !checked_product(N, I, initial_count) ||
+        !checked_product(N, F, final_count) ||
+        !checked_product(N, padded, global_items) || N == std::numeric_limits<size_t>::max()) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+
+    const size_t max_work_group_size =
+        device.get_info<sycl::info::device::max_work_group_size>();
+    const size_t local_mem_size = device.get_info<sycl::info::device::local_mem_size>();
+    if (padded > max_work_group_size || padded * sizeof(uint64_t) > local_mem_size) {
+      return OVVS_STATUS_UNSUPPORTED;
+    }
+
+    const auto bytes_for = [](size_t count, size_t width, size_t& bytes) {
+      return checked_product(count, width, bytes);
+    };
+    size_t initial_bytes = 0;
+    size_t lookup_bytes = 0;
+    size_t final_bytes = 0;
+    size_t counts_bytes = 0;
+    size_t offsets_bytes = 0;
+    size_t reverse_bytes = 0;
+    if (!bytes_for(initial_count, sizeof(int32_t), initial_bytes) ||
+        !bytes_for(initial_count, sizeof(uint64_t), lookup_bytes) ||
+        !bytes_for(final_count, sizeof(int32_t), final_bytes) ||
+        !bytes_for(N, sizeof(uint32_t), counts_bytes) ||
+        !bytes_for(N + 1u, sizeof(uint64_t), offsets_bytes) ||
+        !bytes_for(final_count, sizeof(uint64_t), reverse_bytes)) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    const size_t max_alloc = device.get_info<sycl::info::device::max_mem_alloc_size>();
+    if (std::max({initial_bytes, lookup_bytes, final_bytes, counts_bytes,
+                  offsets_bytes, reverse_bytes}) > max_alloc) {
+      return OVVS_STATUS_OOM;
+    }
+    const auto checked_sum = [](std::initializer_list<size_t> values, size_t& total) {
+      total = 0;
+      for (size_t value : values) {
+        if (value > std::numeric_limits<size_t>::max() - total) return false;
+        total += value;
+      }
+      return true;
+    };
+    size_t phase_a_bytes = 0;
+    size_t phase_b_bytes = 0;
+    if (!checked_sum({initial_bytes, lookup_bytes, final_bytes, sizeof(int32_t)},
+                     phase_a_bytes) ||
+        !checked_sum({final_bytes, counts_bytes, offsets_bytes, counts_bytes,
+                      reverse_bytes, final_bytes, sizeof(int32_t)},
+                     phase_b_bytes)) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    const uint64_t global_mem = device.get_info<sycl::info::device::global_mem_size>();
+    if (static_cast<uint64_t>(std::max(phase_a_bytes, phase_b_bytes)) > global_mem) {
+      return OVVS_STATUS_OOM;
+    }
+
+    ScopedDeviceUsm<int32_t> forward(q, final_count);
+    ScopedDeviceUsm<int32_t> status(q, 1u);
+    int32_t* const forward_ptr = forward.get();
+    int32_t* const status_ptr = status.get();
+    int32_t host_status = 0;
+
+    {
+      ScopedDeviceUsm<int32_t> initial_device(q, initial_count);
+      ScopedDeviceUsm<uint64_t> rank_lookup(q, initial_count);
+      int32_t* const initial_ptr = initial_device.get();
+      uint64_t* const rank_ptr = rank_lookup.get();
+
+      const sycl::event input_copy = q.memcpy(initial_ptr, initial, initial_bytes);
+      const sycl::event status_fill = q.fill(status_ptr, 0, 1u);
+      const sycl::event rank_event = q.submit([&](sycl::handler& h) {
+        h.depends_on(input_copy);
+        h.depends_on(status_fill);
+        sycl::local_accessor<uint64_t, 1> row_keys(sycl::range<1>(padded), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global_items), sycl::range<1>(padded)),
+            [=](sycl::nd_item<1> item) {
+              const size_t row = item.get_group_linear_id();
+              const size_t lane = item.get_local_linear_id();
+              uint64_t key = std::numeric_limits<uint64_t>::max();
+              if (lane < I) {
+                const int32_t id = initial_ptr[row * I + lane];
+                if (id < 0 || static_cast<size_t>(id) >= N ||
+                    static_cast<size_t>(id) == row) {
+                  sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                   sycl::memory_scope::device,
+                                   sycl::access::address_space::global_space>(*status_ptr)
+                      .fetch_or(1);
+                } else {
+                  key = (static_cast<uint64_t>(static_cast<uint32_t>(id)) << 32u) |
+                        static_cast<uint32_t>(lane);
+                }
+              }
+              row_keys[lane] = key;
+              item.barrier(sycl::access::fence_space::local_space);
+              for (size_t width = 2u; width <= padded; width <<= 1u) {
+                for (size_t stride = width >> 1u; stride != 0; stride >>= 1u) {
+                  const size_t other = lane ^ stride;
+                  if (other > lane) {
+                    const bool ascending = (lane & width) == 0;
+                    const uint64_t left = row_keys[lane];
+                    const uint64_t right = row_keys[other];
+                    if ((left > right) == ascending) {
+                      row_keys[lane] = right;
+                      row_keys[other] = left;
+                    }
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+              }
+              if (lane < I) {
+                const uint64_t sorted = row_keys[lane];
+                rank_ptr[row * I + lane] = sorted;
+                if (lane != 0 && (sorted >> 32u) == (row_keys[lane - 1u] >> 32u)) {
+                  sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                   sycl::memory_scope::device,
+                                   sycl::access::address_space::global_space>(*status_ptr)
+                      .fetch_or(2);
+                }
+              }
+            });
+      });
+      sycl::event validation_copy =
+          q.memcpy(&host_status, status_ptr, sizeof(host_status), rank_event);
+      validation_copy.wait_and_throw();
+      if (host_status != 0) return OVVS_STATUS_ERROR;
+
+      sycl::event forward_event = q.submit([&](sycl::handler& h) {
+        h.depends_on(rank_event);
+        sycl::local_accessor<uint64_t, 1> candidates(sycl::range<1>(padded), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global_items), sycl::range<1>(padded)),
+            [=](sycl::nd_item<1> item) {
+              const size_t row = item.get_group_linear_id();
+              const size_t lane = item.get_local_linear_id();
+              uint64_t key = std::numeric_limits<uint64_t>::max();
+              if (lane < I) {
+                const int32_t y = initial_ptr[row * I + lane];
+                uint32_t detours = 0;
+                const uint64_t needle =
+                    static_cast<uint64_t>(static_cast<uint32_t>(y)) << 32u;
+                for (size_t z_rank = 0; z_rank < lane; ++z_rank) {
+                  const int32_t z = initial_ptr[row * I + z_rank];
+                  const size_t z_base = static_cast<size_t>(z) * I;
+                  size_t lo = 0;
+                  size_t hi = I;
+                  while (lo < hi) {
+                    const size_t mid = lo + (hi - lo) / 2u;
+                    if (rank_ptr[z_base + mid] < needle) {
+                      lo = mid + 1u;
+                    } else {
+                      hi = mid;
+                    }
+                  }
+                  uint32_t z_y_rank = static_cast<uint32_t>(I);
+                  if (lo < I && (rank_ptr[z_base + lo] >> 32u) ==
+                                    static_cast<uint32_t>(y)) {
+                    z_y_rank = static_cast<uint32_t>(rank_ptr[z_base + lo]);
+                  }
+                  if (z_y_rank < lane) ++detours;
+                }
+                key = (static_cast<uint64_t>(detours) << 38u) |
+                      (static_cast<uint64_t>(lane) << 32u) |
+                      static_cast<uint32_t>(y);
+              }
+              candidates[lane] = key;
+              item.barrier(sycl::access::fence_space::local_space);
+              for (size_t width = 2u; width <= padded; width <<= 1u) {
+                for (size_t stride = width >> 1u; stride != 0; stride >>= 1u) {
+                  const size_t other = lane ^ stride;
+                  if (other > lane) {
+                    const bool ascending = (lane & width) == 0;
+                    const uint64_t left = candidates[lane];
+                    const uint64_t right = candidates[other];
+                    if ((left > right) == ascending) {
+                      candidates[lane] = right;
+                      candidates[other] = left;
+                    }
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+              }
+              if (lane < F) {
+                forward_ptr[row * F + lane] =
+                    static_cast<int32_t>(static_cast<uint32_t>(candidates[lane]));
+              }
+            });
+      });
+      forward_event.wait_and_throw();
+    }
+
+    ScopedDeviceUsm<uint32_t> reverse_counts(q, N);
+    ScopedDeviceUsm<uint64_t> reverse_offsets(q, N + 1u);
+    ScopedDeviceUsm<uint32_t> reverse_cursors(q, N);
+    ScopedDeviceUsm<uint64_t> reverse_keys(q, final_count);
+    ScopedDeviceUsm<int32_t> result(q, final_count);
+    uint32_t* const counts_ptr = reverse_counts.get();
+    uint64_t* const offsets_ptr = reverse_offsets.get();
+    uint32_t* const cursors_ptr = reverse_cursors.get();
+    uint64_t* const reverse_ptr = reverse_keys.get();
+    int32_t* const result_ptr = result.get();
+
+    const sycl::event counts_fill = q.fill(counts_ptr, uint32_t{0}, N);
+    const sycl::event count_event = q.submit([&](sycl::handler& h) {
+      h.depends_on(counts_fill);
+      h.parallel_for(sycl::range<1>(final_count), [=](sycl::id<1> index) {
+        const int32_t destination = forward_ptr[index];
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+                         sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            count(counts_ptr[static_cast<size_t>(destination)]);
+        count.fetch_add(1u);
+      });
+    });
+    const sycl::event scan_event = q.submit([&](sycl::handler& h) {
+      h.depends_on(count_event);
+      h.single_task([=]() {
+        uint64_t offset = 0;
+        offsets_ptr[0] = 0;
+        for (size_t row = 0; row < N; ++row) {
+          offset += static_cast<uint64_t>(counts_ptr[row]);
+          offsets_ptr[row + 1u] = offset;
+        }
+        if (offset != static_cast<uint64_t>(final_count)) {
+          sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                           sycl::memory_scope::device,
+                           sycl::access::address_space::global_space>(*status_ptr)
+              .fetch_or(4);
+        }
+      });
+    });
+    const sycl::event cursors_fill = q.fill(cursors_ptr, uint32_t{0}, N);
+    const sycl::event scatter_event = q.submit([&](sycl::handler& h) {
+      h.depends_on(scan_event);
+      h.depends_on(cursors_fill);
+      h.parallel_for(sycl::range<2>(N, F), [=](sycl::id<2> index) {
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                         sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            status_value(*status_ptr);
+        if (status_value.load() != 0) return;
+        const uint32_t source = static_cast<uint32_t>(index[0]);
+        const uint32_t rank = static_cast<uint32_t>(index[1]);
+        const size_t edge = static_cast<size_t>(source) * F + rank;
+        const size_t destination = static_cast<size_t>(forward_ptr[edge]);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+                         sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            cursor(cursors_ptr[destination]);
+        const uint32_t local_slot = cursor.fetch_add(1u);
+        const uint64_t slot = offsets_ptr[destination] + local_slot;
+        if (slot >= offsets_ptr[destination + 1u]) {
+          sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                           sycl::memory_scope::device,
+                           sycl::access::address_space::global_space>(*status_ptr)
+              .fetch_or(8);
+          return;
+        }
+        reverse_ptr[static_cast<size_t>(slot)] =
+            (static_cast<uint64_t>(rank) << 32u) | source;
+      });
+    });
+    const sycl::event result_fill = q.fill(result_ptr, int32_t{-1}, final_count);
+    const sycl::event select_event = q.submit([&](sycl::handler& h) {
+      h.depends_on(scatter_event);
+      h.depends_on(result_fill);
+      h.parallel_for(sycl::range<1>(N), [=](sycl::id<1> row_id) {
+        const size_t row = row_id[0];
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                         sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            status_value(*status_ptr);
+        if (status_value.load() != 0) return;
+        if (cursors_ptr[row] != counts_ptr[row]) {
+          sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                           sycl::memory_scope::device,
+                           sycl::access::address_space::global_space>(*status_ptr)
+              .fetch_or(16);
+          return;
+        }
+        uint64_t best[kMaxReverseTake];
+        size_t best_count = 0;
+        for (size_t i = 0; i < kMaxReverseTake; ++i) {
+          best[i] = std::numeric_limits<uint64_t>::max();
+        }
+        const size_t forward_base = row * F;
+        const uint64_t begin = offsets_ptr[row];
+        const uint64_t end = offsets_ptr[row + 1u];
+        for (uint64_t cursor = begin; cursor < end; ++cursor) {
+          const uint64_t key = reverse_ptr[static_cast<size_t>(cursor)];
+          const int32_t source =
+              static_cast<int32_t>(static_cast<uint32_t>(key));
+          bool already_forward = false;
+          for (size_t rank = 0; rank < F; ++rank) {
+            if (forward_ptr[forward_base + rank] == source) {
+              already_forward = true;
+              break;
+            }
+          }
+          if (already_forward || reverse_take_limit == 0) continue;
+          size_t position = 0;
+          while (position < best_count && best[position] < key) ++position;
+          if (position >= reverse_take_limit) continue;
+          const size_t upper =
+              best_count < reverse_take_limit ? best_count : reverse_take_limit - 1u;
+          for (size_t move = upper; move > position; --move) {
+            best[move] = best[move - 1u];
+          }
+          best[position] = key;
+          if (best_count < reverse_take_limit) ++best_count;
+        }
+
+        const size_t forward_take = F - best_count;
+        size_t forward_position = 0;
+        size_t reverse_position = 0;
+        size_t output_position = 0;
+        while (forward_position < forward_take || reverse_position < best_count) {
+          if (forward_position < forward_take) {
+            result_ptr[forward_base + output_position++] =
+                forward_ptr[forward_base + forward_position++];
+          }
+          if (reverse_position < best_count) {
+            result_ptr[forward_base + output_position++] =
+                static_cast<int32_t>(static_cast<uint32_t>(best[reverse_position++]));
+          }
+        }
+        if (output_position != F) {
+          sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                           sycl::memory_scope::device,
+                           sycl::access::address_space::global_space>(*status_ptr)
+              .fetch_or(32);
+          return;
+        }
+        for (size_t left = 0; left < F; ++left) {
+          const int32_t id = result_ptr[forward_base + left];
+          if (id < 0 || static_cast<size_t>(id) >= N ||
+              static_cast<size_t>(id) == row) {
+            sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                             sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(*status_ptr)
+                .fetch_or(64);
+          }
+          for (size_t right = 0; right < left; ++right) {
+            if (result_ptr[forward_base + right] == id) {
+              sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                               sycl::memory_scope::device,
+                               sycl::access::address_space::global_space>(*status_ptr)
+                  .fetch_or(128);
+            }
+          }
+        }
+      });
+    });
+
+    std::vector<int32_t> staged(final_count);
+    host_status = 0;
+    sycl::event result_copy = q.memcpy(staged.data(), result_ptr, final_bytes, select_event);
+    sycl::event final_status_copy =
+        q.memcpy(&host_status, status_ptr, sizeof(host_status), select_event);
+    result_copy.wait_and_throw();
+    final_status_copy.wait_and_throw();
+    if (host_status != 0) return OVVS_STATUS_ERROR;
+    output.swap(staged);
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+#else
+  (void)r;
+  (void)initial;
+  (void)n;
+  (void)initial_degree;
+  (void)final_degree;
   return OVVS_STATUS_DEVICE_UNAVAILABLE;
 #endif
 }

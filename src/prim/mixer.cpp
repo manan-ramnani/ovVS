@@ -463,6 +463,34 @@ ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t 
   return OVVS_STATUS_UNSUPPORTED;
 }
 
+ovvsStatus prim_cagra_optimize_ranked(ResourcesData& r, const int32_t* initial,
+                                      int64_t n, int32_t initial_degree,
+                                      int32_t final_degree,
+                                      std::vector<int32_t>& output) {
+  output.clear();
+  if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  const bool gpu_policy = r.policy == OVVS_POLICY_AUTO ||
+                          r.policy == OVVS_POLICY_GPU_IF_FASTER ||
+                          r.policy == OVVS_POLICY_HETERO ||
+                          r.policy == OVVS_POLICY_FORCE_GPU;
+  if (!gpu_policy) return OVVS_STATUS_UNSUPPORTED;
+  if (!sycl_gpu_available()) {
+    return r.policy == OVVS_POLICY_FORCE_GPU ? finish_forced_fail(r)
+                                             : OVVS_STATUS_UNSUPPORTED;
+  }
+  const ovvsStatus status = gpu_cagra_optimize_ranked(
+      r, initial, n, initial_degree, final_degree, output);
+  if (status == OVVS_STATUS_SUCCESS) {
+    r.last_device = OVVS_DEVICE_GPU;
+    return status;
+  }
+  if (status == OVVS_STATUS_UNSUPPORTED || status == OVVS_STATUS_DEVICE_UNAVAILABLE) {
+    return r.policy == OVVS_POLICY_FORCE_GPU ? finish_forced_fail(r)
+                                             : OVVS_STATUS_UNSUPPORTED;
+  }
+  return status;
+}
+
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,

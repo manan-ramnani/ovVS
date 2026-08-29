@@ -2221,6 +2221,131 @@ OVVS_TEST(cagra_rank_optimizer_invalid_and_deterministic) {
          "rank optimizer null graph rejection");
 }
 
+OVVS_TEST(cagra_rank_optimizer_gpu_matches_cpu) {
+  if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
+  Res res;
+  int32_t gpu = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu),
+                "rank optimizer GPU availability");
+  if (!gpu) skip_test("GPU device unavailable");
+  auto* resources = ovvs::impl::rd(res.r);
+
+  constexpr int64_t n = 97;
+  constexpr int32_t initial_degree = 9;
+  std::vector<int32_t> initial(static_cast<size_t>(n * initial_degree));
+  for (int64_t row = 0; row < n; ++row) {
+    std::vector<int32_t> ids;
+    if (row != 0) ids.push_back(0);  // Exercise a reverse segment much larger than its cap.
+    for (int64_t step = 1; static_cast<int32_t>(ids.size()) < initial_degree; ++step) {
+      const int32_t id = static_cast<int32_t>((row + step * 17) % n);
+      if (id == row || std::find(ids.begin(), ids.end(), id) != ids.end()) continue;
+      ids.push_back(id);
+    }
+    std::copy(ids.begin(), ids.end(),
+              initial.begin() + static_cast<std::ptrdiff_t>(row * initial_degree));
+  }
+
+  for (const int32_t final_degree : {5, 9}) {
+    std::vector<int32_t> cpu;
+    std::vector<int32_t> first_gpu;
+    std::vector<int32_t> repeated_gpu;
+    expect_status(ovvs::impl::cagra_optimize_ranked(
+                      initial.data(), n, initial_degree, final_degree, cpu),
+                  "CPU rank optimizer oracle");
+    expect_status(ovvs::impl::gpu_cagra_optimize_ranked(
+                      *resources, initial.data(), n, initial_degree, final_degree,
+                      first_gpu),
+                  "GPU rank optimizer");
+    expect(first_gpu == cpu, "GPU rank optimizer must match the CPU oracle byte-for-byte");
+    expect_status(ovvs::impl::gpu_cagra_optimize_ranked(
+                      *resources, initial.data(), n, initial_degree, final_degree,
+                      repeated_gpu),
+                  "repeated GPU rank optimizer");
+    expect(repeated_gpu == first_gpu,
+           "unordered reverse scatter must retain deterministic final graph bytes");
+  }
+
+  const std::array<std::array<int32_t, 2>, 5> degree_pairs = {
+      std::array<int32_t, 2>{2, 1}, {16, 8}, {32, 16}, {64, 32}, {64, 64}};
+  for (const auto& pair : degree_pairs) {
+    constexpr int64_t degree_n = 131;
+    const int32_t input_degree = pair[0];
+    const int32_t output_degree = pair[1];
+    std::vector<int32_t> degree_input(
+        static_cast<size_t>(degree_n * input_degree));
+    for (int64_t row = 0; row < degree_n; ++row) {
+      std::vector<int32_t> ids;
+      if (row != 0) ids.push_back(0);
+      for (int64_t step = 1; static_cast<int32_t>(ids.size()) < input_degree;
+           ++step) {
+        const int32_t id = static_cast<int32_t>((row + step * 17) % degree_n);
+        if (id == row || std::find(ids.begin(), ids.end(), id) != ids.end()) continue;
+        ids.push_back(id);
+      }
+      std::copy(ids.begin(), ids.end(),
+                degree_input.begin() +
+                    static_cast<std::ptrdiff_t>(row * input_degree));
+    }
+    std::vector<int32_t> cpu;
+    std::vector<int32_t> gpu_output;
+    expect_status(ovvs::impl::cagra_optimize_ranked(
+                      degree_input.data(), degree_n, input_degree, output_degree, cpu),
+                  "degree-seam CPU rank optimizer");
+    expect_status(ovvs::impl::gpu_cagra_optimize_ranked(
+                      *resources, degree_input.data(), degree_n, input_degree,
+                      output_degree, gpu_output),
+                  "degree-seam GPU rank optimizer");
+    expect(gpu_output == cpu,
+           "GPU rank optimizer degree seam must match CPU graph bytes");
+  }
+
+  std::vector<int32_t> malformed = initial;
+  malformed[1] = malformed[0];
+  std::vector<int32_t> failed = {99};
+  expect(ovvs::impl::gpu_cagra_optimize_ranked(
+             *resources, malformed.data(), n, initial_degree, 5, failed) ==
+             OVVS_STATUS_ERROR,
+         "GPU rank optimizer duplicate row rejection");
+  expect(failed.empty(), "failed GPU rank optimization clears staged output");
+  malformed = initial;
+  malformed[0] = 0;
+  expect(ovvs::impl::gpu_cagra_optimize_ranked(
+             *resources, malformed.data(), n, initial_degree, 5, failed) ==
+             OVVS_STATUS_ERROR,
+         "GPU rank optimizer self-edge rejection");
+  expect(failed.empty(), "self-edge failure publishes no GPU output");
+  malformed = initial;
+  malformed[0] = static_cast<int32_t>(n);
+  expect(ovvs::impl::gpu_cagra_optimize_ranked(
+             *resources, malformed.data(), n, initial_degree, 5, failed) ==
+             OVVS_STATUS_ERROR,
+         "GPU rank optimizer out-of-range rejection");
+  expect(failed.empty(), "range failure publishes no GPU output");
+  malformed = initial;
+  malformed[0] = -1;
+  expect(ovvs::impl::gpu_cagra_optimize_ranked(
+             *resources, malformed.data(), n, initial_degree, 5, failed) ==
+             OVVS_STATUS_ERROR,
+         "GPU rank optimizer negative-ID rejection");
+  expect(failed.empty(), "negative-ID failure publishes no GPU output");
+
+  constexpr int64_t cap_n = 70;
+  constexpr int32_t cap_degree = 65;
+  std::vector<int32_t> above_cap(static_cast<size_t>(cap_n * cap_degree));
+  for (int64_t row = 0; row < cap_n; ++row) {
+    for (int32_t rank = 0; rank < cap_degree; ++rank) {
+      above_cap[static_cast<size_t>(row * cap_degree + rank)] =
+          static_cast<int32_t>((row + rank + 1) % cap_n);
+    }
+  }
+  failed = {99};
+  expect(ovvs::impl::gpu_cagra_optimize_ranked(
+             *resources, above_cap.data(), cap_n, cap_degree, 32, failed) ==
+             OVVS_STATUS_UNSUPPORTED,
+         "GPU rank optimizer degree cap must fail closed");
+  expect(failed.empty(), "degree-cap failure publishes no GPU output");
+}
+
 OVVS_TEST(nndescent_gpu_n_over_4096) {
   if (!ovvsSyclEnabled()) skip_test("SYCL GPU path unavailable");
   Res res;
@@ -2456,10 +2581,25 @@ OVVS_TEST(nndescent_large_forced_policy_contract) {
   expect(last == OVVS_DEVICE_CPU, "failed FORCE_GPU NN-Descent preserves last device");
 
   ovvsCagraIndex_t cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
-  expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8,
-                        &cagra) == OVVS_STATUS_DEVICE_UNAVAILABLE,
-         "FORCE_GPU CAGRA build must reject its host prune stage");
-  expect(cagra == nullptr, "failed FORCE_GPU CAGRA build must not publish an index");
+  int32_t gpu_available = 0;
+  expect_status(ovvsResourcesGpuAvailable(res.r, &gpu_available),
+                "CAGRA GPU availability");
+  const ovvsStatus cagra_gpu_status =
+      ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8,
+                     &cagra);
+  if (ovvsSyclEnabled() && gpu_available) {
+    expect_status(cagra_gpu_status, "FORCE_GPU CAGRA build");
+    expect(cagra != nullptr, "successful FORCE_GPU CAGRA build publishes an index");
+    expect_status(ovvsResourcesLastDevice(res.r, &last),
+                  "FORCE_GPU CAGRA attribution");
+    expect(last == OVVS_DEVICE_GPU, "complete FORCE_GPU CAGRA build stamps GPU");
+    ovvsCagraDestroy(cagra);
+  } else {
+    expect(cagra_gpu_status == OVVS_STATUS_DEVICE_UNAVAILABLE,
+           "FORCE_GPU CAGRA build must fail when the GPU is unavailable");
+    expect(cagra == nullptr, "failed FORCE_GPU CAGRA build must not publish an index");
+  }
+  const ovvsDevice device_before_npu = last;
 
   graph = reinterpret_cast<ovvsNnDescentGraph_t>(uintptr_t{1});
   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU);
@@ -2471,7 +2611,8 @@ OVVS_TEST(nndescent_large_forced_policy_contract) {
   expect_status(ovvsResourcesNpuFallbacks(res.r, &after_npu), "NN-Descent count after NPU");
   expect(after_npu == fallback_count + 1, "FORCE_NPU NN-Descent increments fallback once");
   expect_status(ovvsResourcesLastDevice(res.r, &last), "NN-Descent last after NPU failure");
-  expect(last == OVVS_DEVICE_CPU, "failed FORCE_NPU NN-Descent preserves last device");
+  expect(last == device_before_npu,
+         "failed FORCE_NPU NN-Descent preserves last device");
 
   cagra = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
   expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 4, 8, &cagra) ==
@@ -2643,13 +2784,15 @@ OVVS_TEST(cagra_build_telemetry_success_atomicity_and_isolation) {
                                  "post-copy CAGRA failure discards partial telemetry");
 
   expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU),
-                "CAGRA telemetry forced GPU rejection policy");
+                "CAGRA telemetry forced GPU cap policy");
+  constexpr int64_t cap_n = 70;
+  auto cap_data = make_data(cap_n, dim, 4190);
   failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
-  expect(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED,
-                        graph_degree, intermediate_degree, &failed) ==
+  expect(ovvsCagraBuild(res.r, cap_data.data(), cap_n, dim,
+                        OVVS_METRIC_L2_EXPANDED, 32, 65, &failed) ==
              OVVS_STATUS_DEVICE_UNAVAILABLE,
-         "CAGRA forced GPU build rejects host optimizer");
-  expect(failed == nullptr, "unavailable forced GPU build clears output");
+         "CAGRA forced GPU build rejects unsupported optimizer degree");
+  expect(failed == nullptr, "degree-capped forced GPU build clears output");
   expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_NPU),
                 "CAGRA telemetry forced NPU rejection policy");
   failed = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
@@ -3138,7 +3281,8 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
   expect_status(ovvsCagraBuild(res.r, data.data(), n, dim, OVVS_METRIC_L2_EXPANDED, 8, 16, &ix), "b");
   ovvsDevice last = OVVS_DEVICE_AUTO;
   expect_status(ovvsResourcesLastDevice(res.r, &last), "sycl n>4096 build device");
-  expect(last == OVVS_DEVICE_CPU, "mixed CAGRA build must report its final host prune stage");
+  expect(last == OVVS_DEVICE_GPU,
+         "AUTO CAGRA build must report its final GPU optimizer stage");
   const ovvsCagraBuildStatsV1 build_stats = cagra_build_stats_v1(res.r);
   expect(build_stats.successful_calls == 1 && build_stats.rows == n &&
              build_stats.nndescent_initializer_calls == 1 &&

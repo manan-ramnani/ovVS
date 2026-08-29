@@ -1010,8 +1010,8 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
     ++resources->npu_fallbacks;
     return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
-  if (resources->policy == OVVS_POLICY_FORCE_GPU) {
-    /* The build still ends in host pruning until T13.3 lands. */
+  if (resources->policy == OVVS_POLICY_FORCE_GPU &&
+      algo != OVVS_CAGRA_BUILD_NN_DESCENT) {
     return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
   graph_degree = std::max(1, std::min(graph_degree, static_cast<int32_t>(n - 1)));
@@ -1089,14 +1089,19 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
 
     std::vector<int32_t> pruned;
     const auto optimizer_begin = BuildClock::now();
-    status = cagra_optimize_ranked(init.data(), n, intermediate_degree, graph_degree, pruned);
+    status = prim_cagra_optimize_ranked(*resources, init.data(), n,
+                                        intermediate_degree, graph_degree, pruned);
+    if (status == OVVS_STATUS_UNSUPPORTED) {
+      status = cagra_optimize_ranked(init.data(), n, intermediate_degree,
+                                     graph_degree, pruned);
+      if (status == OVVS_STATUS_SUCCESS) resources->last_device = OVVS_DEVICE_CPU;
+    }
     if (status != OVVS_STATUS_SUCCESS) return status;
     call_stats.optimizer_prune_merge_ns = elapsed_ns(optimizer_begin);
 
     const auto materialize_begin = BuildClock::now();
     ix->graph.assign(pruned.begin(), pruned.end());
     call_stats.index_materialize_ns = elapsed_ns(materialize_begin);
-    resources->last_device = OVVS_DEVICE_CPU;
     /* The public total is the inner build wall through persistent materialization.
        Telemetry merge, handle publication, and serialization are outside it. */
     call_stats.total_wall_ns = elapsed_ns(total_begin);

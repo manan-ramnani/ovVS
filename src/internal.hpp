@@ -342,6 +342,11 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
                                int64_t dim, ovvsMetric metric, int32_t degree,
                                int32_t iters, int32_t* graph,
                                NnDescentBuildStats* stats = nullptr);
+OVVS_API ovvsStatus gpu_cagra_optimize_ranked(ResourcesData& r,
+                                               const int32_t* initial, int64_t n,
+                                               int32_t initial_degree,
+                                               int32_t final_degree,
+                                               std::vector<int32_t>& output);
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
@@ -412,6 +417,10 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph, NnDescentBuildStats* stats = nullptr);
+ovvsStatus prim_cagra_optimize_ranked(ResourcesData& r, const int32_t* initial,
+                                      int64_t n, int32_t initial_degree,
+                                      int32_t final_degree,
+                                      std::vector<int32_t>& output);
 /* Private C++ test seam; not part of the installed C ABI. */
 OVVS_API ovvsStatus cagra_optimize_ranked(const int32_t* initial, int64_t n,
                                           int32_t initial_degree, int32_t final_degree,
