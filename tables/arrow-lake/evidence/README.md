@@ -1,8 +1,9 @@
-# Arrow Lake escape-route evidence manifest
+# Arrow Lake evidence manifest
 
-These JSON files are the tracked raw inputs for
-`../npu-igpu-escape-routes.md`. Every timing artifact is standalone negative
-evidence: none authorizes production routing or an acceleration claim.
+The table below covers the tracked raw inputs for
+`../npu-igpu-escape-routes.md`. Every escape-route timing artifact is
+standalone negative evidence: none authorizes production routing or an
+acceleration claim.
 
 | Experiment | 131,072 SHA-256 | 524,288 SHA-256 |
 |---|---|---|
@@ -61,4 +62,5 @@ Other evidence manifests: [`cagra-build-v1/`](cagra-build-v1/README.md),
 [`cagra-cached-worst-v1/`](cagra-cached-worst-v1/README.md),
 [`cagra-frontier-v1/`](cagra-frontier-v1/README.md),
 [`cagra-cooperative-pick-v1/`](cagra-cooperative-pick-v1/README.md), and
-[`gpu-root-group-canary-v1/`](gpu-root-group-canary-v1/README.md).
+[`gpu-root-group-canary-v1/`](gpu-root-group-canary-v1/README.md), and
+[`nndescent-active-count-v1/`](nndescent-active-count-v1/README.md).

@@ -1,3 +1,4 @@
 tables/arrow-lake/evidence/*.json binary
 tables/arrow-lake/evidence/**/*.json binary
 tables/arrow-lake/evidence/**/*.ovvs binary
+tables/arrow-lake/evidence/**/*.patch binary
