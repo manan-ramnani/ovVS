@@ -63,5 +63,6 @@ Other evidence manifests: [`cagra-build-v1/`](cagra-build-v1/README.md),
 [`cagra-frontier-v1/`](cagra-frontier-v1/README.md),
 [`cagra-cooperative-pick-v1/`](cagra-cooperative-pick-v1/README.md),
 [`gpu-root-group-canary-v1/`](gpu-root-group-canary-v1/README.md),
-[`nndescent-active-count-v1/`](nndescent-active-count-v1/README.md), and
-[`nndescent-convergence-reduction-v1/`](nndescent-convergence-reduction-v1/README.md).
+[`nndescent-active-count-v1/`](nndescent-active-count-v1/README.md),
+[`nndescent-convergence-reduction-v1/`](nndescent-convergence-reduction-v1/README.md),
+and [`nndescent-heads-reset-v1/`](nndescent-heads-reset-v1/README.md).

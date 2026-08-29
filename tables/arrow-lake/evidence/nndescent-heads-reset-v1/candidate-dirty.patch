@@ -1,0 +1,70 @@
+diff --git a/src/prim/gpu/backend_gpu.cpp b/src/prim/gpu/backend_gpu.cpp
+index 402ec91..966dd49 100644
+--- a/src/prim/gpu/backend_gpu.cpp
++++ b/src/prim/gpu/backend_gpu.cpp
+@@ -1464,6 +1464,9 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+     bool converged = false;
+ 
+     for (int64_t iteration = 0; iteration < iteration_count; ++iteration) {
++      // Each active-target consumer restores its uniquely owned head before scratch reuse.
++      note_submission();
++      q.fill(heads_ptr, -1, N);
+       for (size_t vertex_offset = 0; vertex_offset < N;
+            vertex_offset += kVertexGroupsPerLaunch) {
+         const size_t launch_vertices = std::min(kVertexGroupsPerLaunch, N - vertex_offset);
+@@ -1511,8 +1514,6 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+         for (size_t source_offset = 0; source_offset < N; source_offset += reverse_chunk) {
+           const size_t source_count = std::min(reverse_chunk, N - source_offset);
+           note_submission();
+-          q.fill(heads_ptr, -1, N);
+-          note_submission();
+           q.fill(scalars_ptr, 0, 1u);
+           note_wait();
+           q.wait_and_throw();
+@@ -1619,6 +1620,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+               link = inbox_links_ptr[slot];
+               ++traversed;
+             }
++            heads_ptr[target] = -1;
+             for (size_t i = 0; i < sample_count; ++i) {
+               reverse_graph[static_cast<size_t>(target) * sample_count + i] =
+                   i < count ? best_ids[i] : kInvalidId;
+@@ -1642,8 +1644,6 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+           return OVVS_STATUS_SHAPE_MISMATCH;
+         }
+         note_submission();
+-        q.fill(heads_ptr, -1, N);
+-        note_submission();
+         q.fill(scalars_ptr, 0, 1u);
+         note_wait();
+         q.wait_and_throw();
+@@ -1957,6 +1957,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+             next_ids[row + insert] = tagged_candidate;
+             next_distances[row + insert] = candidate_distance;
+           }
++          heads_ptr[target] = -1;
+         });
+         note_wait();
+         q.wait_and_throw();
+diff --git a/tests/test_neighbors.cpp b/tests/test_neighbors.cpp
+index e8756a1..907ddad 100644
+--- a/tests/test_neighbors.cpp
++++ b/tests/test_neighbors.cpp
+@@ -2314,7 +2314,7 @@ OVVS_TEST(nndescent_gpu_bounded_scale) {
+   expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "scale NN-Descent GPU availability");
+   if (!gpu) skip_test("GPU device unavailable");
+ 
+-  const int64_t n = 16384, dim = 16;
++  const int64_t n = 16385, dim = 16;
+   const int32_t degree = 16, iterations = 4;
+   auto data = make_data(n, dim, 306);
+   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+@@ -3165,7 +3165,7 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
+              build_stats.nndescent_gpu_d2h_calls == 3 + 5 * gpu_iterations &&
+              build_stats.nndescent_gpu_d2h_bytes > 0 &&
+              build_stats.nndescent_gpu_kernel_launches == 3 + 8 * gpu_iterations &&
+-             build_stats.nndescent_gpu_submission_calls == 7 + 21 * gpu_iterations &&
++             build_stats.nndescent_gpu_submission_calls == 7 + 19 * gpu_iterations &&
+              build_stats.nndescent_gpu_wait_calls == 20 + 16 * gpu_iterations,
+          "fixed large CAGRA fixture publishes exact explicit GPU work counters");
+   expect(build_stats.total_wall_ns >= cagra_named_stage_ns(build_stats),

@@ -70,7 +70,9 @@ publication, and exact counter formulas sound.
 Only one valid build pair per size was run and no graph digest was captured.
 That is sufficient for rejection: the candidate did not approach the required
 complete-wall improvement and added a single-work-group strided scan.
-The next bounded B5 change should attack repeated work rather than readback
-volume: initialize the `heads` scratch once per iteration, have each unique
-target-owned consumer reset the rows it touched, and retain the original
-dynamic active-count launches and convergence path.
+The subsequent bounded B5 change attacked repeated work rather than readback
+volume: it initialized the `heads` scratch once per iteration and had each
+unique target-owned consumer reset the rows it touched. That candidate retained
+dynamic active-count launches and the original convergence path, but was also
+rejected after regressing the SIFT1M initializer 6.17%. Evidence:
+[`nndescent-heads-reset-v1.md`](nndescent-heads-reset-v1.md).
