@@ -2258,6 +2258,10 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
            const size_t qi = query_offset + item.get_group_linear_id();
            const size_t visited_base = item.get_group_linear_id() * visited_capacity;
            auto group = item.get_group();
+           auto subgroup = item.get_sub_group();
+           const size_t subgroup_id = subgroup.get_group_linear_id();
+           const size_t subgroup_lane = subgroup.get_local_linear_id();
+           const size_t subgroup_size = subgroup.get_local_linear_range();
 
            for (size_t i = lid; i < visited_capacity; i += work_group_size) {
              VISITED[visited_base + i] = -1;
@@ -2371,9 +2375,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
            }
 
            for (int iter = 0; iter < max_iters; ++iter) {
-             if (lid == 0) {
-               int32_t npicks = 0;
-               for (size_t s = 0; s < SW; ++s) {
+             if (SW == 1) {
+               if (lid == 0) {
                  int32_t best = -1;
                  float best_distance = std::numeric_limits<float>::max();
                  for (int32_t i = 0; i < state[0]; ++i) {
@@ -2383,11 +2386,53 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                      best_distance = candidate_distances[static_cast<size_t>(i)];
                    }
                  }
-                 if (best < 0) break;
-                 candidate_expanded[static_cast<size_t>(best)] = 1;
-                 picks[static_cast<size_t>(npicks++)] = candidate_ids[static_cast<size_t>(best)];
+                 if (best < 0) {
+                   state[2] = 0;
+                 } else {
+                   candidate_expanded[static_cast<size_t>(best)] = 1;
+                   picks[0] = candidate_ids[static_cast<size_t>(best)];
+                   state[2] = 1;
+                 }
                }
-               state[2] = npicks;
+             } else if (subgroup_id == 0) {
+               /* Preserve the serial (distance, candidate-slot) order. A selected
+                  slot is marked by the same modulo owner that rescans it, so
+                  successive picks need no additional work-group barrier. */
+               int32_t npicks = 0;
+               for (size_t s = 0; s < SW; ++s) {
+                 float lane_distance = std::numeric_limits<float>::max();
+                 uint32_t lane_slot = std::numeric_limits<uint32_t>::max();
+                 const uint32_t candidate_count = static_cast<uint32_t>(state[0]);
+                 for (uint32_t i = static_cast<uint32_t>(subgroup_lane); i < candidate_count;
+                      i += static_cast<uint32_t>(subgroup_size)) {
+                   const float distance = candidate_distances[static_cast<size_t>(i)];
+                   if (!candidate_expanded[static_cast<size_t>(i)] &&
+                       distance < std::numeric_limits<float>::max() &&
+                       (distance < lane_distance || (distance == lane_distance && i < lane_slot))) {
+                     lane_distance = distance;
+                     lane_slot = i;
+                   }
+                 }
+
+                 const float best_distance =
+                     sycl::reduce_over_group(subgroup, lane_distance, sycl::minimum<float>());
+                 const uint32_t proposal =
+                     lane_slot != std::numeric_limits<uint32_t>::max() && lane_distance == best_distance
+                         ? lane_slot
+                         : std::numeric_limits<uint32_t>::max();
+                 const uint32_t best_slot =
+                     sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
+                 if (best_slot == std::numeric_limits<uint32_t>::max()) break;
+
+                 if (subgroup_lane == static_cast<size_t>(best_slot) % subgroup_size) {
+                   candidate_expanded[static_cast<size_t>(best_slot)] = 1;
+                 }
+                 if (subgroup_lane == 0) {
+                   picks[static_cast<size_t>(npicks)] = candidate_ids[static_cast<size_t>(best_slot)];
+                 }
+                 ++npicks;
+               }
+               if (subgroup_lane == 0) state[2] = npicks;
              }
              item.barrier(sycl::access::fence_space::local_space);
              const int32_t npicks = state[2];
