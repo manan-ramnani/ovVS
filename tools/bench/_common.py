@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from collections import Counter
 import hashlib
 import importlib.metadata
 import json
@@ -186,6 +187,8 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
             {"itopk_size": 64, "search_width": 2, "query_batch_size": 32},
             {"itopk_size": 128, "search_width": 4, "query_batch_size": 32},
             {"itopk_size": 128, "search_width": 4, "query_batch_size": 1, "purpose": "b1_latency"},
+            {"itopk_size": 64, "search_width": 2, "query_batch_size": 256, "purpose": "b1_throughput"},
+            {"itopk_size": 64, "search_width": 2, "query_batch_size": 1024, "purpose": "b1_throughput"},
         ],
         "hnsw_ef_construction": 200,
         "hnsw_points": [
@@ -194,6 +197,8 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
             {"ef": 128, "query_batch_size": 32},
             {"ef": 256, "query_batch_size": 32},
             {"ef": 256, "query_batch_size": 1, "purpose": "b1_latency"},
+            {"ef": 64, "query_batch_size": 256, "purpose": "b1_throughput"},
+            {"ef": 64, "query_batch_size": 1024, "purpose": "b1_throughput"},
         ],
     },
     "embedding-100k": {
@@ -1561,8 +1566,14 @@ def policy_contract(algorithm: str, policy: str, devices: Sequence[int]) -> dict
     }
 
 
-def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: dict[str, Any],
-                      lanes: Sequence[dict[str, Any]]) -> list[str]:
+def completion_issues(
+    profile_name: str,
+    dataset: dict[str, Any],
+    ground_truth: dict[str, Any],
+    lanes: Sequence[dict[str, Any]],
+    *,
+    require_full_point_matrix: bool = False,
+) -> list[str]:
     issues: list[str] = []
     full_profile = profile_name != "smoke"
     if dataset.get("status") != "success":
@@ -1709,9 +1720,55 @@ def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: 
                 issues.append(f"{lane_id}: forced build policy contract {build_contract.get('status', 'missing')}")
             if build_policy_key == "hetero" and build_contract.get("status") != "unwired_equals_auto":
                 issues.append(f"{lane_id}: HETERO build policy contract is missing")
+        hnsw_implementation = lane.get("implementation") in ("hnswlib", "hnswlib-export")
+        if full_profile and hnsw_implementation:
+            metadata = lane.get("implementation_metadata", {})
+            binary = metadata.get("module_binary", {})
+            digest = binary.get("sha256")
+            if (
+                binary.get("status") != "verified"
+                or not isinstance(binary.get("bytes"), int)
+                or binary.get("bytes") <= 0
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                issues.append(f"{lane_id}: full-profile hnswlib comparator has no binary identity")
+            if metadata.get("threading") != "explicit" or not isinstance(
+                metadata.get("num_threads"), int
+            ) or metadata.get("num_threads") <= 0:
+                issues.append(f"{lane_id}: full-profile hnswlib threads were not explicitly pinned")
+            if binary.get("selection") == "explicit_module" and metadata.get(
+                "build_provenance", {}
+            ).get("status") != "verified":
+                issues.append(f"{lane_id}: explicit hnswlib module has no hash-matched provenance")
         points = lane.get("points", [])
         if not points:
             issues.append(f"{lane_id}: successful lane has no curve points")
+        if (
+            full_profile
+            and require_full_point_matrix
+            and lane.get("algorithm") in ("cagra", "hnsw")
+        ):
+            algorithm = str(lane["algorithm"])
+            expected = point_parameters(resolved_profile(profile_name), algorithm)
+            expected_keys = Counter(
+                json.dumps(point, sort_keys=True, separators=(",", ":")) for point in expected
+            )
+            actual_parameters = [point.get("parameters") for point in points]
+            actual_keys = Counter(
+                json.dumps(point, sort_keys=True, separators=(",", ":"))
+                for point in actual_parameters
+                if isinstance(point, dict)
+            )
+            if len(actual_parameters) != sum(actual_keys.values()) or actual_keys != expected_keys:
+                missing = list((expected_keys - actual_keys).elements())
+                unexpected = list((actual_keys - expected_keys).elements())
+                issues.append(
+                    f"{lane_id}: incomplete configured {profile_name} {algorithm} point multiset "
+                    f"(expected={sum(expected_keys.values())}, actual={len(actual_parameters)}, "
+                    f"missing={missing}, unexpected={unexpected})"
+                )
         for point in points:
             if point.get("status") != "success":
                 issues.append(f"{lane_id} curve point: {point.get('reason', point.get('status'))}")
@@ -1726,6 +1783,13 @@ def completion_issues(profile_name: str, dataset: dict[str, Any], ground_truth: 
                 issues.append(f"{lane_id}: successful point has incomplete/invalid repeat statistics")
             if ground_truth.get("status") == "success" and point.get("recall", {}).get("status") != "success":
                 issues.append(f"{lane_id}: successful point has no exact-recall result")
+            if (
+                full_profile
+                and hnsw_implementation
+                and point.get("search_threading", {}).get("status")
+                != "inferred_from_pinned_binding"
+            ):
+                issues.append(f"{lane_id}: full-profile point has no effective-thread provenance")
             energy = point.get("energy", {})
             if full_profile and energy.get("status") != "success":
                 issues.append(

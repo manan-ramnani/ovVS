@@ -92,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit hnswlib build/search threads; fixed modes default to os.cpu_count()",
     )
     parser.add_argument(
+        "--hnsw-module",
+        help="explicit hnswlib extension module; requires a hash-matched --hnsw-provenance file",
+    )
+    parser.add_argument(
+        "--hnsw-provenance",
+        help="ovvs.hnswlib-build.v1 JSON describing and hashing the explicit hnswlib module",
+    )
+    parser.add_argument(
         "--include-hnsw-export",
         action="store_true",
         help="add an experimental ovVS-CAGRA-build/export plus stock-hnswlib-search lane",
@@ -156,6 +164,25 @@ def normalize_preflight_configuration(args: argparse.Namespace) -> None:
     args.include_hnsw_export = False
     if args.hnsw_threads is None:
         args.hnsw_threads = max(1, os.cpu_count() or 1)
+
+
+def normalize_hnsw_configuration(args: argparse.Namespace) -> None:
+    """Fail closed when an explicit comparator cannot be tied to build evidence."""
+
+    module = getattr(args, "hnsw_module", None)
+    provenance = getattr(args, "hnsw_provenance", None)
+    if bool(module) != bool(provenance):
+        raise ValueError("--hnsw-module and --hnsw-provenance must be supplied together")
+    if not module:
+        return
+    module_path = Path(module).expanduser().resolve()
+    provenance_path = Path(provenance).expanduser().resolve()
+    if not module_path.is_file():
+        raise ValueError(f"hnswlib module is not a file: {module_path}")
+    if not provenance_path.is_file():
+        raise ValueError(f"hnswlib provenance is not a file: {provenance_path}")
+    args.hnsw_module = str(module_path)
+    args.hnsw_provenance = str(provenance_path)
 
 
 def gate_exit_code(artifact: dict[str, Any]) -> int:
@@ -259,9 +286,15 @@ def _artifact(
     lanes: list[dict[str, Any]],
     started_at: str,
 ) -> dict[str, Any]:
-    issues = completion_issues(args.profile, dataset, ground_truth, lanes)
     gate_only = getattr(args, "gate_only", None)
     preflight_only = getattr(args, "preflight_only", None)
+    issues = completion_issues(
+        args.profile,
+        dataset,
+        ground_truth,
+        lanes,
+        require_full_point_matrix=gate_only is None and preflight_only is None,
+    )
     quality_gate = None
     preflight = None
     if gate_only == CAGRA_RECALL_GATE:
@@ -311,6 +344,8 @@ def _artifact(
                 else None
             ),
             "hnswlib_threads": getattr(args, "hnsw_threads", None),
+            "hnswlib_module": getattr(args, "hnsw_module", None),
+            "hnswlib_provenance": getattr(args, "hnsw_provenance", None),
             "include_hnsw_export": bool(getattr(args, "include_hnsw_export", False)),
             "seed": getattr(args, "seed", 7),
             "energy": not getattr(args, "no_energy", False),
@@ -355,6 +390,14 @@ def _artifact(
                 "SIFT-100k is a noncanonical prefix preflight and cannot close the SIFT1M quality gate.",
                 *(
                     [
+                        "The hnswlib comparator used an explicit extension and a hash-matched build "
+                        "provenance document; lane metadata is authoritative over the ambient package version."
+                    ]
+                    if getattr(args, "hnsw_module", None)
+                    else []
+                ),
+                *(
+                    [
                         "The hnswlib export lane's construction wall covers ovVS resource creation "
                         "through a loaded stock index and includes instrumentation snapshots; an "
                         "instrumentation-adjusted value and the production-stage sum are also retained. "
@@ -390,6 +433,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     try:
         normalize_gate_configuration(args)
         normalize_preflight_configuration(args)
+        normalize_hnsw_configuration(args)
         algorithms = parse_selection(args.algorithms, ALGORITHM_ORDER, "algorithm")
         policies = parse_selection(args.policies, POLICY_ORDER, "policy")
         build_policies = parse_selection(args.build_policy, POLICY_ORDER, "build policy")
@@ -437,6 +481,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                 else {}
             ),
             "hnsw_threads": getattr(args, "hnsw_threads", None),
+            "hnsw_module": getattr(args, "hnsw_module", None),
+            "hnsw_provenance": getattr(args, "hnsw_provenance", None),
             "include_hnsw_export": bool(getattr(args, "include_hnsw_export", False)),
         }
         spec_path = directory / "run-spec.json"

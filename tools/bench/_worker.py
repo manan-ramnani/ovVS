@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from array import array
 import hashlib
+import importlib.util
 import json
 import mmap
 import os
@@ -1296,13 +1297,198 @@ def run_faiss(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_HNSWLIB_AVX2_SOURCE = {
+    "repository": "https://github.com/nmslib/hnswlib.git",
+    "tag": "v0.8.0",
+    "version": "0.8.0",
+    "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d",
+    "tree": "fa3b6d92bd6b0c3a81a7236731c7ad7905c949a1",
+}
+_HNSWLIB_AVX2_COMPILE_OPTIONS = ["/O2", "/openmp", "/EHsc", "/arch:AVX2"]
+_HNSWLIB_AVX2_SIMD_FIELDS = ("ymm_operands", "vsubps", "vmulps", "vaddps", "vmovups")
+
+
+def _validate_hnswlib_avx2_provenance(
+    document: dict[str, Any], binary: dict[str, Any]
+) -> str:
+    if document.get("schema_version") != "ovvs.hnswlib-build.v1":
+        raise ValueError("hnswlib provenance has an unsupported schema_version")
+    recorded_binary = document.get("binary")
+    if not isinstance(recorded_binary, dict):
+        raise ValueError("hnswlib provenance has no binary object")
+    if binary.get("status") != "verified":
+        raise ValueError("hnswlib provenance cannot be checked without a readable module binary")
+    if str(recorded_binary.get("sha256", "")).lower() != binary["sha256"]:
+        raise ValueError("hnswlib provenance binary SHA-256 does not match the loaded module")
+    if recorded_binary.get("bytes") != binary["bytes"]:
+        raise ValueError("hnswlib provenance binary byte count does not match the loaded module")
+
+    source = document.get("source")
+    if not isinstance(source, dict) or any(
+        source.get(key) != value for key, value in _HNSWLIB_AVX2_SOURCE.items()
+    ):
+        raise ValueError("hnswlib provenance does not name the pinned v0.8.0 source identity")
+    if source.get("tracked_files_clean_after_build") is not True:
+        raise ValueError("hnswlib provenance does not certify a clean tracked source tree")
+
+    toolchain = document.get("toolchain")
+    if not isinstance(toolchain, dict):
+        raise ValueError("hnswlib provenance has no toolchain object")
+    if toolchain.get("compile_options") != _HNSWLIB_AVX2_COMPILE_OPTIONS:
+        raise ValueError("hnswlib provenance does not certify the pinned MSVC AVX2 options")
+    injected = toolchain.get("injected_environment")
+    if not isinstance(injected, dict) or injected.get("CL") != "/O2 /openmp /arch:AVX2":
+        raise ValueError("hnswlib provenance does not certify the injected /arch:AVX2 build")
+
+    verification = document.get("verification")
+    if not isinstance(verification, dict) or verification.get("pe_machine") != "x64":
+        raise ValueError("hnswlib provenance does not certify an x64 candidate")
+    smoke = verification.get("import_add_query_smoke")
+    if (
+        not isinstance(smoke, dict)
+        or smoke.get("status") != "success"
+        or smoke.get("finite_distances") is not True
+    ):
+        raise ValueError("hnswlib provenance has no successful finite import/add/query smoke")
+    candidate = verification.get("candidate")
+    if not isinstance(candidate, dict) or any(
+        type(candidate.get(field)) is not int or candidate[field] <= 0
+        for field in _HNSWLIB_AVX2_SIMD_FIELDS
+    ):
+        raise ValueError("hnswlib provenance has no positive AVX/YMM float-distance evidence")
+    candidate_module = candidate.get("module")
+    if (
+        not isinstance(candidate_module, dict)
+        or candidate_module.get("bytes") != binary["bytes"]
+        or str(candidate_module.get("sha256", "")).lower() != binary["sha256"]
+    ):
+        raise ValueError("hnswlib provenance candidate verification is not bound to the loaded module")
+    return str(source["version"])
+
+
+def _load_hnswlib(spec: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    configured_module = spec.get("hnsw_module")
+    provenance_path_value = spec.get("hnsw_provenance")
+    if bool(configured_module) != bool(provenance_path_value):
+        raise ValueError("hnsw_module and hnsw_provenance must be supplied together")
+
+    provenance: dict[str, Any] = {"status": "not_supplied"}
+    source_version = None
+    if configured_module:
+        module_path = Path(configured_module).expanduser().resolve()
+        if not module_path.is_file():
+            raise UnavailableError(f"configured hnswlib module is not a file: {module_path}")
+        selection = "explicit_module"
+        binary = {
+            "status": "verified",
+            "path": str(module_path),
+            "bytes": module_path.stat().st_size,
+            "sha256": _sha256_path(module_path),
+            "selection": selection,
+        }
+        provenance_path = Path(provenance_path_value).expanduser().resolve()
+        if not provenance_path.is_file():
+            raise UnavailableError(f"configured hnswlib provenance is not a file: {provenance_path}")
+        document = json.loads(provenance_path.read_text(encoding="utf-8"))
+        source_version = _validate_hnswlib_avx2_provenance(document, binary)
+        provenance = {
+            "status": "verified",
+            "contract": "pinned_hnswlib_0.8.0_msvc_avx2_static",
+            "active_cycle_attribution": False,
+            "path": str(provenance_path),
+            "sha256": _sha256_path(provenance_path),
+            "document": document,
+        }
+
+        module_spec = importlib.util.spec_from_file_location("hnswlib", module_path)
+        if module_spec is None or module_spec.loader is None:
+            raise UnavailableError(f"configured hnswlib module cannot be loaded: {module_path}")
+        hnswlib = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(hnswlib)
+    else:
+        try:
+            import hnswlib
+        except ImportError as exc:
+            raise UnavailableError(f"hnswlib is not importable: {exc}") from exc
+        module_file = getattr(hnswlib, "__file__", None)
+        module_path = Path(module_file).resolve() if module_file else None
+        selection = "environment_import"
+        if module_path is not None and module_path.is_file():
+            binary = {
+                "status": "verified",
+                "path": str(module_path),
+                "bytes": module_path.stat().st_size,
+                "sha256": _sha256_path(module_path),
+                "selection": selection,
+            }
+        else:
+            binary = {
+                "status": "unavailable",
+                "path": str(module_path) if module_path is not None else None,
+                "selection": selection,
+                "reason": "loaded module has no readable file identity",
+            }
+
+    if not callable(getattr(hnswlib, "Index", None)):
+        raise UnavailableError("loaded hnswlib module does not expose Index")
+
+    reported_version = source_version if configured_module else package_version("hnswlib")
+    return hnswlib, {
+        "hnswlib_version": reported_version,
+        "module_binary": binary,
+        "build_provenance": provenance,
+    }
+
+
+def _hnsw_inferred_search_threads(
+    query_count: int,
+    batch_size: int,
+    requested_threads: int | None,
+    hnswlib_version: str | None,
+) -> dict[str, Any]:
+    if requested_threads is None:
+        return {
+            "status": "not_inferred",
+            "reason": "hnswlib search threads were not explicitly pinned",
+        }
+    if hnswlib_version != "0.8.0":
+        return {
+            "status": "not_inferred",
+            "requested_threads": requested_threads,
+            "reason": "the effective-thread rule is pinned only for hnswlib 0.8.0",
+        }
+    batch_histogram: dict[str, int] = {}
+    thread_histogram: dict[str, int] = {}
+    for start in range(0, query_count, batch_size):
+        rows = min(batch_size, query_count - start)
+        threads = min(requested_threads, rows)
+        effective = 1 if rows <= threads * 4 else threads
+        batch_histogram[str(rows)] = batch_histogram.get(str(rows), 0) + 1
+        thread_histogram[str(effective)] = thread_histogram.get(str(effective), 0) + 1
+    effective_values = [int(value) for value in thread_histogram]
+    return {
+        "status": "inferred_from_pinned_binding",
+        "contract": "hnswlib-0.8.0-python-binding: one thread when rows <= 4 * available threads",
+        "requested_threads": requested_threads,
+        "batch_rows_histogram": batch_histogram,
+        "effective_threads_histogram": thread_histogram,
+        "effective_threads_min": min(effective_values),
+        "effective_threads_max": max(effective_values),
+    }
+
+
 def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     import numpy as np
 
-    try:
-        import hnswlib
-    except ImportError as exc:
-        raise UnavailableError(f"hnswlib is not importable: {exc}") from exc
+    hnswlib, hnsw_metadata = _load_hnswlib(spec)
     started_at, started = utc_now(), time.perf_counter()
     base, queries = load_dataset(spec["dataset"])
     truth = np.load(spec["truth_path"], allow_pickle=False).tolist() if Path(spec["truth_path"]).exists() else None
@@ -1360,6 +1546,12 @@ def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
                         "recall": recall_result(ids.tolist(), truth, profile["k"]),
                         "validation": validation,
                         "energy": _energy(spec, reader, search_once, len(queries)),
+                        "search_threading": _hnsw_inferred_search_threads(
+                            len(queries),
+                            point["query_batch_size"],
+                            hnsw_threads,
+                            hnsw_metadata["hnswlib_version"],
+                        ),
                         "reason": "; ".join(validation["issues"]) or None,
                     }
                 )
@@ -1378,7 +1570,7 @@ def run_hnsw(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
         "build": {"status": "success", "elapsed_ms": build_ms},
         "points": points,
         "implementation_metadata": {
-            "hnswlib_version": package_version("hnswlib"),
+            **hnsw_metadata,
             "M": profile["graph_degree"],
             "ef_construction": profile["hnsw_ef_construction"],
             "random_seed": spec["seed"],
@@ -1534,10 +1726,7 @@ def _hnsw_export_graph_stats(path: Path) -> dict[str, Any]:
 def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     """Build with ovVS CAGRA, export, then search through unmodified hnswlib."""
 
-    try:
-        import hnswlib
-    except ImportError as exc:
-        raise UnavailableError(f"hnswlib is not importable: {exc}") from exc
+    hnswlib, hnsw_metadata = _load_hnswlib(spec)
 
     started_at, started = utc_now(), time.perf_counter()
     module = load_ovvs(spec.get("library"))
@@ -1548,13 +1737,14 @@ def run_hnsw_export(spec: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any
             lane,
             module,
             hnswlib,
+            hnsw_metadata,
             loaded_library,
             started_at,
             started,
         )
     except Exception as exc:
         metadata = _loaded_ovvs_metadata(module, loaded_library)
-        metadata["hnswlib_version"] = package_version("hnswlib")
+        metadata.update(hnsw_metadata)
         return _error(
             lane,
             exception_point_status(exc),
@@ -1568,6 +1758,7 @@ def _run_loaded_hnsw_export(
     lane: dict[str, Any],
     module: Any,
     hnswlib: Any,
+    hnsw_metadata: dict[str, Any],
     loaded_library: dict[str, Any],
     started_at: str,
     started: float,
@@ -1771,7 +1962,7 @@ def _run_loaded_hnsw_export(
                 "points": [],
                 "implementation_metadata": {
                     "ovvs_version": module.version(),
-                    "hnswlib_version": package_version("hnswlib"),
+                    **hnsw_metadata,
                     "loaded_library": loaded_library,
                     "build_policy": POLICY_LABELS[build_policy],
                     "cagra_build_algo": cagra_build_algo,
@@ -1823,6 +2014,12 @@ def _run_loaded_hnsw_export(
                             "recall": recall_result(ids.tolist(), truth, profile["k"]),
                             "validation": validation,
                             "energy": _energy(spec, reader, search_once, len(queries)),
+                            "search_threading": _hnsw_inferred_search_threads(
+                                len(queries),
+                                point["query_batch_size"],
+                                hnsw_threads,
+                                hnsw_metadata["hnswlib_version"],
+                            ),
                             "reason": "; ".join(validation["issues"]) or None,
                         }
                     )
@@ -1863,7 +2060,7 @@ def _run_loaded_hnsw_export(
             "points": points,
             "implementation_metadata": {
                 "ovvs_version": module.version(),
-                "hnswlib_version": package_version("hnswlib"),
+                **hnsw_metadata,
                 "library": os.environ.get("OVVS_LIBRARY"),
                 "loaded_library": loaded_library,
                 "producer": "ovVS CAGRA build plus single-layer hnswlib export",

@@ -398,6 +398,205 @@ class PureHelperTests(unittest.TestCase):
                 [{"itopk_size": 31, "search_width": 1, "query_batch_size": 32}],
             )
 
+    def test_sift1m_has_targeted_full_thread_throughput_points(self) -> None:
+        profile = resolved_profile("sift1m")
+        for batch_size in (256, 1024):
+            self.assertIn(
+                {
+                    "itopk_size": 64,
+                    "search_width": 2,
+                    "query_batch_size": batch_size,
+                    "purpose": "b1_throughput",
+                },
+                profile["cagra_points"],
+            )
+            self.assertIn(
+                {"ef": 64, "query_batch_size": batch_size, "purpose": "b1_throughput"},
+                profile["hnsw_points"],
+            )
+
+    def test_explicit_hnsw_module_requires_matching_provenance_argument(self) -> None:
+        args = bench.build_parser().parse_args(["--hnsw-module", "hnswlib.pyd"])
+        with self.assertRaisesRegex(ValueError, "must be supplied together"):
+            bench.normalize_hnsw_configuration(args)
+
+    def test_hnsw_effective_thread_inference_exposes_binding_batch_threshold(self) -> None:
+        batch32 = _worker._hnsw_inferred_search_threads(1_000, 32, 20, "0.8.0")
+        batch256 = _worker._hnsw_inferred_search_threads(1_000, 256, 20, "0.8.0")
+        batch1024 = _worker._hnsw_inferred_search_threads(1_000, 1024, 20, "0.8.0")
+        self.assertEqual(batch32["effective_threads_histogram"], {"1": 32})
+        self.assertEqual(batch32["batch_rows_histogram"], {"32": 31, "8": 1})
+        self.assertEqual(batch256["effective_threads_histogram"], {"20": 4})
+        self.assertEqual(batch256["batch_rows_histogram"], {"256": 3, "232": 1})
+        self.assertEqual(batch1024["effective_threads_histogram"], {"20": 1})
+        self.assertEqual(batch1024["batch_rows_histogram"], {"1000": 1})
+
+    def test_explicit_hnsw_module_is_hash_matched_to_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            module_path = directory / "hnswlib.py"
+            module_path.write_text("class Index:\n    pass\n", encoding="utf-8")
+            module_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+            manifest_path = directory / "hnswlib-build.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "ovvs.hnswlib-build.v1",
+                        "source": {
+                            "repository": "https://github.com/nmslib/hnswlib.git",
+                            "tag": "v0.8.0",
+                            "version": "0.8.0",
+                            "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d",
+                            "tree": "fa3b6d92bd6b0c3a81a7236731c7ad7905c949a1",
+                            "tracked_files_clean_after_build": True,
+                        },
+                        "toolchain": {
+                            "compile_options": ["/O2", "/openmp", "/EHsc", "/arch:AVX2"],
+                            "injected_environment": {"CL": "/O2 /openmp /arch:AVX2"},
+                        },
+                        "binary": {
+                            "bytes": module_path.stat().st_size,
+                            "sha256": module_sha256,
+                        },
+                        "verification": {
+                            "pe_machine": "x64",
+                            "import_add_query_smoke": {
+                                "status": "success",
+                                "finite_distances": True,
+                            },
+                            "candidate": {
+                                "module": {
+                                    "bytes": module_path.stat().st_size,
+                                    "sha256": module_sha256,
+                                },
+                                "ymm_operands": 1,
+                                "vsubps": 1,
+                                "vmulps": 1,
+                                "vaddps": 1,
+                                "vmovups": 1,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _, metadata = _worker._load_hnswlib(
+                {
+                    "hnsw_module": str(module_path),
+                    "hnsw_provenance": str(manifest_path),
+                }
+            )
+            self.assertEqual(metadata["hnswlib_version"], "0.8.0")
+            self.assertEqual(metadata["module_binary"]["sha256"], module_sha256)
+            self.assertEqual(metadata["build_provenance"]["status"], "verified")
+            self.assertFalse(metadata["build_provenance"]["active_cycle_attribution"])
+
+            document = json.loads(manifest_path.read_text(encoding="utf-8"))
+            document["binary"]["sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                _worker._load_hnswlib(
+                    {
+                        "hnsw_module": str(module_path),
+                        "hnsw_provenance": str(manifest_path),
+                    }
+                )
+
+    def test_hnsw_avx2_provenance_rejects_semantic_contract_violations(self) -> None:
+        binary = {"status": "verified", "bytes": 17, "sha256": "a" * 64}
+        valid = {
+            "schema_version": "ovvs.hnswlib-build.v1",
+            "source": {
+                "repository": "https://github.com/nmslib/hnswlib.git",
+                "tag": "v0.8.0",
+                "version": "0.8.0",
+                "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d",
+                "tree": "fa3b6d92bd6b0c3a81a7236731c7ad7905c949a1",
+                "tracked_files_clean_after_build": True,
+            },
+            "toolchain": {
+                "compile_options": ["/O2", "/openmp", "/EHsc", "/arch:AVX2"],
+                "injected_environment": {"CL": "/O2 /openmp /arch:AVX2"},
+            },
+            "binary": {"bytes": 17, "sha256": "a" * 64},
+            "verification": {
+                "pe_machine": "x64",
+                "import_add_query_smoke": {"status": "success", "finite_distances": True},
+                "candidate": {
+                    "module": {"bytes": 17, "sha256": "a" * 64},
+                    "ymm_operands": 1,
+                    "vsubps": 1,
+                    "vmulps": 1,
+                    "vaddps": 1,
+                    "vmovups": 1,
+                },
+            },
+        }
+        cases = {
+            "source identity": lambda doc: doc["source"].update(commit="0" * 40),
+            "clean tracked source": lambda doc: doc["source"].update(
+                tracked_files_clean_after_build=False
+            ),
+            "MSVC AVX2 options": lambda doc: doc["toolchain"].update(
+                compile_options=["/O2", "/EHsc"]
+            ),
+            "finite import/add/query smoke": lambda doc: doc["verification"].update(
+                import_add_query_smoke={"status": "success", "finite_distances": False}
+            ),
+            "AVX/YMM float-distance evidence": lambda doc: doc["verification"][
+                "candidate"
+            ].update(vmulps=0),
+            "bound to the loaded module": lambda doc: doc["verification"][
+                "candidate"
+            ]["module"].update(sha256="b" * 64),
+        }
+        for message, mutate in cases.items():
+            with self.subTest(message=message):
+                document = json.loads(json.dumps(valid))
+                mutate(document)
+                with self.assertRaisesRegex(ValueError, message):
+                    _worker._validate_hnswlib_avx2_provenance(document, binary)
+
+    def test_worker_rejects_explicit_hnsw_module_without_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module_path = Path(raw) / "hnswlib.py"
+            module_path.write_text("class Index:\n    pass\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be supplied together"):
+                _worker._load_hnswlib({"hnsw_module": str(module_path)})
+
+    def test_invalid_hnsw_provenance_is_rejected_before_module_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            marker = directory / "executed.txt"
+            module_path = directory / "hnswlib.py"
+            module_path.write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+                "class Index:\n    pass\n",
+                encoding="utf-8",
+            )
+            manifest_path = directory / "hnswlib-build.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "ovvs.hnswlib-build.v1",
+                        "source": {"version": "0.8.0"},
+                        "binary": {
+                            "bytes": module_path.stat().st_size,
+                            "sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "pinned v0.8.0 source identity"):
+                _worker._load_hnswlib(
+                    {
+                        "hnsw_module": str(module_path),
+                        "hnsw_provenance": str(manifest_path),
+                    }
+                )
+            self.assertFalse(marker.exists())
+
     def test_gate_configuration_normalizes_conflicting_selection(self) -> None:
         args = bench.build_parser().parse_args(
             [
@@ -1234,6 +1433,49 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
             [],
         )
 
+    def test_full_profile_rejects_incomplete_cagra_and_hnsw_point_multisets(self) -> None:
+        profile = resolved_profile("sift1m")
+        for lane_id, implementation, algorithm, expected in (
+            ("ovvs.cagra.auto", "ovvs", "cagra", profile["cagra_points"]),
+            ("hnswlib.hnsw", "hnswlib", "hnsw", profile["hnsw_points"]),
+        ):
+            with self.subTest(algorithm=algorithm):
+                lane = successful_lane(lane_id)
+                lane.update(implementation=implementation, algorithm=algorithm)
+                template = lane["points"][0]
+                lane["points"] = [
+                    {**json.loads(json.dumps(template)), "parameters": point}
+                    for point in expected
+                ]
+                complete = completion_issues(
+                    "sift1m",
+                    {"status": "success"},
+                    {"status": "success", "exact": True},
+                    [lane],
+                    require_full_point_matrix=True,
+                )
+                self.assertFalse(any("point multiset" in issue for issue in complete))
+
+                lane["points"] = lane["points"][:-1]
+                incomplete = completion_issues(
+                    "sift1m",
+                    {"status": "success"},
+                    {"status": "success", "exact": True},
+                    [lane],
+                    require_full_point_matrix=True,
+                )
+                self.assertTrue(any("incomplete configured" in issue for issue in incomplete))
+
+                lane["points"].append(json.loads(json.dumps(lane["points"][0])))
+                duplicated = completion_issues(
+                    "sift1m",
+                    {"status": "success"},
+                    {"status": "success", "exact": True},
+                    [lane],
+                    require_full_point_matrix=True,
+                )
+                self.assertTrue(any("incomplete configured" in issue for issue in duplicated))
+
     def test_full_profile_requires_package_energy_evidence(self) -> None:
         lane = successful_lane()
         lane["points"][0]["energy"] = {"status": "skipped", "reason": "disabled by --no-energy"}
@@ -1601,6 +1843,7 @@ class HnswThreadingTests(unittest.TestCase):
                 patch.dict(sys.modules, {"hnswlib": fake_hnswlib}),
                 patch.object(_worker, "load_dataset", return_value=(base, queries)),
                 patch.object(_worker, "_optional_energy_reader", return_value=(None, None)),
+                patch.object(_worker, "package_version", return_value="0.8.0"),
             ):
                 result = _worker.run_hnsw(spec, lane)
 
@@ -1611,6 +1854,10 @@ class HnswThreadingTests(unittest.TestCase):
         self.assertEqual(set(index.query_threads), {3})
         self.assertEqual(result["implementation_metadata"]["threading"], "explicit")
         self.assertEqual(result["implementation_metadata"]["num_threads"], 3)
+        self.assertEqual(
+            result["points"][0]["search_threading"]["effective_threads_histogram"],
+            {"1": 1},
+        )
 
 
 class OvvsBuildPolicyTests(unittest.TestCase):
@@ -1763,7 +2010,7 @@ class OvvsBuildPolicyTests(unittest.TestCase):
             "algorithm": "cagra-hnsw-export",
         }
         with (
-            patch.dict(sys.modules, {"hnswlib": SimpleNamespace()}),
+            patch.dict(sys.modules, {"hnswlib": SimpleNamespace(Index=lambda **_kwargs: None)}),
             patch.object(_worker, "load_ovvs", return_value=self.fake_module(resources)),
             patch.object(
                 _worker,

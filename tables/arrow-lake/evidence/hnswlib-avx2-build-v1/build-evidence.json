@@ -1,0 +1,86 @@
+{
+  "schema_version": "ovvs.hnswlib-avx2-build-evidence.v1",
+  "status": "static_candidate_validated_no_performance_claim",
+  "source": {
+    "repository": "https://github.com/nmslib/hnswlib.git",
+    "tag": "v0.8.0",
+    "version": "0.8.0",
+    "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d",
+    "tree": "fa3b6d92bd6b0c3a81a7236731c7ad7905c949a1",
+    "tracked_files_clean_after_build": true
+  },
+  "builder": {
+    "path": "tools/bench/build_hnswlib_avx2.ps1",
+    "sha256": "11fceee93cb78997f1d9fd523028d7c00fb2f3bc6266bfa787bb05ce6712930a"
+  },
+  "toolchain": {
+    "python_version": "Python 3.13.14",
+    "python_cache_tag": "cpython-313",
+    "compiler": "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35219 for x64",
+    "compile_options": [
+      "/O2",
+      "/openmp",
+      "/EHsc",
+      "/arch:AVX2"
+    ]
+  },
+  "dependency_pins": [
+    "pip==26.1.1",
+    "build==1.5.0",
+    "setuptools==80.9.0",
+    "wheel==0.45.1",
+    "pybind11==2.13.6",
+    "numpy==2.2.6",
+    "packaging==25.0",
+    "pyproject-hooks==1.2.0",
+    "colorama==0.4.6"
+  ],
+  "independent_builds": [
+    {
+      "label": "final-a",
+      "manifest_sha256": "9413f6daec84c0ae64c4ff4c91fe99e1db67f6f5f36a8b6c839a058e759865dd",
+      "wheel_bytes": 155130,
+      "wheel_sha256": "023cd8c0ac0d67f0193ac00c513ac549c67ca4dca01ba7bf1991491db68ebe5c",
+      "module_bytes": 340480,
+      "module_sha256": "7d88f1f633766113fc2cda0f65379fb63231a9f98a3096e61809ba82f9eee6f5"
+    },
+    {
+      "label": "final-b",
+      "manifest_sha256": "22b22bcdd8ecbfcd9066336fbbcdb25a6d68508bc2f2c9cd2a563b4c1f528e3f",
+      "wheel_bytes": 155130,
+      "wheel_sha256": "023cd8c0ac0d67f0193ac00c513ac549c67ca4dca01ba7bf1991491db68ebe5c",
+      "module_bytes": 340480,
+      "module_sha256": "7d88f1f633766113fc2cda0f65379fb63231a9f98a3096e61809ba82f9eee6f5"
+    }
+  ],
+  "candidate_static_verification": {
+    "pe_machine": "x64",
+    "import_add_query_smoke": {
+      "status": "success",
+      "finite_distances": true
+    },
+    "ymm_operands": 303,
+    "vsubps": 8,
+    "vmulps": 31,
+    "vaddps": 32,
+    "vmovups": 604,
+    "legacy_subps": 0,
+    "legacy_mulps": 0
+  },
+  "stock_negative_control": {
+    "module_bytes": 373248,
+    "module_sha256": "ee278018b71e7814d1d11f3501c5ac3ec90f5cacb229278e0e1231ac0eec2adb",
+    "ymm_operands": 30,
+    "vsubps": 0,
+    "vmulps": 0,
+    "vaddps": 0,
+    "vmovups": 0,
+    "legacy_subps": 6,
+    "legacy_mulps": 24
+  },
+  "limitations": [
+    "Static disassembly shows candidate AVX/YMM float instructions but does not prove hot-path active-cycle attribution.",
+    "No SIFT1M build, recall, latency, throughput, energy, or peak-memory result is included.",
+    "Root-specific absolute paths make the two full manifest, build-log, and candidate-disassembly files byte-different even though the wheel and module are identical."
+  ]
+}
