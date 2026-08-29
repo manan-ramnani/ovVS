@@ -7,6 +7,13 @@ the existing exact detour-rank reorder, fixed-degree prune, capped reverse
 construction, and deterministic forward/reverse interleave. This is a
 construction-stage acceleration, not a claim that ovVS beats hnswlib overall.
 
+The later
+[`nndescent-cooperative-minima-v1`](nndescent-cooperative-minima-v1.md)
+checkpoint supersedes the complete-build timing: the current SIFT1M median is
+61.000 seconds, while the optimizer implemented here remains promoted and
+accounts for a 0.655-second median in that cohort. The measurements below stay
+canonical for this isolated optimizer decision.
+
 The implementation uses two bounded allocation phases, validates input and
 output graph invariants on-device, and publishes only after successful staged
 readback. `AUTO`, `GPU_IF_FASTER`, and `HETERO` use it when the GPU and shape are

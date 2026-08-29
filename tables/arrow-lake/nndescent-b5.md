@@ -1,9 +1,11 @@
 # Arrow Lake 265K NN-Descent B5 bounded evidence
 
 > Historical checkpoint: the measurements below predate the promoted exact GPU
-> optimizer. Current construction routing and evidence are in
-> [`cagra-gpu-optimize-v1.md`](cagra-gpu-optimize-v1.md); the original timings
-> and conclusions remain unchanged for the DLLs that produced them.
+> optimizer and cooperative-minima join. Current construction routing and
+> evidence are in [`cagra-gpu-optimize-v1.md`](cagra-gpu-optimize-v1.md) and
+> [`nndescent-cooperative-minima-v1.md`](nndescent-cooperative-minima-v1.md);
+> the original timings and conclusions remain unchanged for the DLLs that
+> produced them.
 
 Source: native `ovvs_tests` against `build-icpx` (`OVVS_WITH_SYCL=ON`) on 2026-08-28. Inputs are deterministic `make_data` fixtures; overlap is against independent exact L2 neighbors on sampled rows. CTest runs the threshold and bounded-scale cases in separate processes with an Intel-GPU resource lock and 45/120-second timeouts.
 
@@ -26,7 +28,19 @@ The frozen V1 telemetry attributes a median 90.444 s (90.36% of complete build) 
 
 The first bounded synchronization experiment kept active counts on-device and launched fixed-`N` consumers. It reduced SIFT1M D2H calls 459→21, submissions 2,458→2,020, and waits 1,820→488, but regressed complete build 8.91% and initializer wall 9.85% in a fresh parent/candidate pair. The patch was rejected and production source restored. The next experiment must preserve dynamic consumer ranges and reduce only the large convergence readbacks. Evidence: `tables/arrow-lake/nndescent-active-count-v1.md`.
 
-That convergence-only follow-up preserved dynamic ranges and cut SIFT1M D2H bytes 176,003,272→128,003,416, but its single-work-group reduction regressed complete build 2.14% and initializer wall 1.91%. It too was rejected and restored. A third bounded candidate replaced 438 of 444 SIFT1M full-array `heads[N]` fills with one initialization per iteration plus target-owned row resets. Submissions fell 17.82%, but the candidate regressed complete build 5.55% and initializer wall 6.17%. A fourth candidate retained every fill/readback/dynamic range and removed only 444 queue-wide producer waits through explicit copy dependencies. Waits fell 24.40%, but complete build regressed 8.96% and initializer wall 9.68%. Production was restored after both. Further initializer changes require device-side phase evidence and less algorithmic work; the next independent implementation target is the T13.3 iGPU optimize/prune/merge port. Evidence: `tables/arrow-lake/nndescent-convergence-reduction-v1.md`, `tables/arrow-lake/nndescent-heads-reset-v1.md`, and `tables/arrow-lake/nndescent-producer-copy-event-v1.md`.
+That convergence-only follow-up preserved dynamic ranges and cut SIFT1M D2H bytes 176,003,272→128,003,416, but its single-work-group reduction regressed complete build 2.14% and initializer wall 1.91%. It too was rejected and restored. A third bounded candidate replaced 438 of 444 SIFT1M full-array `heads[N]` fills with one initialization per iteration plus target-owned row resets. Submissions fell 17.82%, but the candidate regressed complete build 5.55% and initializer wall 6.17%. A fourth candidate retained every fill/readback/dynamic range and removed only 444 queue-wide producer waits through explicit copy dependencies. Waits fell 24.40%, but complete build regressed 8.96% and initializer wall 9.68%. Production was restored after both. At that checkpoint, further initializer changes required device-side phase evidence and T13.3 remained the next independent implementation target; both were completed by the later promotions. Evidence: `tables/arrow-lake/nndescent-convergence-reduction-v1.md`, `tables/arrow-lake/nndescent-heads-reset-v1.md`, and `tables/arrow-lake/nndescent-producer-copy-event-v1.md`.
+
+The subsequent profiler-guided checkpoint found the proposal join responsible
+for 82.113 of 91.034 measured GPU seconds. Parallelizing only the already-
+computed row/column minima removed the leader's serial scans without changing
+distance arithmetic or emission order. Three fresh SIFT1M candidate processes
+reduced median complete build from 91.978 to 61.000 seconds (-33.68%) and the
+initializer from 90.883 to 60.164 seconds (-33.80%), with exact graph bytes,
+unchanged 0.9036 recall and lifecycle counters, +0.04% search QPS, +0.03% p99,
+and +0.14% peak RSS. This change is promoted. Bank-safe coordinate tiling and
+NEW-only staging were rejected after one-process SIFT100K screens ran 2.51x and
+2.23x slower. Evidence:
+[`nndescent-cooperative-minima-v1.md`](nndescent-cooperative-minima-v1.md).
 
 SIFT1M/K64 remains a scale risk even without `N²` storage. Estimated owned device allocations are 1,197,748,744 bytes (1.116 GiB) with a device-accessible dataset and 1,709,748,744 bytes (1.592 GiB) when the 512 MB dataset is staged. A conservative per-iteration upper bound is 1.52 billion pair distances, 194.56 billion dimension visits at D=128, and 192 million proposals, followed by serial `O(K)` target-row merges. Those are design bounds, not measured consumption or throughput. The measured default degree-16/intermediate-32 CAGRA path is practical at SIFT1M, but K64 and full FORCE_GPU construction remain unproven.
 

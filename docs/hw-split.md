@@ -27,7 +27,7 @@ Sources: `tables/arrow-lake/gemm.json`, `gemm_large.json`, `gemm_f16.json`, `gem
 | TopK | tiny and 32×1e5 k=10 | **1.9 ms** | 114 ms | 750 ms | CPU |
 | Gather | 4096 rows from 1e5×768 | **4 ms** | 213 ms | 24 ms | CPU |
 | Graph walk | CAGRA | host fallback | no | **SYCL fused** | GPU |
-| CAGRA optimize/prune/merge | SIFT1M, intermediate/final degree 32/16 | 9.034 s | no | **0.641 s** | GPU through intermediate degree 64 |
+| CAGRA optimize/prune/merge | SIFT1M, intermediate/final degree 32/16 | 9.034 s | no | **0.655 s** in the current 61.000 s build | GPU through intermediate degree 64 |
 | PQ ADC | bounded fixed-bucket batch fallback | SHAVE C | **Batched Gather+ReduceSum when range-safe** | fused FORCE_GPU scan/select | Existing safe AUTO attempt / unsafe CPU fallback; no Arrow Lake NPU promotion |
 | Hamming / Lp | pairwise graph | AVX | GreaterEqual/Xor or Abs/Power | SYCL | FORCE_* honest; AUTO follows size |
 
@@ -57,14 +57,14 @@ CAGRA search
   candidate scoring inside the walk → fused in the SYCL kernel
 
 CAGRA build
-  NN-Descent init n>4096 → iGPU SYCL under AUTO (90.883 s median after T13.3 promotion; device-phase profiling is the primary construction target)
-  optimize/prune/merge → exact iGPU SYCL through intermediate degree 64 (0.641 s vs 9.034 s CPU baseline; 91.987 s complete build)
+  NN-Descent init n>4096 → iGPU SYCL under AUTO (60.164 s SIFT1M median after cooperative minima; T12.5 convergence/initializer comparison remains open)
+  optimize/prune/merge → exact iGPU SYCL through intermediate degree 64 (0.655 s current median vs 9.034 s CPU baseline; 61.000 s complete build)
   policy              → AUTO/GPU_IF_FASTER/HETERO use GPU when supported; cap/device absence may use CPU; selected GPU failure is fail-closed
   FORCE_GPU           → NN-Descent initializer plus supported GPU optimizer; capability absence returns DEVICE_UNAVAILABLE, while execution/correctness and allocation failures retain ERROR/OOM with no CPU fallback; FORCE_CPU retains CPU
   attribution         → success-only V1 stages plus initializer lifecycle counters; optimizer-specific transfers/submissions remain unexposed, so external API wall is canonical
 
 Vamana / NN-Descent
-  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (the resulting measured graph reaches 0.9609 with higher walk effort; T12.5 IVF-PQ comparison/prune open)
+  NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join with cooperative exact row/column minima (the measured graph reaches 0.9609 with higher walk effort; T12.5 IVF-PQ comparison/prune open)
   Vamana prune/walk  → host control path (B21 remains open)
 
 k-means

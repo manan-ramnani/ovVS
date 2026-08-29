@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-29 09:05:19 UTC",
+  "purpose": "Exact CAGRA graph check for the NN-Descent cooperative-minima candidate",
+  "dataset": {
+    "path": "data/sift-128-euclidean.hdf5",
+    "sha256": "DD6F0A6ED6B7EBB8934680F861A33ED01FF33991EAEE4FD60914D854A0CA5984",
+    "base_key": "train"
+  },
+  "build": {
+    "policy": "AUTO",
+    "algorithm": "nndescent",
+    "metric": "L2_EXPANDED",
+    "graph_degree": 16,
+    "intermediate_degree": 32,
+    "serialization": "ovvsCagraSerializeEx(include_dataset=0)",
+    "process_isolation": "one fresh Python process per build",
+    "timing_disposition": "diagnostic only; promotion timing comes from the benchmark JSON cohort"
+  },
+  "libraries": {
+    "frozen_parent_100k": {
+      "sha256": "6F4E5FBEA1F0E5E3FFE431A4F3CE88A84BE1260661D1A79C11C5D66DB1A9A45C",
+      "bytes": 1204736
+    },
+    "candidate": {
+      "sha256": "6B90289980D01A69189FAC4B35F7F92CBD68BC2163C8B6908AA75A5F7C5D4FAB",
+      "bytes": 1208832,
+      "measured_dirty_base_commit": "2897f355e7b7bca3e6459cfc0c52e5bf6627a440",
+      "source_commit": "1ec94ad7ef7fe77ca7f8d51a462f754593d46165"
+    },
+    "sift1m_parent_oracle": {
+      "source": "../cagra-gpu-optimize-v1/cagra-gpu-optimize-graph-digest.json",
+      "source_commit": "28f2dbd539d4844a7008f53ba5767dc96e078ff4"
+    }
+  },
+  "checks": [
+    {
+      "rows": 100000,
+      "file_bytes": 6400036,
+      "parent_build_seconds_diagnostic": 7.924670199980028,
+      "candidate_build_seconds_diagnostic": 5.3628639000235125,
+      "whole_file_sha256": "3DDBC4936F1307AC2B842AF2FCCB9B7FE06E6AA82718255FF6CC917C6F60FE32",
+      "direct_parent_candidate_match": true
+    },
+    {
+      "rows": 1000000,
+      "file_bytes": 64000036,
+      "candidate_build_seconds_diagnostic": 70.41376979998313,
+      "whole_file_sha256": "0A792378EFD0652A4410894BF7ABAF888EEC314B5C4CAE7F7463532002AF15BE",
+      "canonical_parent_oracle_match": true
+    }
+  ],
+  "verdict": {
+    "status": "pass",
+    "exact_graph_bytes": true,
+    "performance_claim_from_this_artifact": false
+  }
+}
