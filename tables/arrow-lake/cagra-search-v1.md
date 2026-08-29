@@ -44,9 +44,9 @@ baseline values above remain historical evidence and are not rewritten.
 ## Engineering disposition
 
 The exact cached-worst candidate passed its repeated complete-wall gate and is
-now retained. Continue with exact leader cleanup and barrier reduction before
-changing graph geometry: prefix-only final selection, a stable one-pass pick,
-then canonical frontier tiling. Cooperative selection and a measured
-multi-work-group/query small-batch route remain separate changes. hnswlib
-settings remain unchanged, and no kernel-only timing can establish a product
-win.
+retained. The later combined prefix-sort/frontier checkpoint also passed; the
+stable one-pass pick was exact but rejected. Cooperative integer/min-location
+selection and a measured multi-work-group/query small-batch route remain
+separate changes. hnswlib settings remain unchanged, and no kernel-only timing
+can establish a product win. Current result:
+[`cagra-frontier-v1.md`](cagra-frontier-v1.md).

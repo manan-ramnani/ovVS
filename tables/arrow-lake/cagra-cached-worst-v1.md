@@ -60,13 +60,12 @@ the product objective:
 - Candidate CAGRA construction remains slower: 100.314 seconds versus 74.334
   seconds for hnswlib in the three candidate processes.
 
-The next one-variable checkpoint is the exact prefix-only final selection sort,
-then a stable one-pass `search_width` pick. If those local changes survive their
-own gates, canonical frontier tiling can remove most explicit candidate
-barriers without changing arithmetic or insertion order. Cooperative selection
-and a bounded owner/helper multi-work-group route remain separate measured
-experiments for the remaining leader and batch-one utilization gaps. No NPU
-share is implied on Arrow Lake.
+This frozen cohort remains the promotion evidence for cached-worst tracking.
+The later combined prefix-sort/frontier checkpoint supersedes its current
+performance status; the stable one-pass pick was exact but rejected.
+Cooperative integer/min-location selection and a bounded owner/helper route are
+the next separate gates. No NPU share is implied on Arrow Lake. Current result:
+[`cagra-frontier-v1.md`](cagra-frontier-v1.md).
 
 Raw artifacts and producer hashes:
 [`evidence/cagra-cached-worst-v1/`](evidence/cagra-cached-worst-v1/README.md).
