@@ -52,7 +52,7 @@ IVF-PQ / RaBitQ
   refine              → CPU
 
 CAGRA search
-  graph walk          → iGPU SYCL (same graph reaches 0.9609 recall at 64/2; promoted frontier path remains 2.42× behind hnswlib at comparable recall)
+  graph walk          → iGPU SYCL (same graph reaches 0.9609 recall at 64/2; promoted cooperative-pick path remains 2.09× behind hnswlib at comparable recall)
   candidate scoring inside the walk → fused in the SYCL kernel
 
 CAGRA build

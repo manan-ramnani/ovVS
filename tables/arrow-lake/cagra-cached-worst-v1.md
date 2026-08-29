@@ -61,11 +61,11 @@ the product objective:
   seconds for hnswlib in the three candidate processes.
 
 This frozen cohort remains the promotion evidence for cached-worst tracking.
-The later combined prefix-sort/frontier checkpoint supersedes its current
-performance status; the stable one-pass pick was exact but rejected.
-Cooperative integer/min-location selection and a bounded owner/helper route are
-the next separate gates. No NPU share is implied on Arrow Lake. Current result:
-[`cagra-frontier-v1.md`](cagra-frontier-v1.md).
+The later prefix-sort/frontier and cooperative multi-pick checkpoints supersede
+its current performance status; the stable one-pass pick was exact but
+rejected. A bounded owner/helper route is the next separate gate. No NPU share
+is implied on Arrow Lake. Current result:
+[`cagra-cooperative-pick-v1.md`](cagra-cooperative-pick-v1.md).
 
 Raw artifacts and producer hashes:
 [`evidence/cagra-cached-worst-v1/`](evidence/cagra-cached-worst-v1/README.md).

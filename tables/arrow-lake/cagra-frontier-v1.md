@@ -3,6 +3,10 @@
 Status: **promoted as an exact CAGRA search improvement; full-strength
 hnswlib remains faster**.
 
+Performance status is historical. The later cooperative-pick promotion
+supersedes the current-product figures below; see
+[`cagra-cooperative-pick-v1.md`](cagra-cooperative-pick-v1.md).
+
 ## Change and proof boundary
 
 The candidate combines two adjacent exact cleanups after the promoted
@@ -73,9 +77,10 @@ This promotion does not meet the product objective:
 
 An exact stable one-pass pick experiment was rejected after its complete
 dirty-source admission screen regressed three of four effort points; its code
-was not committed. The next B2 checkpoint is cooperative integer/min-location
-selection, followed by a bounded owner/helper multi-work-group route for small
-batches. Each remains a separate exactness and complete-wall experiment.
+was not committed. At this checkpoint, the next B2 experiment was cooperative
+integer/min-location selection; it later passed its separate gate. The current
+next experiment is a bounded owner/helper multi-work-group route for small
+batches, documented in the superseding report linked above.
 
 Raw artifacts and producer hashes:
 [`evidence/cagra-frontier-v1/`](evidence/cagra-frontier-v1/README.md).
