@@ -1,0 +1,1854 @@
+{
+  "schema_version": "ovvs.benchmark.v1",
+  "started_at": "2026-08-29T00:09:07Z",
+  "finished_at": "2026-08-29T00:21:49Z",
+  "profile": {
+    "name": "sift1m",
+    "settings": {
+      "description": "Full one-million-vector SIFT base with a 1,000-query measured prefix.",
+      "expected_n": 1000000,
+      "expected_dim": 128,
+      "nq": 1000,
+      "k": 10,
+      "query_batch_size": 32,
+      "warmups": 1,
+      "repeats": 5,
+      "timeout_seconds": 7200.0,
+      "energy_min_seconds": 0.5,
+      "energy_max_passes": 3,
+      "nlist": 1024,
+      "nprobes": [
+        8,
+        16,
+        32,
+        64
+      ],
+      "pq_m": 16,
+      "pq_nbits": 8,
+      "krefine": 64,
+      "graph_degree": 16,
+      "intermediate_degree": 32,
+      "cagra_points": [
+        {
+          "itopk_size": 32,
+          "search_width": 1,
+          "query_batch_size": 32
+        },
+        {
+          "itopk_size": 64,
+          "search_width": 2,
+          "query_batch_size": 32
+        },
+        {
+          "itopk_size": 128,
+          "search_width": 4,
+          "query_batch_size": 32
+        },
+        {
+          "itopk_size": 128,
+          "search_width": 4,
+          "query_batch_size": 1,
+          "purpose": "b1_latency"
+        }
+      ],
+      "hnsw_ef_construction": 200,
+      "hnsw_points": [
+        {
+          "ef": 32,
+          "query_batch_size": 32
+        },
+        {
+          "ef": 64,
+          "query_batch_size": 32
+        },
+        {
+          "ef": 128,
+          "query_batch_size": 32
+        },
+        {
+          "ef": 256,
+          "query_batch_size": 32
+        },
+        {
+          "ef": 256,
+          "query_batch_size": 1,
+          "purpose": "b1_latency"
+        }
+      ]
+    }
+  },
+  "selection": {
+    "gate_only": null,
+    "preflight_only": null,
+    "algorithms": [
+      "cagra"
+    ],
+    "build_policy": "AUTO",
+    "build_policy_key": "auto",
+    "cagra_build_algo": "nndescent",
+    "policies": [
+      "FORCE_GPU"
+    ],
+    "point_selection": null,
+    "hnswlib_threads": 20,
+    "include_hnsw_export": false,
+    "seed": 7,
+    "energy": true
+  },
+  "dataset": {
+    "status": "success",
+    "kind": "sift1m",
+    "loader": "hdf5",
+    "path": "C:\\Personal\\ioVS\\data\\sift-128-euclidean.hdf5",
+    "base_key": "train",
+    "query_key": "test",
+    "neighbors_key": "neighbors",
+    "n": 1000000,
+    "source_n": 1000000,
+    "dim": 128,
+    "nq": 1000,
+    "source_nq": 10000,
+    "dtype": "float32_cast_on_load",
+    "metric": "squared_l2",
+    "selection": {
+      "base": "first 1000000",
+      "queries": "first 1000"
+    },
+    "source": {
+      "path": "C:\\Personal\\ioVS\\data\\sift-128-euclidean.hdf5",
+      "size_bytes": 525128288,
+      "sha256": "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984",
+      "expected_sha256": "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984",
+      "checksum_valid": true
+    },
+    "ground_truth_hint": {
+      "method": "hdf5_neighbors",
+      "hdf5_neighbors_eligible": true,
+      "neighbors_shape": [
+        10000,
+        100
+      ],
+      "hdf5_distance_attribute": "euclidean",
+      "reason": "complete base, query prefix, neighbor depth, and Euclidean/L2 attribute validated"
+    }
+  },
+  "ground_truth": {
+    "elapsed_ms": 67.45339999906719,
+    "exact": true,
+    "method": "hdf5_neighbors",
+    "process_memory": {
+      "peak_rss_bytes": 56287232,
+      "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+      "source": "GetProcessMemoryInfo.PeakWorkingSetSize",
+      "status": "success"
+    },
+    "shape": [
+      1000,
+      10
+    ],
+    "status": "success",
+    "validation": {
+      "complete_base_selected": true,
+      "duplicate_row_count": 0,
+      "id_count": 10000,
+      "invalid_id_count": 0,
+      "query_prefix_selected": true
+    },
+    "worker_returncode": 0
+  },
+  "lanes": [
+    {
+      "algorithm": "cagra",
+      "blocking_skip": false,
+      "build": {
+        "attribution_caveat": "last_device reports the final build primitive, not the complete build pipeline",
+        "build_algo": "nndescent",
+        "cagra_build_stats": {
+          "after": {
+            "abi_version": 1,
+            "dataset_copy_bytes": 512000000,
+            "dataset_copy_ns": 145769600,
+            "index_materialize_ns": 7968400,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 1,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 128000000,
+            "initializer_ns": 91123950000,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 685748744,
+            "nndescent_gpu_allocation_calls": 12,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 176003272,
+            "nndescent_gpu_d2h_calls": 459,
+            "nndescent_gpu_final_changed_edges": 5911309,
+            "nndescent_gpu_final_pending_new_edges": 5949466,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 1,
+            "nndescent_gpu_iterations": 6,
+            "nndescent_gpu_kernel_launches": 1098,
+            "nndescent_gpu_peak_owned_bytes_max": 685748744,
+            "nndescent_gpu_submission_calls": 2458,
+            "nndescent_gpu_wait_calls": 1820,
+            "nndescent_initializer_calls": 1,
+            "optimizer_prune_merge_ns": 9144909600,
+            "published_graph_copy_bytes": 64000000,
+            "rows": 1000000,
+            "struct_size": 256,
+            "successful_calls": 1,
+            "total_wall_ns": 100422599700
+          },
+          "before": {
+            "abi_version": 1,
+            "dataset_copy_bytes": 0,
+            "dataset_copy_ns": 0,
+            "index_materialize_ns": 0,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 0,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 0,
+            "initializer_ns": 0,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 0,
+            "nndescent_gpu_allocation_calls": 0,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 0,
+            "nndescent_gpu_d2h_calls": 0,
+            "nndescent_gpu_final_changed_edges": 0,
+            "nndescent_gpu_final_pending_new_edges": 0,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 0,
+            "nndescent_gpu_iterations": 0,
+            "nndescent_gpu_kernel_launches": 0,
+            "nndescent_gpu_peak_owned_bytes_max": 0,
+            "nndescent_gpu_submission_calls": 0,
+            "nndescent_gpu_wait_calls": 0,
+            "nndescent_initializer_calls": 0,
+            "optimizer_prune_merge_ns": 0,
+            "published_graph_copy_bytes": 0,
+            "rows": 0,
+            "struct_size": 256,
+            "successful_calls": 0,
+            "total_wall_ns": 0
+          },
+          "blocking": false,
+          "clamped_graph_degree": 16,
+          "clamped_intermediate_degree": 32,
+          "delta": {
+            "dataset_copy_bytes": 512000000,
+            "dataset_copy_ns": 145769600,
+            "index_materialize_ns": 7968400,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 1,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 128000000,
+            "initializer_ns": 91123950000,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 685748744,
+            "nndescent_gpu_allocation_calls": 12,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 176003272,
+            "nndescent_gpu_d2h_calls": 459,
+            "nndescent_gpu_final_changed_edges": 5911309,
+            "nndescent_gpu_final_pending_new_edges": 5949466,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 1,
+            "nndescent_gpu_iterations": 6,
+            "nndescent_gpu_kernel_launches": 1098,
+            "nndescent_gpu_peak_owned_bytes_max": 685748744,
+            "nndescent_gpu_submission_calls": 2458,
+            "nndescent_gpu_wait_calls": 1820,
+            "nndescent_initializer_calls": 1,
+            "optimizer_prune_merge_ns": 9144909600,
+            "published_graph_copy_bytes": 64000000,
+            "rows": 1000000,
+            "successful_calls": 1,
+            "total_wall_ns": 100422599700
+          },
+          "expected": {
+            "dataset_copy_bytes": 512000000,
+            "initializer_graph_payload_bytes": 128000000,
+            "published_graph_copy_bytes": 64000000,
+            "rows": 1000000,
+            "successful_calls": 1
+          },
+          "gpu_structural_validation_required": true,
+          "outcome": "successful_build",
+          "reason": null,
+          "requested_build_algo": "nndescent",
+          "requested_build_policy": "auto",
+          "scope": "one_fresh_resource_cagra_build",
+          "stage_sum_ns": 100422597600,
+          "status": "success",
+          "total_wall_ns_scope": "inner build wall through persistent graph materialization, excluding telemetry merge and caller-handle publication"
+        },
+        "elapsed_ms": 100429.74950000644,
+        "elapsed_ms_scope": "complete Python/API build wall",
+        "fallback_telemetry": {
+          "npu_compile_fails": {
+            "after": 0,
+            "before": 0,
+            "delta": 0
+          },
+          "npu_fallbacks": {
+            "after": 0,
+            "before": 0,
+            "delta": 0
+          }
+        },
+        "last_device": {
+          "code": 1,
+          "label": "CPU",
+          "scope": "final_primitive_only",
+          "status": "reported"
+        },
+        "policy": "AUTO",
+        "policy_contract": {
+          "attribution_scope": "last_primitive_only_not_complete_pipeline",
+          "conforming": null,
+          "reported_last_primitive_devices": [
+            "CPU"
+          ],
+          "requested": "AUTO",
+          "status": "not_forced"
+        },
+        "requested_policy": "AUTO",
+        "requested_policy_key": "auto",
+        "resource_after": {
+          "cagra_build_stats": {
+            "abi_version": 1,
+            "dataset_copy_bytes": 512000000,
+            "dataset_copy_ns": 145769600,
+            "index_materialize_ns": 7968400,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 1,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 128000000,
+            "initializer_ns": 91123950000,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 685748744,
+            "nndescent_gpu_allocation_calls": 12,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 176003272,
+            "nndescent_gpu_d2h_calls": 459,
+            "nndescent_gpu_final_changed_edges": 5911309,
+            "nndescent_gpu_final_pending_new_edges": 5949466,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 1,
+            "nndescent_gpu_iterations": 6,
+            "nndescent_gpu_kernel_launches": 1098,
+            "nndescent_gpu_peak_owned_bytes_max": 685748744,
+            "nndescent_gpu_submission_calls": 2458,
+            "nndescent_gpu_wait_calls": 1820,
+            "nndescent_initializer_calls": 1,
+            "optimizer_prune_merge_ns": 9144909600,
+            "published_graph_copy_bytes": 64000000,
+            "rows": 1000000,
+            "struct_size": 256,
+            "successful_calls": 1,
+            "total_wall_ns": 100422599700
+          },
+          "cagra_transfer_stats": {
+            "direct_walks": 0,
+            "index_upload_bytes": 0,
+            "index_upload_calls": 0,
+            "walks": 0
+          },
+          "gpu_available": 1,
+          "ivfpq_search_stats": {
+            "abi_version": 1,
+            "adc_scan_select_ns": 0,
+            "blocks": 0,
+            "candidate_rows": 0,
+            "coarse_pairwise_ns": 0,
+            "coarse_topk_ns": 0,
+            "gpu_allocation_bytes": 0,
+            "gpu_allocation_calls": 0,
+            "gpu_d2h_bytes": 0,
+            "gpu_d2h_calls": 0,
+            "gpu_h2d_bytes": 0,
+            "gpu_h2d_calls": 0,
+            "gpu_kernel_launches": 0,
+            "gpu_wait_calls": 0,
+            "lut_build_ns": 0,
+            "planning_ns": 0,
+            "queries": 0,
+            "refine_distance_ns": 0,
+            "refine_gather_ns": 0,
+            "refine_topk_ns": 0,
+            "selected_rows": 0,
+            "shortlist_select_validate_ns": 0,
+            "struct_size": 200,
+            "successful_calls": 0,
+            "tasks": 0,
+            "total_wall_ns": 0
+          },
+          "npu_available": 1,
+          "npu_compile_fails": 0,
+          "npu_fallbacks": 0,
+          "sku": "arrow-lake",
+          "sycl_enabled": true
+        },
+        "resource_before": {
+          "cagra_build_stats": {
+            "abi_version": 1,
+            "dataset_copy_bytes": 0,
+            "dataset_copy_ns": 0,
+            "index_materialize_ns": 0,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 0,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 0,
+            "initializer_ns": 0,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 0,
+            "nndescent_gpu_allocation_calls": 0,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 0,
+            "nndescent_gpu_d2h_calls": 0,
+            "nndescent_gpu_final_changed_edges": 0,
+            "nndescent_gpu_final_pending_new_edges": 0,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 0,
+            "nndescent_gpu_iterations": 0,
+            "nndescent_gpu_kernel_launches": 0,
+            "nndescent_gpu_peak_owned_bytes_max": 0,
+            "nndescent_gpu_submission_calls": 0,
+            "nndescent_gpu_wait_calls": 0,
+            "nndescent_initializer_calls": 0,
+            "optimizer_prune_merge_ns": 0,
+            "published_graph_copy_bytes": 0,
+            "rows": 0,
+            "struct_size": 256,
+            "successful_calls": 0,
+            "total_wall_ns": 0
+          },
+          "cagra_transfer_stats": {
+            "direct_walks": 0,
+            "index_upload_bytes": 0,
+            "index_upload_calls": 0,
+            "walks": 0
+          },
+          "gpu_available": 1,
+          "ivfpq_search_stats": {
+            "abi_version": 1,
+            "adc_scan_select_ns": 0,
+            "blocks": 0,
+            "candidate_rows": 0,
+            "coarse_pairwise_ns": 0,
+            "coarse_topk_ns": 0,
+            "gpu_allocation_bytes": 0,
+            "gpu_allocation_calls": 0,
+            "gpu_d2h_bytes": 0,
+            "gpu_d2h_calls": 0,
+            "gpu_h2d_bytes": 0,
+            "gpu_h2d_calls": 0,
+            "gpu_kernel_launches": 0,
+            "gpu_wait_calls": 0,
+            "lut_build_ns": 0,
+            "planning_ns": 0,
+            "queries": 0,
+            "refine_distance_ns": 0,
+            "refine_gather_ns": 0,
+            "refine_topk_ns": 0,
+            "selected_rows": 0,
+            "shortlist_select_validate_ns": 0,
+            "struct_size": 200,
+            "successful_calls": 0,
+            "tasks": 0,
+            "total_wall_ns": 0
+          },
+          "npu_available": 1,
+          "npu_compile_fails": 0,
+          "npu_fallbacks": 0,
+          "sku": "arrow-lake",
+          "sycl_enabled": true
+        },
+        "resource_deltas": {
+          "gpu_available": 0,
+          "npu_available": 0,
+          "npu_compile_fails": 0,
+          "npu_fallbacks": 0
+        },
+        "status": "success"
+      },
+      "elapsed_ms": 665496.8344999943,
+      "expected_skip": false,
+      "id": "ovvs.cagra.gpu",
+      "implementation": "ovvs",
+      "implementation_metadata": {
+        "library": "C:\\Personal\\ioVS\\out\\baseline-615dd97\\build-icpx\\bin\\ovvs.dll",
+        "loaded_library": {
+          "matches_requested_path": true,
+          "mtime_ns": 1787961904472411800,
+          "requested_path": "C:\\Personal\\ioVS\\out\\baseline-615dd97\\build-icpx\\bin\\ovvs.dll",
+          "resolved_path": "C:\\Personal\\ioVS\\out\\baseline-615dd97\\build-icpx\\bin\\ovvs.dll",
+          "sha256": "bacd5bc9d6071e70518993cfdb52a2c78ebf4c4dfa7c55999ec08715a7150e64",
+          "size_bytes": 1131520,
+          "status": "success"
+        },
+        "ovvs_version": "0.2.0",
+        "resource_after": {
+          "cagra_build_stats": {
+            "abi_version": 1,
+            "dataset_copy_bytes": 512000000,
+            "dataset_copy_ns": 145769600,
+            "index_materialize_ns": 7968400,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 1,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 128000000,
+            "initializer_ns": 91123950000,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 685748744,
+            "nndescent_gpu_allocation_calls": 12,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 176003272,
+            "nndescent_gpu_d2h_calls": 459,
+            "nndescent_gpu_final_changed_edges": 5911309,
+            "nndescent_gpu_final_pending_new_edges": 5949466,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 1,
+            "nndescent_gpu_iterations": 6,
+            "nndescent_gpu_kernel_launches": 1098,
+            "nndescent_gpu_peak_owned_bytes_max": 685748744,
+            "nndescent_gpu_submission_calls": 2458,
+            "nndescent_gpu_wait_calls": 1820,
+            "nndescent_initializer_calls": 1,
+            "optimizer_prune_merge_ns": 9144909600,
+            "published_graph_copy_bytes": 64000000,
+            "rows": 1000000,
+            "struct_size": 256,
+            "successful_calls": 1,
+            "total_wall_ns": 100422599700
+          },
+          "cagra_transfer_stats": {
+            "direct_walks": 7704,
+            "index_upload_bytes": 0,
+            "index_upload_calls": 0,
+            "walks": 7704
+          },
+          "gpu_available": 1,
+          "ivfpq_search_stats": {
+            "abi_version": 1,
+            "adc_scan_select_ns": 0,
+            "blocks": 0,
+            "candidate_rows": 0,
+            "coarse_pairwise_ns": 0,
+            "coarse_topk_ns": 0,
+            "gpu_allocation_bytes": 0,
+            "gpu_allocation_calls": 0,
+            "gpu_d2h_bytes": 0,
+            "gpu_d2h_calls": 0,
+            "gpu_h2d_bytes": 0,
+            "gpu_h2d_calls": 0,
+            "gpu_kernel_launches": 0,
+            "gpu_wait_calls": 0,
+            "lut_build_ns": 0,
+            "planning_ns": 0,
+            "queries": 0,
+            "refine_distance_ns": 0,
+            "refine_gather_ns": 0,
+            "refine_topk_ns": 0,
+            "selected_rows": 0,
+            "shortlist_select_validate_ns": 0,
+            "struct_size": 200,
+            "successful_calls": 0,
+            "tasks": 0,
+            "total_wall_ns": 0
+          },
+          "npu_available": 1,
+          "npu_compile_fails": 0,
+          "npu_fallbacks": 0,
+          "sku": "arrow-lake",
+          "sycl_enabled": true
+        },
+        "resource_before": {
+          "cagra_build_stats": {
+            "abi_version": 1,
+            "dataset_copy_bytes": 0,
+            "dataset_copy_ns": 0,
+            "index_materialize_ns": 0,
+            "initializer_final_cpu_calls": 0,
+            "initializer_final_gpu_calls": 0,
+            "initializer_final_npu_calls": 0,
+            "initializer_graph_payload_bytes": 0,
+            "initializer_ns": 0,
+            "iterative_initializer_calls": 0,
+            "ivfpq_initializer_calls": 0,
+            "nndescent_gpu_allocation_bytes": 0,
+            "nndescent_gpu_allocation_calls": 0,
+            "nndescent_gpu_converged_calls": 0,
+            "nndescent_gpu_d2h_bytes": 0,
+            "nndescent_gpu_d2h_calls": 0,
+            "nndescent_gpu_final_changed_edges": 0,
+            "nndescent_gpu_final_pending_new_edges": 0,
+            "nndescent_gpu_h2d_bytes": 0,
+            "nndescent_gpu_h2d_calls": 0,
+            "nndescent_gpu_instrumented_calls": 0,
+            "nndescent_gpu_iterations": 0,
+            "nndescent_gpu_kernel_launches": 0,
+            "nndescent_gpu_peak_owned_bytes_max": 0,
+            "nndescent_gpu_submission_calls": 0,
+            "nndescent_gpu_wait_calls": 0,
+            "nndescent_initializer_calls": 0,
+            "optimizer_prune_merge_ns": 0,
+            "published_graph_copy_bytes": 0,
+            "rows": 0,
+            "struct_size": 256,
+            "successful_calls": 0,
+            "total_wall_ns": 0
+          },
+          "cagra_transfer_stats": {
+            "direct_walks": 0,
+            "index_upload_bytes": 0,
+            "index_upload_calls": 0,
+            "walks": 0
+          },
+          "gpu_available": 1,
+          "ivfpq_search_stats": {
+            "abi_version": 1,
+            "adc_scan_select_ns": 0,
+            "blocks": 0,
+            "candidate_rows": 0,
+            "coarse_pairwise_ns": 0,
+            "coarse_topk_ns": 0,
+            "gpu_allocation_bytes": 0,
+            "gpu_allocation_calls": 0,
+            "gpu_d2h_bytes": 0,
+            "gpu_d2h_calls": 0,
+            "gpu_h2d_bytes": 0,
+            "gpu_h2d_calls": 0,
+            "gpu_kernel_launches": 0,
+            "gpu_wait_calls": 0,
+            "lut_build_ns": 0,
+            "planning_ns": 0,
+            "queries": 0,
+            "refine_distance_ns": 0,
+            "refine_gather_ns": 0,
+            "refine_topk_ns": 0,
+            "selected_rows": 0,
+            "shortlist_select_validate_ns": 0,
+            "struct_size": 200,
+            "successful_calls": 0,
+            "tasks": 0,
+            "total_wall_ns": 0
+          },
+          "npu_available": 1,
+          "npu_compile_fails": 0,
+          "npu_fallbacks": 0,
+          "sku": "arrow-lake",
+          "sycl_enabled": true
+        },
+        "routing_caveat": "build and search policies are independent; last_device is final-primitive evidence"
+      },
+      "mandatory": true,
+      "points": [
+        {
+          "cagra_transfer": {
+            "after": {
+              "direct_walks": 256,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 256
+            },
+            "before": {
+              "direct_walks": 0,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 0
+            },
+            "contract": {
+              "conforming": true,
+              "status": "direct_zero_upload"
+            },
+            "delta": {
+              "direct_walks": 256,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 256
+            },
+            "scope": "warmups_timed_repeats_and_energy_passes",
+            "status": "success"
+          },
+          "device_attribution": {
+            "failures": 0,
+            "search_calls": 256,
+            "successful_observations": 256
+          },
+          "energy": {
+            "elapsed_ms": 574.8606000561267,
+            "energy_delta_uj": 15666203,
+            "microjoules_per_query": 7833.1015,
+            "passes": 2,
+            "queries": 2000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 1.09715,
+                "mean": 0.30625169921875,
+                "median": 0.27828125,
+                "min": 0.261490625,
+                "p50": 0.27828125,
+                "p95": 0.31846296875,
+                "p99": 1.08754625,
+                "stdev": 0.1417390066899326
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 10.2116,
+                "mean": 8.983431874999999,
+                "median": 8.85595,
+                "min": 8.3677,
+                "p50": 8.85595,
+                "p95": 9.960120000000002,
+                "p99": 10.195761,
+                "stdev": 0.46563757877104145
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                287.0741,
+                287.4126,
+                288.4507,
+                287.1126,
+                287.7466
+              ],
+              "summary": {
+                "count": 5,
+                "max": 288.4507,
+                "mean": 287.55931999999996,
+                "median": 287.4126,
+                "min": 287.0741,
+                "p50": 287.4126,
+                "p95": 288.30987999999996,
+                "p99": 288.422536,
+                "stdev": 0.5670441049865513
+              }
+            },
+            "qps": {
+              "samples": [
+                3483.4211794097764,
+                3479.3185824142715,
+                3466.7969257831583,
+                3482.954074464165,
+                3475.2799859320667
+              ],
+              "summary": {
+                "count": 5,
+                "max": 3483.4211794097764,
+                "mean": 3477.554149600687,
+                "median": 3479.3185824142715,
+                "min": 3466.7969257831583,
+                "p50": 3479.3185824142715,
+                "p95": 3483.327758420654,
+                "p99": 3483.402495211952,
+                "stdev": 6.848067886595552
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "itopk_size": 32,
+            "query_batch_size": 32,
+            "search_width": 1
+          },
+          "policy_contract": {
+            "attribution_scope": "last_primitive_only_not_complete_pipeline",
+            "conforming": true,
+            "reason": null,
+            "reported_last_primitive_devices": [
+              "GPU"
+            ],
+            "requested": "FORCE_GPU",
+            "status": "conforming_last_primitive"
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9036000000000001
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "cagra_transfer": {
+            "after": {
+              "direct_walks": 480,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 480
+            },
+            "before": {
+              "direct_walks": 256,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 256
+            },
+            "contract": {
+              "conforming": true,
+              "status": "direct_zero_upload"
+            },
+            "delta": {
+              "direct_walks": 224,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 224
+            },
+            "scope": "warmups_timed_repeats_and_energy_passes",
+            "status": "success"
+          },
+          "device_attribution": {
+            "failures": 0,
+            "search_calls": 224,
+            "successful_observations": 224
+          },
+          "energy": {
+            "elapsed_ms": 864.485300029628,
+            "energy_delta_uj": 20166112,
+            "microjoules_per_query": 20166.112,
+            "passes": 1,
+            "queries": 1000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 3.341325,
+                "mean": 0.9229544531249999,
+                "median": 0.8470421875,
+                "min": 0.793265625,
+                "p50": 0.8470421875,
+                "p95": 0.9149264062500001,
+                "p99": 3.2261325,
+                "stdev": 0.4206376791557484
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 39.3076,
+                "mean": 27.099939375,
+                "median": 27.045099999999998,
+                "min": 25.3845,
+                "p50": 27.045099999999998,
+                "p95": 28.659895,
+                "p99": 29.332445,
+                "stdev": 1.3238070611808623
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                865.0775,
+                865.3606,
+                865.013,
+                863.3392,
+                878.0432
+              ],
+              "summary": {
+                "count": 5,
+                "max": 878.0432,
+                "mean": 867.3666999999999,
+                "median": 865.0775,
+                "min": 863.3392,
+                "p50": 865.0775,
+                "p95": 875.50668,
+                "p99": 877.535896,
+                "stdev": 6.021071043427386
+              }
+            },
+            "qps": {
+              "samples": [
+                1155.9657949721268,
+                1155.5876243961188,
+                1156.0519899700928,
+                1158.2932872734148,
+                1138.8961272064973
+              ],
+              "summary": {
+                "count": 5,
+                "max": 1158.2932872734148,
+                "mean": 1152.95896476365,
+                "median": 1155.9657949721268,
+                "min": 1138.8961272064973,
+                "p50": 1155.9657949721268,
+                "p95": 1157.8450278127505,
+                "p99": 1158.2036353812819,
+                "stdev": 7.933096512250381
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "itopk_size": 64,
+            "query_batch_size": 32,
+            "search_width": 2
+          },
+          "policy_contract": {
+            "attribution_scope": "last_primitive_only_not_complete_pipeline",
+            "conforming": true,
+            "reason": null,
+            "reported_last_primitive_devices": [
+              "GPU"
+            ],
+            "requested": "FORCE_GPU",
+            "status": "conforming_last_primitive"
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9609
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "cagra_transfer": {
+            "after": {
+              "direct_walks": 704,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 704
+            },
+            "before": {
+              "direct_walks": 480,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 480
+            },
+            "contract": {
+              "conforming": true,
+              "status": "direct_zero_upload"
+            },
+            "delta": {
+              "direct_walks": 224,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 224
+            },
+            "scope": "warmups_timed_repeats_and_energy_passes",
+            "status": "success"
+          },
+          "device_attribution": {
+            "failures": 0,
+            "search_calls": 224,
+            "successful_observations": 224
+          },
+          "energy": {
+            "elapsed_ms": 2880.633599939756,
+            "energy_delta_uj": 68354892,
+            "microjoules_per_query": 68354.892,
+            "passes": 1,
+            "queries": 1000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 10.943825,
+                "mean": 3.06464625,
+                "median": 2.8128390625,
+                "min": 2.702553125,
+                "p50": 2.8128390625,
+                "p95": 2.9606039062500003,
+                "p99": 10.932506,
+                "stdev": 1.4181400060788056
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 95.181,
+                "mean": 89.871643125,
+                "median": 89.91235,
+                "min": 86.4817,
+                "p50": 89.91235,
+                "p95": 92.708025,
+                "p99": 94.845125,
+                "stdev": 1.8831521323735712
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                2874.7757,
+                2874.9489,
+                2875.462,
+                2879.7433,
+                2875.7088
+              ],
+              "summary": {
+                "count": 5,
+                "max": 2879.7433,
+                "mean": 2876.12774,
+                "median": 2875.462,
+                "min": 2874.7757,
+                "p50": 2875.462,
+                "p95": 2878.9364,
+                "p99": 2879.58192,
+                "stdev": 2.056007690403947
+              }
+            },
+            "qps": {
+              "samples": [
+                347.85322555773655,
+                347.83226929702994,
+                347.7702017971373,
+                347.25317357279727,
+                347.7403553516963
+              ],
+              "summary": {
+                "count": 5,
+                "max": 347.85322555773655,
+                "mean": 347.68984511527947,
+                "median": 347.7702017971373,
+                "min": 347.25317357279727,
+                "p50": 347.7702017971373,
+                "p95": 347.84903430559524,
+                "p99": 347.8523873073083,
+                "stdev": 0.2483285791248323
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "itopk_size": 128,
+            "query_batch_size": 32,
+            "search_width": 4
+          },
+          "policy_contract": {
+            "attribution_scope": "last_primitive_only_not_complete_pipeline",
+            "conforming": true,
+            "reason": null,
+            "reported_last_primitive_devices": [
+              "GPU"
+            ],
+            "requested": "FORCE_GPU",
+            "status": "conforming_last_primitive"
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9889
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "cagra_transfer": {
+            "after": {
+              "direct_walks": 7704,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 7704
+            },
+            "before": {
+              "direct_walks": 704,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 704
+            },
+            "contract": {
+              "conforming": true,
+              "status": "direct_zero_upload"
+            },
+            "delta": {
+              "direct_walks": 7000,
+              "index_upload_bytes": 0,
+              "index_upload_calls": 0,
+              "walks": 7000
+            },
+            "scope": "warmups_timed_repeats_and_energy_passes",
+            "status": "success"
+          },
+          "device_attribution": {
+            "failures": 0,
+            "search_calls": 7000,
+            "successful_observations": 7000
+          },
+          "energy": {
+            "elapsed_ms": 76533.45190000255,
+            "energy_delta_uj": 2122023715,
+            "microjoules_per_query": 2122023.715,
+            "passes": 1,
+            "queries": 1000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 5000,
+                "max": 92.2848,
+                "mean": 76.50809462,
+                "median": 78.49985,
+                "min": 48.7801,
+                "p50": 78.49985,
+                "p95": 86.741285,
+                "p99": 89.60755900000001,
+                "stdev": 8.062386678329391
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 5000,
+                "max": 92.2848,
+                "mean": 76.50809462,
+                "median": 78.49985,
+                "min": 48.7801,
+                "p50": 78.49985,
+                "p95": 86.741285,
+                "p99": 89.60755900000001,
+                "stdev": 8.062386678329391
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                76499.6365,
+                76486.5985,
+                76552.4764,
+                76512.7997,
+                76526.6993
+              ],
+              "summary": {
+                "count": 5,
+                "max": 76552.4764,
+                "mean": 76515.64207999999,
+                "median": 76512.7997,
+                "min": 76486.5985,
+                "p50": 76512.7997,
+                "p95": 76547.32098,
+                "p99": 76551.445316,
+                "stdev": 25.430377987794582
+              }
+            },
+            "qps": {
+              "samples": [
+                13.071957537994315,
+                13.074185800013058,
+                13.062934695604438,
+                13.069708649022289,
+                13.067334788343604
+              ],
+              "summary": {
+                "count": 5,
+                "max": 13.074185800013058,
+                "mean": 13.069224294195541,
+                "median": 13.069708649022289,
+                "min": 13.062934695604438,
+                "p50": 13.069708649022289,
+                "p95": 13.07374014760931,
+                "p99": 13.07409666953231,
+                "stdev": 0.004343128021388897
+              }
+            },
+            "query_batch_size": 1,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "itopk_size": 128,
+            "purpose": "b1_latency",
+            "query_batch_size": 1,
+            "search_width": 4
+          },
+          "policy_contract": {
+            "attribution_scope": "last_primitive_only_not_complete_pipeline",
+            "conforming": true,
+            "reason": null,
+            "reported_last_primitive_devices": [
+              "GPU"
+            ],
+            "requested": "FORCE_GPU",
+            "status": "conforming_last_primitive"
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9889
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        }
+      ],
+      "policy": "FORCE_GPU",
+      "policy_key": "gpu",
+      "process_memory": {
+        "peak_rss_bytes": 2441342976,
+        "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+        "source": "GetProcessMemoryInfo.PeakWorkingSetSize",
+        "status": "success"
+      },
+      "reason": null,
+      "skip_reason": null,
+      "started_at": "2026-08-29T00:09:08Z",
+      "status": "success",
+      "worker_returncode": 0
+    },
+    {
+      "algorithm": "hnsw",
+      "blocking_skip": false,
+      "build": {
+        "elapsed_ms": 82706.31100004539,
+        "status": "success"
+      },
+      "elapsed_ms": 95155.92099993955,
+      "expected_skip": false,
+      "id": "hnswlib.hnsw",
+      "implementation": "hnswlib",
+      "implementation_metadata": {
+        "M": 16,
+        "ef_construction": 200,
+        "hnswlib_version": "0.8.0",
+        "num_threads": 20,
+        "random_seed": 7,
+        "threading": "explicit"
+      },
+      "mandatory": true,
+      "points": [
+        {
+          "energy": {
+            "elapsed_ms": 284.4685000600293,
+            "energy_delta_uj": 12979580,
+            "microjoules_per_query": 4326.526666666667,
+            "passes": 3,
+            "queries": 3000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 0.115859375,
+                "mean": 0.09811539062499999,
+                "median": 0.0981703125,
+                "min": 0.07524375,
+                "p50": 0.0981703125,
+                "p95": 0.10889640625000001,
+                "p99": 0.1143975625,
+                "stdev": 0.007663412037683098
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 3.7075,
+                "mean": 3.0620281250000003,
+                "median": 3.1335,
+                "min": 0.777,
+                "p50": 3.1335,
+                "p95": 3.4846850000000003,
+                "p99": 3.660722,
+                "stdev": 0.46943762369173475
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                101.724,
+                95.7639,
+                95.2921,
+                96.7745,
+                100.9306
+              ],
+              "summary": {
+                "count": 5,
+                "max": 101.724,
+                "mean": 98.09702,
+                "median": 96.7745,
+                "min": 95.2921,
+                "p50": 96.7745,
+                "p95": 101.56532,
+                "p99": 101.69226400000001,
+                "stdev": 3.010159623176151
+              }
+            },
+            "qps": {
+              "samples": [
+                9830.521804097361,
+                10442.348317058933,
+                10494.04934931647,
+                10333.30061121473,
+                9907.798031518687
+              ],
+              "summary": {
+                "count": 5,
+                "max": 10494.04934931647,
+                "mean": 10201.603622641236,
+                "median": 10333.30061121473,
+                "min": 9830.521804097361,
+                "p50": 10333.30061121473,
+                "p95": 10483.709142864964,
+                "p99": 10491.981308026168,
+                "stdev": 310.1814183542041
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "ef": 32,
+            "query_batch_size": 32
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.8891
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "energy": {
+            "elapsed_ms": 451.6418999992311,
+            "energy_delta_uj": 14470663,
+            "microjoules_per_query": 4823.5543333333335,
+            "passes": 3,
+            "queries": 3000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 0.182440625,
+                "mean": 0.15392427734375,
+                "median": 0.15654374999999998,
+                "min": 0.11816875,
+                "p50": 0.15654374999999998,
+                "p95": 0.16919484375,
+                "p99": 0.17894259375,
+                "stdev": 0.012230532877037837
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 5.8381,
+                "mean": 4.806109375,
+                "median": 4.982049999999999,
+                "min": 1.2153,
+                "p50": 4.982049999999999,
+                "p95": 5.414235,
+                "p99": 5.726163,
+                "stdev": 0.7458193980045427
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                153.959,
+                154.8437,
+                152.7157,
+                156.6405,
+                151.5192
+              ],
+              "summary": {
+                "count": 5,
+                "max": 156.6405,
+                "mean": 153.93562000000003,
+                "median": 153.959,
+                "min": 151.5192,
+                "p50": 153.959,
+                "p95": 156.28114,
+                "p99": 156.568628,
+                "stdev": 1.9665211763416117
+              }
+            },
+            "qps": {
+              "samples": [
+                6495.2357445813495,
+                6458.125193340123,
+                6548.115223254715,
+                6384.044994749122,
+                6599.823652711999
+              ],
+              "summary": {
+                "count": 5,
+                "max": 6599.823652711999,
+                "mean": 6497.068961727462,
+                "median": 6495.2357445813495,
+                "min": 6384.044994749122,
+                "p50": 6495.2357445813495,
+                "p95": 6589.481966820542,
+                "p99": 6597.755315533707,
+                "stdev": 82.8532471120907
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "ef": 64,
+            "query_batch_size": 32
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9579
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "energy": {
+            "elapsed_ms": 561.5027999738231,
+            "energy_delta_uj": 29627334,
+            "microjoules_per_query": 14813.667,
+            "passes": 2,
+            "queries": 2000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 0.3382625,
+                "mean": 0.27957330078125003,
+                "median": 0.2811234375,
+                "min": 0.2201375,
+                "p50": 0.2811234375,
+                "p95": 0.32027703125,
+                "p99": 0.32997662499999997,
+                "stdev": 0.024665012031220557
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 10.8244,
+                "mean": 8.733188125,
+                "median": 8.9749,
+                "min": 2.1489,
+                "p50": 8.9749,
+                "p95": 10.248865,
+                "p99": 10.559251999999999,
+                "stdev": 1.4049243837111476
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                266.1189,
+                274.5033,
+                283.3342,
+                282.8714,
+                291.5506
+              ],
+              "summary": {
+                "count": 5,
+                "max": 291.5506,
+                "mean": 279.67568,
+                "median": 282.8714,
+                "min": 266.1189,
+                "p50": 282.8714,
+                "p95": 289.90731999999997,
+                "p99": 291.22194399999995,
+                "stdev": 9.684406522188121
+              }
+            },
+            "qps": {
+              "samples": [
+                3757.718824179718,
+                3642.9434545959916,
+                3529.4009688911538,
+                3535.175348232448,
+                3429.9363472412683
+              ],
+              "summary": {
+                "count": 5,
+                "max": 3757.718824179718,
+                "mean": 3579.034988628116,
+                "median": 3535.175348232448,
+                "min": 3429.9363472412683,
+                "p50": 3535.175348232448,
+                "p95": 3734.7637502629727,
+                "p99": 3753.127809396369,
+                "stdev": 125.12974660736086
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "ef": 128,
+            "query_batch_size": 32
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9877
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "energy": {
+            "elapsed_ms": 512.7291999524459,
+            "energy_delta_uj": 20150862,
+            "microjoules_per_query": 20150.862,
+            "passes": 1,
+            "queries": 1000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 0.59793125,
+                "mean": 0.50133072265625,
+                "median": 0.50659375,
+                "min": 0.376659375,
+                "p50": 0.50659375,
+                "p95": 0.5620090625,
+                "p99": 0.58316821875,
+                "stdev": 0.04088865265639311
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 160,
+                "max": 19.1338,
+                "mean": 15.6676975,
+                "median": 16.172449999999998,
+                "min": 3.8831,
+                "p50": 16.172449999999998,
+                "p95": 17.98429,
+                "p99": 18.661383,
+                "stdev": 2.4755853547794997
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                490.2799,
+                510.4498,
+                501.383,
+                498.8608,
+                507.2838
+              ],
+              "summary": {
+                "count": 5,
+                "max": 510.4498,
+                "mean": 501.65145999999993,
+                "median": 501.383,
+                "min": 490.2799,
+                "p50": 501.383,
+                "p95": 509.8166,
+                "p99": 510.32316,
+                "stdev": 7.847073841120645
+              }
+            },
+            "qps": {
+              "samples": [
+                2039.6512277986515,
+                1959.05650271584,
+                1994.4832593047631,
+                2004.5672059219728,
+                1971.2831357910504
+              ],
+              "summary": {
+                "count": 5,
+                "max": 2039.6512277986515,
+                "mean": 1993.8082663064556,
+                "median": 1994.4832593047631,
+                "min": 1959.05650271584,
+                "p50": 1994.4832593047631,
+                "p95": 2032.6344234233156,
+                "p99": 2038.2478669235843,
+                "stdev": 31.356235795161766
+              }
+            },
+            "query_batch_size": 32,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "ef": 256,
+            "query_batch_size": 32
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9969
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        },
+        {
+          "energy": {
+            "elapsed_ms": 984.0750000439584,
+            "energy_delta_uj": 30288695,
+            "microjoules_per_query": 15144.3475,
+            "passes": 2,
+            "queries": 2000,
+            "scope": "whole_package_cpu_igpu_uncore_not_isolated_device",
+            "status": "success"
+          },
+          "measurement": {
+            "amortized_per_query_latency_ms": {
+              "summary": {
+                "count": 5000,
+                "max": 0.9208,
+                "mean": 0.49647128,
+                "median": 0.515,
+                "min": 0.1491,
+                "p50": 0.515,
+                "p95": 0.6044,
+                "p99": 0.6553130000000003,
+                "stdev": 0.08809280081523514
+              }
+            },
+            "batch_latency_ms": {
+              "summary": {
+                "count": 5000,
+                "max": 0.9208,
+                "mean": 0.49647128,
+                "median": 0.515,
+                "min": 0.1491,
+                "p50": 0.515,
+                "p95": 0.6044,
+                "p99": 0.6553130000000003,
+                "stdev": 0.08809280081523514
+              }
+            },
+            "measured_passes": 5,
+            "pass_latency_ms": {
+              "samples": [
+                495.3217,
+                504.2517,
+                497.6312,
+                494.0874,
+                497.6872
+              ],
+              "summary": {
+                "count": 5,
+                "max": 504.2517,
+                "mean": 497.79584000000006,
+                "median": 497.6312,
+                "min": 494.0874,
+                "p50": 497.6312,
+                "p95": 502.9388,
+                "p99": 503.98912,
+                "stdev": 3.9239945620502663
+              }
+            },
+            "qps": {
+              "samples": [
+                2018.8899456656147,
+                1983.1365962673005,
+                2009.5203033893374,
+                2023.9334174480061,
+                2009.294191210865
+              ],
+              "summary": {
+                "count": 5,
+                "max": 2023.9334174480061,
+                "mean": 2008.9548907962248,
+                "median": 2009.5203033893374,
+                "min": 1983.1365962673005,
+                "p50": 2009.5203033893374,
+                "p95": 2022.9247230915278,
+                "p99": 2023.7316785767105,
+                "stdev": 15.732774107496251
+              }
+            },
+            "query_batch_size": 1,
+            "query_count_per_pass": 1000,
+            "warmup_passes": 1
+          },
+          "parameters": {
+            "ef": 256,
+            "purpose": "b1_latency",
+            "query_batch_size": 1
+          },
+          "reason": null,
+          "recall": {
+            "metric": "recall@10",
+            "status": "success",
+            "value": 0.9969
+          },
+          "status": "success",
+          "validation": {
+            "duplicate_row_count": 0,
+            "invalid_id_count": 0,
+            "issues": [],
+            "nonfinite_distance_count": 0,
+            "status": "success"
+          }
+        }
+      ],
+      "policy": null,
+      "policy_key": null,
+      "process_memory": {
+        "peak_rss_bytes": 1515343872,
+        "scope": "isolated_worker_process_including_dataset_runtime_and_index",
+        "source": "GetProcessMemoryInfo.PeakWorkingSetSize",
+        "status": "success"
+      },
+      "reason": null,
+      "skip_reason": null,
+      "started_at": "2026-08-29T00:20:14Z",
+      "status": "success",
+      "worker_returncode": 0
+    }
+  ],
+  "completion": {
+    "status": "complete",
+    "issues": [],
+    "lane_counts": {
+      "failed": 0,
+      "skipped": 0,
+      "success": 2,
+      "timeout": 0,
+      "unavailable": 0
+    },
+    "full_profile_strict": true
+  },
+  "metadata": {
+    "command": [
+      "C:\\Personal\\ioVS\\out\\baseline-615dd97\\tools\\bench\\bench.py",
+      "--profile",
+      "sift1m",
+      "--algorithms",
+      "cagra",
+      "--policies",
+      "gpu",
+      "--build-policy",
+      "auto",
+      "--cagra-build-algo",
+      "nndescent",
+      "--allow-unscalable-cagra",
+      "--hnsw-threads",
+      "20",
+      "--timeout-seconds",
+      "7200",
+      "--sift",
+      "C:\\Personal\\ioVS\\data\\sift-128-euclidean.hdf5",
+      "--library",
+      "C:\\Personal\\ioVS\\out\\baseline-615dd97\\build-icpx\\bin\\ovvs.dll",
+      "--output",
+      "C:\\Personal\\ioVS\\out\\bench\\cagra-effort-sift1m-baseline-615dd971b8c-i1.json"
+    ],
+    "python": "3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]",
+    "python_executable": "C:\\Users\\manan\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+    "hostname": "Server",
+    "pid": 78840,
+    "git": {
+      "commit": "615dd971b8c88a75cbd0f50fdb3e9f87f3cbbefd",
+      "branch": "",
+      "dirty": false
+    },
+    "dependencies": {
+      "numpy": "2.2.6",
+      "h5py": "3.16.0",
+      "faiss-cpu": "1.15.0",
+      "hnswlib": "0.8.0"
+    },
+    "caveats": [
+      "Package energy covers the package, iGPU, and uncore; it is not isolated device energy.",
+      "ovVS last_device reports the final primitive, not a per-stage route trace.",
+      "ovVS construction policy is independent of each lane's search policy.",
+      "HETERO currently equals AUTO (backlog B6).",
+      "IVF-PQ FORCE_GPU uses the fused iGPU scan/select path; AUTO remains evidence-gated.",
+      "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
+      "SIFT-100k is a noncanonical prefix preflight and cannot close the SIFT1M quality gate."
+    ]
+  }
+}

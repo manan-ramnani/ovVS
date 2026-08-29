@@ -1,0 +1,45 @@
+{
+  "mode": "load",
+  "library": "C:\\Personal\\ioVS\\build-icpx\\bin\\ovvs.dll",
+  "library_sha256": "7999df05575a7cab252bb09b1a5536ff9439f608cade4ec9644b421a878e45c0",
+  "model": "C:\\Personal\\ioVS\\out\\cagra-cached-worst-baseline.ovvs",
+  "model_sha256": "43e9000ec667be2d3b4a1075f4116eed1f30b512556c83fc07587135c42f6d25",
+  "dataset_sha256": "78b1dc5cbde53da9b2d11aad85dc67bd6faa4ee453e0824bd1e19a8bcba6b77b",
+  "queries_sha256": "b3fb5fc6531939985894660a9b72b72aca8e9252b62884815f906603d65b7b47",
+  "last_device": 3,
+  "transfer_before": {
+    "walks": 0,
+    "direct_walks": 0,
+    "index_upload_calls": 0,
+    "index_upload_bytes": 0
+  },
+  "transfer_after": {
+    "walks": 3,
+    "direct_walks": 3,
+    "index_upload_calls": 0,
+    "index_upload_bytes": 0
+  },
+  "points": [
+    {
+      "itopk_size": 32,
+      "search_width": 1,
+      "ids_sha256": "a99f20ab44e064e95cc1bf2938d6c681a44f767df17f6680c7887e7569b630bc",
+      "distances_sha256": "0c2d020b6e238ca4aef6b10c97a9c87c36f4f61d8aaa5ddb4f64c864e23dcd9b",
+      "combined_sha256": "376e984f0702a73e108b493033db236abe068a72f16a4a97c1ec63fc0787ee9d"
+    },
+    {
+      "itopk_size": 64,
+      "search_width": 2,
+      "ids_sha256": "a99f20ab44e064e95cc1bf2938d6c681a44f767df17f6680c7887e7569b630bc",
+      "distances_sha256": "0c2d020b6e238ca4aef6b10c97a9c87c36f4f61d8aaa5ddb4f64c864e23dcd9b",
+      "combined_sha256": "376e984f0702a73e108b493033db236abe068a72f16a4a97c1ec63fc0787ee9d"
+    },
+    {
+      "itopk_size": 128,
+      "search_width": 4,
+      "ids_sha256": "a99f20ab44e064e95cc1bf2938d6c681a44f767df17f6680c7887e7569b630bc",
+      "distances_sha256": "0c2d020b6e238ca4aef6b10c97a9c87c36f4f61d8aaa5ddb4f64c864e23dcd9b",
+      "combined_sha256": "376e984f0702a73e108b493033db236abe068a72f16a4a97c1ec63fc0787ee9d"
+    }
+  ]
+}

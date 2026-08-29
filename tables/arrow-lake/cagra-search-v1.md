@@ -36,6 +36,17 @@ All 7,704 ovVS search calls were direct GPU walks with successful device attribu
 
 This is one benchmark invocation with two sequential isolated lane processes. CAGRA points were measured before hnswlib and in increasing effort order within each lane. The invocation has no in-run clock, temperature, utilization, or background-load trace. The performance and energy ratios are diagnostic, not promotion evidence; a winning change still requires at least three clean interleaved complete invocations. B1 remains open for the other algorithms and policies plus the real 100K×768 corpus.
 
+This curve is the old-source baseline for the later cached-worst promotion. The
+promoted current-code result, three-process ranges, and unchanged-comparator
+status are in [`cagra-cached-worst-v1.md`](cagra-cached-worst-v1.md). The raw
+baseline values above remain historical evidence and are not rewritten.
+
 ## Engineering disposition
 
-Profile and reduce GPU walk cost before changing graph geometry. The first bounded kernel work should preserve exact IDs and recall while reducing leader-serial candidate selection; the measured small-batch deficit is consistent with under-utilization and/or submission and serial overhead. A measured SIMD16 portfolio can then select multi-work-group/query for small batches, one-work-group/query for large batches, and a bounded fallback. hnswlib settings remain unchanged, and no kernel-only timing can establish a product win.
+The exact cached-worst candidate passed its repeated complete-wall gate and is
+now retained. Continue with exact leader cleanup and barrier reduction before
+changing graph geometry: prefix-only final selection, a stable one-pass pick,
+then canonical frontier tiling. Cooperative selection and a measured
+multi-work-group/query small-batch route remain separate changes. hnswlib
+settings remain unchanged, and no kernel-only timing can establish a product
+win.

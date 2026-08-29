@@ -4,25 +4,39 @@ Source: `tools/bench/bench.py` against `build-icpx` `ovvs.dll` (`OVVS_WITH_SYCL=
 Dataset: checksum-pinned `data/sift-128-euclidean.hdf5`; each section states its selected base/query geometry.
 Comparators: faiss-cpu 1.15.0, hnswlib 0.8.0.
 
-## SIFT1M same-index search-effort curve
+## SIFT1M promoted cached-worst search-effort curve
 
-One clean complete process at commit `acd67e2` built a single CAGRA degree-16/intermediate-32 index and reused it across the normal batch-32 effort curve plus the high-effort batch-one point. The hnswlib lane retained `M=16`, `ef_construction=200`, 20 threads, and its complete `ef=32/64/128/256` curve. Every point used one warmup, five measured passes, exact validated HDF5 truth, and successful whole-package energy sampling. All 7,704 CAGRA calls were direct GPU walks with zero explicit index uploads.
+Three clean candidate processes at commit `c7e9c04` built fresh CAGRA
+degree-16/intermediate-32 indexes and reused each index across the normal
+batch-32 effort curve plus the high-effort batch-one point. The hnswlib lanes
+retained `M=16`, `ef_construction=200`, 20 threads, and the complete
+`ef=32/64/128/256` curve. Every point used one warmup, five measured passes,
+exact validated HDF5 truth, and successful whole-package energy sampling. The
+table reports the median of the three process medians.
 
 | Lane / effort | Recall@10 | Median QPS | Batch p99 | Package µJ/query |
 |---|---:|---:|---:|---:|
-| CAGRA 32/1, batch 32 | 0.9036 | 3,480.2 | 10.213 ms | 6,702.1 |
-| CAGRA 64/2, batch 32 | 0.9609 | 1,169.1 | 29.126 ms | 18,297.5 |
-| CAGRA 128/4, batch 32 | 0.9889 | 347.9 | 94.798 ms | 116,004.4 |
-| CAGRA 128/4, batch 1 | 0.9889 | 13.0 | 89.459 ms | 1,710,529.2 |
-| hnswlib ef32, batch 32 | 0.8911 | 11,112.6 | 4.570 ms | 2,981.3 |
-| hnswlib ef64, batch 32 | 0.9589 | 6,675.0 | 5.482 ms | 4,891.6 |
-| hnswlib ef128, batch 32 | 0.9879 | 3,765.6 | 9.813 ms | 8,638.5 |
-| hnswlib ef256, batch 32 | 0.9976 | 2,061.7 | 17.675 ms | 13,464.8 |
-| hnswlib ef256, batch 1 | 0.9976 | 2,040.2 | 0.635 ms | 14,713.9 |
+| CAGRA 32/1, batch 32 | 0.9036 | 6,330.2 | 5.754 ms | 4,931.0 |
+| CAGRA 64/2, batch 32 | 0.9609 | 2,549.9 | 13.233 ms | 12,005.0 |
+| CAGRA 128/4, batch 32 | 0.9889 | 892.2 | 36.270 ms | 28,147.8 |
+| CAGRA 128/4, batch 1 | 0.9889 | 33.4 | 35.013 ms | 699,287.2 |
+| hnswlib ef32, batch 32 | 0.8919 | 11,235.5 | 3.179 ms | 3,090.0 |
+| hnswlib ef64, batch 32 | 0.9589 | 6,746.8 | 5.399 ms | 4,654.6 |
+| hnswlib ef128, batch 32 | 0.9878 | 3,742.0 | 9.804 ms | 9,245.6 |
+| hnswlib ef256, batch 32 | 0.9974 | 2,061.4 | 17.727 ms | 14,319.5 |
+| hnswlib ef256, batch 1 | 0.9974 | 2,032.2 | 0.643 ms | 15,618.3 |
 
-The current graph crosses the ≥0.95 target at 64/2, so the low-effort 0.9036 result is not a hard topology ceiling. This does not establish topology parity or isolate the two search knobs because `itopk_size` and `search_width` rise together. At the closest batch-32 recall points, hnswlib is 3.19×, 5.71×, and 10.82× faster as effort rises; CAGRA package energy/query is 2.25×, 3.74×, and 13.43× higher. The batch-one rows are not recall matched, but the stronger-quality hnswlib point is still 156.37× faster. This identifies traversal/selection and small-batch GPU mapping as measured problems, not an acceleration result.
+The graph crosses the ≥0.95 target at `64/2`, but this still does not establish
+topology parity or isolate `itopk_size` from `search_width`. At the closest
+batch-32 recall points, hnswlib remains 1.77×, 2.65×, and 4.19× faster as effort
+rises. The batch-one rows are not recall matched; the stronger-quality hnswlib
+point remains 60.8× faster. The cached-worst change is promoted against its
+old-source A/B gate, not as an hnswlib or FAISS win.
 
-The curve is one benchmark invocation with two sequential isolated lane processes and no in-run clock, thermal, utilization, or background-load trace. It is causal quality/effort evidence, not repeated performance-promotion evidence. Complete provenance, counters, limitations, and the immutable raw hash: `tables/arrow-lake/cagra-search-v1.md`.
+The six-process old/new comparison, process ranges, exactness fixture,
+limitations, and immutable hashes are in
+`tables/arrow-lake/cagra-cached-worst-v1.md`. The original diagnostic curve
+remains in `tables/arrow-lake/cagra-search-v1.md`.
 
 ## SIFT100K current-code scale preflight
 
