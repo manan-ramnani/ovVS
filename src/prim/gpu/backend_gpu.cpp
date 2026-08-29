@@ -2124,6 +2124,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
   if (itopk > std::numeric_limits<int>::max() / 6) return false;
   constexpr size_t kMaxVisitedBytesPerQuery = 8u * 1024u * 1024u;
   constexpr size_t kVisitedAllocationTarget = 64u * 1024u * 1024u;
+  constexpr size_t kFrontierTileSize = 64u;
   try {
     auto& q = gpu_queue();
     const size_t N = static_cast<size_t>(n);
@@ -2158,11 +2159,17 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     size_t local_bytes = 0;
     if (!checked_product(BEAM, sizeof(int32_t) + sizeof(float) + sizeof(uint8_t), local_bytes)) return false;
     size_t pick_bytes = 0;
+    size_t frontier_bytes = 0;
     if (!checked_product(SW, sizeof(int32_t), pick_bytes) ||
-        local_bytes > std::numeric_limits<size_t>::max() - pick_bytes - 64u) {
+        !checked_product(kFrontierTileSize, sizeof(int32_t), frontier_bytes)) {
       return false;
     }
-    local_bytes += pick_bytes + 64u;
+    constexpr size_t kLocalMetadataBytes = 64u;
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (pick_bytes > max_size - frontier_bytes - kLocalMetadataBytes) return false;
+    const size_t auxiliary_bytes = pick_bytes + frontier_bytes + kLocalMetadataBytes;
+    if (local_bytes > max_size - auxiliary_bytes) return false;
+    local_bytes += auxiliary_bytes;
     const size_t local_mem = device.get_info<sycl::info::device::local_mem_size>();
     if (local_bytes > local_mem) return false;
 
@@ -2241,6 +2248,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
          sycl::local_accessor<float, 1> candidate_distances(sycl::range<1>(BEAM), h);
          sycl::local_accessor<uint8_t, 1> candidate_expanded(sycl::range<1>(BEAM), h);
          sycl::local_accessor<int32_t, 1> picks(sycl::range<1>(SW), h);
+         sycl::local_accessor<int32_t, 1> frontier_ids(sycl::range<1>(kFrontierTileSize), h);
          sycl::local_accessor<int32_t, 1> state(sycl::range<1>(4), h);
          sycl::local_accessor<uint32_t, 1> query_hash_state(sycl::range<1>(1), h);
          h.parallel_for(sycl::nd_range<1>(sycl::range<1>(launch_queries * work_group_size),
@@ -2338,17 +2346,27 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              }
            };
 
-           for (size_t seed = 0; seed < nseeds; ++seed) {
+           for (size_t seed_base = 0; seed_base < nseeds; seed_base += kFrontierTileSize) {
              if (lid == 0) {
-               const uint64_t mixed =
-                   static_cast<uint64_t>(seed) * 9973u + static_cast<uint64_t>(query_hash_state[0]) * 13u;
-               const int32_t id = static_cast<int32_t>(mixed % N);
-               state[1] = allowed_id(id) && visit_once(id) ? id : -1;
+               int32_t frontier_count = 0;
+               const size_t seed_end = std::min(seed_base + kFrontierTileSize, nseeds);
+               for (size_t seed = seed_base; seed < seed_end; ++seed) {
+                 const uint64_t mixed =
+                     static_cast<uint64_t>(seed) * 9973u + static_cast<uint64_t>(query_hash_state[0]) * 13u;
+                 const int32_t id = static_cast<int32_t>(mixed % N);
+                 if (allowed_id(id) && visit_once(id)) {
+                   frontier_ids[static_cast<size_t>(frontier_count++)] = id;
+                 }
+               }
+               state[1] = frontier_count;
              }
              item.barrier(sycl::access::fence_space::local_space);
-             const int32_t id = state[1];
-             const float score = id >= 0 ? cooperative_distance(id) : 0.f;
-             if (lid == 0 && id >= 0) consider(id, score, IT);
+             const int32_t frontier_count = state[1];
+             for (int32_t frontier = 0; frontier < frontier_count; ++frontier) {
+               const int32_t id = frontier_ids[static_cast<size_t>(frontier)];
+               const float score = cooperative_distance(id);
+               if (lid == 0) consider(id, score, IT);
+             }
              item.barrier(sycl::access::fence_space::local_space);
            }
 
@@ -2375,22 +2393,36 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              const int32_t npicks = state[2];
              if (npicks == 0) break;
 
-             for (int32_t pi = 0; pi < npicks; ++pi) {
-               const int32_t picked = picks[static_cast<size_t>(pi)];
-               for (size_t edge = 0; edge < DEG; ++edge) {
-                 if (lid == 0) {
-                   const int32_t neighbor = G[static_cast<size_t>(picked) * DEG + edge];
-                   state[1] = neighbor >= 0 && static_cast<size_t>(neighbor) < N && allowed_id(neighbor) &&
-                                      visit_once(neighbor)
-                                  ? neighbor
-                                  : -1;
+             const size_t frontier_total = static_cast<size_t>(npicks) * DEG;
+             size_t frontier_pick = 0;
+             size_t frontier_edge = 0;
+             for (size_t frontier_base = 0; frontier_base < frontier_total;
+                  frontier_base += kFrontierTileSize) {
+               if (lid == 0) {
+                 int32_t frontier_count = 0;
+                 const size_t frontier_raw_count = std::min(kFrontierTileSize, frontier_total - frontier_base);
+                 for (size_t raw = 0; raw < frontier_raw_count; ++raw) {
+                   const int32_t picked = picks[frontier_pick];
+                   const int32_t neighbor = G[static_cast<size_t>(picked) * DEG + frontier_edge];
+                   if (neighbor >= 0 && static_cast<size_t>(neighbor) < N && allowed_id(neighbor) &&
+                       visit_once(neighbor)) {
+                     frontier_ids[static_cast<size_t>(frontier_count++)] = neighbor;
+                   }
+                   if (++frontier_edge == DEG) {
+                     frontier_edge = 0;
+                     ++frontier_pick;
+                   }
                  }
-                 item.barrier(sycl::access::fence_space::local_space);
-                 const int32_t neighbor = state[1];
-                 const float score = neighbor >= 0 ? cooperative_distance(neighbor) : 0.f;
-                 if (lid == 0 && neighbor >= 0) consider(neighbor, score, BEAM);
-                 item.barrier(sycl::access::fence_space::local_space);
+                 state[1] = frontier_count;
                }
+               item.barrier(sycl::access::fence_space::local_space);
+               const int32_t frontier_count = state[1];
+               for (int32_t frontier = 0; frontier < frontier_count; ++frontier) {
+                 const int32_t neighbor = frontier_ids[static_cast<size_t>(frontier)];
+                 const float score = cooperative_distance(neighbor);
+                 if (lid == 0) consider(neighbor, score, BEAM);
+               }
+               item.barrier(sycl::access::fence_space::local_space);
              }
            }
 
