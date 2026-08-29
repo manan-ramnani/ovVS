@@ -435,6 +435,12 @@ def enumerate_lanes(algorithms: Sequence[str], policies: Sequence[str], n: int,
     return lanes
 
 
+def comparator_only_lanes(lanes: Sequence[Lane]) -> list[Lane]:
+    """Keep independent CPU comparators without running an ovVS producer lane."""
+
+    return [lane for lane in lanes if lane.implementation in ("faiss-cpu", "hnswlib")]
+
+
 def package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -1864,16 +1870,20 @@ def format_cagra_transfer(point: dict[str, Any]) -> str | None:
 
 def render_markdown(artifact: dict[str, Any]) -> str:
     dataset = artifact["dataset"]
+    selection = artifact.get("selection", {})
+    canonical_b1 = bool(artifact.get("completion", {}).get("canonical_b1_evidence", False))
     lines = [
         f"# ovVS benchmark — {artifact['profile']['name']}",
         "",
         f"- Started: `{artifact['started_at']}`",
         f"- Completion: **{artifact['completion']['status']}**",
+        f"- Canonical B1 evidence: **{'yes' if canonical_b1 else 'no'}**",
         f"- Dataset: `{dataset.get('kind', 'unavailable')}`; n={dataset.get('n', '—')}, dim={dataset.get('dim', '—')}, nq={dataset.get('nq', '—')}, k={artifact['profile']['settings']['k']}",
         f"- Exact ground truth: `{artifact['ground_truth'].get('status')}` via `{artifact['ground_truth'].get('method', 'unavailable')}`",
     ]
-    selection = artifact.get("selection", {})
-    if "cagra" in selection.get("algorithms", ()):
+    if selection.get("comparators_only"):
+        lines.append("- Scope: **comparator-only control (noncanonical)**; every ovVS lane is omitted.")
+    if "cagra" in selection.get("algorithms", ()) and not selection.get("comparators_only"):
         lines.append(
             f"- CAGRA initializer: `{selection.get('cagra_build_algo', 'nndescent')}`"
         )

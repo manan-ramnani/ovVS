@@ -33,6 +33,7 @@ from _common import (
     SIFT_SHA256,
     cagra_recall_gate_result,
     cagra_sift100k_preflight_result,
+    comparator_only_lanes,
     completion_issues,
     default_output_path,
     duplicate_safe_recall,
@@ -1225,6 +1226,70 @@ class CliAndLaneSemanticsTests(unittest.TestCase):
         self.assertTrue(by_id["ovvs.cagra.auto"].expected_skip)
         self.assertFalse(by_id["ovvs.cagra.npu"].blocking_skip)
         self.assertIn("hnswlib.hnsw", by_id)
+
+    def test_comparator_only_selection_excludes_every_ovvs_producer_lane(self) -> None:
+        lanes = enumerate_lanes(
+            ["brute", "ivf-flat", "ivf-pq", "cagra"],
+            ["auto", "gpu"],
+            1_000_000,
+            True,
+            False,
+            include_hnsw_export=True,
+        )
+        selected = comparator_only_lanes(lanes)
+        self.assertEqual(
+            [lane.id for lane in selected],
+            ["faiss-cpu.brute", "faiss-cpu.ivf-flat", "faiss-cpu.ivf-pq", "hnswlib.hnsw"],
+        )
+        self.assertTrue(all(lane.implementation in ("faiss-cpu", "hnswlib") for lane in selected))
+
+    def test_comparator_only_artifact_is_explicitly_noncanonical(self) -> None:
+        artifact = bench._artifact(
+            SimpleNamespace(
+                profile="sift1m",
+                gate_only=None,
+                preflight_only=None,
+                comparators_only=True,
+                hnsw_threads=20,
+                build_policy="auto",
+                cagra_build_algo="nndescent",
+                no_energy=False,
+                allow_partial=False,
+                seed=7,
+                include_hnsw_export=False,
+                hnsw_module=None,
+                hnsw_provenance=None,
+            ),
+            resolved_profile("sift1m"),
+            ["cagra"],
+            ["gpu"],
+            {"status": "success", "kind": "sift1m"},
+            {"status": "success", "exact": True},
+            [successful_lane("hnswlib.hnsw")],
+            "2026-08-29T00:00:00Z",
+        )
+        self.assertTrue(artifact["selection"]["comparators_only"])
+        self.assertFalse(artifact["selection"]["canonical"])
+        self.assertFalse(artifact["completion"]["canonical_b1_evidence"])
+        self.assertFalse(artifact["completion"]["full_profile_strict"])
+        self.assertTrue(any("Comparator-only mode" in caveat for caveat in artifact["metadata"]["caveats"]))
+        markdown = _common.render_markdown(artifact)
+        self.assertIn("Canonical B1 evidence: **no**", markdown)
+        self.assertIn("Scope: **comparator-only control (noncanonical)**", markdown)
+        self.assertNotIn("CAGRA initializer", markdown)
+
+    def test_comparator_only_rejects_hnsw_export_before_dataset_work(self) -> None:
+        args = bench.build_parser().parse_args(["--comparators-only", "--include-hnsw-export"])
+        with patch("builtins.print") as mocked_print, patch.object(bench, "prepare_dataset") as prepare_dataset:
+            result = bench.orchestrate(args)
+        self.assertEqual(result, 2)
+        prepare_dataset.assert_not_called()
+        self.assertTrue(
+            any(
+                "--comparators-only cannot be combined with --include-hnsw-export" in str(call)
+                for call in mocked_print.call_args_list
+            )
+        )
 
     def test_hnsw_export_lane_is_explicit_and_nonmandatory(self) -> None:
         ordinary = enumerate_lanes(["cagra"], ["auto"], 2_000, False, True)

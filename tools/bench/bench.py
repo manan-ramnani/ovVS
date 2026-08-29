@@ -35,6 +35,7 @@ from _common import (
     WORKER_PREFIX,
     cagra_recall_gate_result,
     cagra_sift100k_preflight_result,
+    comparator_only_lanes,
     completion_issues,
     default_output_path,
     enumerate_lanes,
@@ -63,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--preflight-only",
         choices=(CAGRA_SIFT100K_PREFLIGHT,),
         help="run one noncanonical 100K SIFT runtime/memory/quality diagnostic",
+    )
+    fixed_mode.add_argument(
+        "--comparators-only",
+        action="store_true",
+        help="run only independent FAISS/hnswlib lanes; never canonical B1 evidence",
     )
     parser.add_argument("--algorithms", default="all", help="comma-separated: brute,ivf-flat,ivf-pq,cagra")
     parser.add_argument("--policies", default="all", help="comma-separated: auto,cpu,npu,gpu,hetero")
@@ -333,6 +339,7 @@ def _artifact(
         "selection": {
             "gate_only": gate_only,
             "preflight_only": preflight_only,
+            "comparators_only": bool(getattr(args, "comparators_only", False)),
             "algorithms": algorithms,
             "build_policy": POLICY_LABELS[getattr(args, "build_policy", "auto")],
             "build_policy_key": getattr(args, "build_policy", "auto"),
@@ -362,6 +369,7 @@ def _artifact(
                 and not getattr(args, "allow_partial", False)
                 and gate_only is None
                 and preflight_only is None
+                and not getattr(args, "comparators_only", False)
             ),
         },
         "metadata": {
@@ -388,6 +396,14 @@ def _artifact(
                 "IVF-PQ FORCE_GPU uses the fused iGPU scan/select path; AUTO remains evidence-gated.",
                 "Synthetic 100k x 768 is provisional and does not close real-corpus backlog B20.",
                 "SIFT-100k is a noncanonical prefix preflight and cannot close the SIFT1M quality gate.",
+                *(
+                    [
+                        "Comparator-only mode omits every ovVS lane and cannot establish an ovVS speedup "
+                        "or close canonical B1 evidence."
+                    ]
+                    if getattr(args, "comparators_only", False)
+                    else []
+                ),
                 *(
                     [
                         "The hnswlib comparator used an explicit extension and a hash-matched build "
@@ -424,6 +440,9 @@ def _artifact(
     if args.profile == "sift-100k":
         artifact["selection"]["canonical"] = False
         artifact["completion"]["canonical_b1_evidence"] = False
+    if getattr(args, "comparators_only", False):
+        artifact["selection"]["canonical"] = False
+        artifact["completion"]["canonical_b1_evidence"] = False
     if preflight is not None:
         artifact["preflight"] = preflight
     return artifact
@@ -439,6 +458,8 @@ def orchestrate(args: argparse.Namespace) -> int:
         build_policies = parse_selection(args.build_policy, POLICY_ORDER, "build policy")
         if len(build_policies) != 1:
             raise ValueError("exactly one build policy must be selected")
+        if getattr(args, "comparators_only", False) and args.include_hnsw_export:
+            raise ValueError("--comparators-only cannot be combined with --include-hnsw-export")
         build_policy = build_policies[0]
         args.build_policy = build_policy
         profile = resolved_profile(args.profile, args.warmups, args.repeats, args.timeout_seconds)
@@ -458,6 +479,8 @@ def orchestrate(args: argparse.Namespace) -> int:
             args.allow_unscalable_cagra,
             args.include_hnsw_export,
         )
+        if getattr(args, "comparators_only", False):
+            lanes = comparator_only_lanes(lanes)
         spec = {
             "schema_version": SCHEMA_VERSION,
             "profile": profile,
