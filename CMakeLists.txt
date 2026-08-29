@@ -111,6 +111,11 @@ endif()
 
 if(OVVS_BUILD_ESCAPE_EXPERIMENTS)
   if(OVVS_WITH_SYCL AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
+    add_executable(ovvs_gpu_root_group_canary
+      tools/gpu_root_group_canary/main.cpp)
+    target_compile_options(ovvs_gpu_root_group_canary PRIVATE -fsycl)
+    target_link_options(ovvs_gpu_root_group_canary PRIVATE -fsycl)
+
     add_executable(ovvs_pq_gpu_fused_bench tools/pq_gpu_fused_bench/main.cpp)
     target_compile_options(ovvs_pq_gpu_fused_bench PRIVATE -fsycl)
     target_link_options(ovvs_pq_gpu_fused_bench PRIVATE -fsycl)
@@ -187,6 +192,15 @@ if(OVVS_BUILD_TESTS)
   add_executable(ovvs_consumer_cxx tests/consumer.cpp)
   target_link_libraries(ovvs_consumer_cxx PRIVATE ovvs)
   enable_testing()
+  if(TARGET ovvs_gpu_root_group_canary)
+    add_test(NAME gpu_root_group_canary
+      COMMAND ovvs_gpu_root_group_canary)
+    set_tests_properties(gpu_root_group_canary PROPERTIES
+      LABELS "gpu;experimental;capability"
+      RESOURCE_LOCK intel_gpu
+      SKIP_RETURN_CODE 77
+      TIMEOUT 20)
+  endif()
   add_test(NAME cpu COMMAND ovvs_tests
     --exclude nndescent_gpu_n_over_4096
     --exclude nndescent_gpu_bounded_scale
