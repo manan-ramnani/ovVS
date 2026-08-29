@@ -417,11 +417,12 @@ ovvsStatus prim_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
 ovvsStatus prim_nndescent_build(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                                  ovvsMetric metric, int32_t degree, int32_t iterations,
                                  int32_t* graph, NnDescentBuildStats* stats = nullptr);
-ovvsStatus prim_cagra_optimize_ranked(ResourcesData& r, const int32_t* initial,
-                                      int64_t n, int32_t initial_degree,
-                                      int32_t final_degree,
-                                      std::vector<int32_t>& output);
 /* Private C++ test seam; not part of the installed C ABI. */
+OVVS_API ovvsStatus prim_cagra_optimize_ranked(ResourcesData& r,
+                                                const int32_t* initial, int64_t n,
+                                                int32_t initial_degree,
+                                                int32_t final_degree,
+                                                std::vector<int32_t>& output);
 OVVS_API ovvsStatus cagra_optimize_ranked(const int32_t* initial, int64_t n,
                                           int32_t initial_degree, int32_t final_degree,
                                           std::vector<int32_t>& output);

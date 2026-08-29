@@ -1,5 +1,10 @@
 # Arrow Lake 265K NN-Descent B5 bounded evidence
 
+> Historical checkpoint: the measurements below predate the promoted exact GPU
+> optimizer. Current construction routing and evidence are in
+> [`cagra-gpu-optimize-v1.md`](cagra-gpu-optimize-v1.md); the original timings
+> and conclusions remain unchanged for the DLLs that produced them.
+
 Source: native `ovvs_tests` against `build-icpx` (`OVVS_WITH_SYCL=ON`) on 2026-08-28. Inputs are deterministic `make_data` fixtures; overlap is against independent exact L2 neighbors on sampled rows. CTest runs the threshold and bounded-scale cases in separate processes with an Intel-GPU resource lock and 45/120-second timeouts.
 
 | n | dim | degree | iterations | Build wall, isolated processes | Sampled exact overlap | Final iteration telemetry | Owned device bytes |

@@ -1,5 +1,10 @@
 # Arrow Lake 265K recall–QPS (icx SYCL + oneMKL)
 
+> Historical checkpoint: build-stage descriptions below apply to the DLLs that
+> produced those rows. The exact GPU optimizer was promoted later; current
+> construction routing and evidence are in
+> [`cagra-gpu-optimize-v1.md`](cagra-gpu-optimize-v1.md).
+
 Source: `tools/bench/bench.py` against `build-icpx` `ovvs.dll` (`OVVS_WITH_SYCL=ON`, `OVVS_WITH_MKL=ON`).
 Dataset: checksum-pinned `data/sift-128-euclidean.hdf5`; each section states its selected base/query geometry.
 Comparators: faiss-cpu 1.15.0, hnswlib 0.8.0.

@@ -9,12 +9,12 @@ Goal: **put each op on the device that is actually fastest for that op**, then o
 | Device | Native strength | Native weakness |
 |---|---|---|
 | **NPU** | Compiled static MatMul / Conv on DPU. INT8 full-rate, FP16 half. Weight-stationary graphs. ~4 MB SRAM scratchpad. | Launch tax. No pointer-chasing. `set_tensor(host*)` SHAVE-copies. Two live fp32 Parameters do not light INT8 MACs. Dataset does not fit SRAM. |
-| **iGPU** | XMX/DPAS GEMM (FP16 and INT8 via oneMKL). SYCL graph walk (CAGRA). USM shared with CPU. Parallel convert/pack. | TopK/Gather launch tax vs CPU. Serial host fp32→half is a self-inflicted stall. Shared DRAM, not HBM. |
+| **iGPU** | XMX/DPAS GEMM (FP16 and INT8 via oneMKL). SYCL CAGRA walk, NN-Descent, and bounded graph optimization. USM shared with CPU. Parallel convert/pack. | TopK/Gather launch tax vs CPU. Serial host fp32→half is a self-inflicted stall. Shared DRAM, not HBM. |
 | **CPU** | Tiny GEMM, TopK, Gather, control plane, heaps, HostCompile, k-means reduction, filters. AVX-512 / oneMKL `cblas_sgemm`. | Naive triple-loop GEMM is not a device (we do not ship that). Dense GEMM remains memory-bandwidth-bound and must be re-baked per SKU. |
 
 ## Primitive winners (Arrow Lake, icx + oneMKL + OpenVINO)
 
-Sources: `tables/arrow-lake/gemm.json`, `gemm_large.json`, `gemm_f16.json`, `gemm_i8.json`, `topk.json`, `topk_large.json`, `gather.json`, `gather_large.json`, `npu-gemm-dpu-vs-wall.md`. Re-run `ovvs_bakeoff` after this split; `ms` is cold (includes L0 fill), `ms_hot` is repeated infer with fingerprint-sticky operands.
+Sources: `tables/arrow-lake/gemm.json`, `gemm_large.json`, `gemm_f16.json`, `gemm_i8.json`, `topk.json`, `topk_large.json`, `gather.json`, `gather_large.json`, `npu-gemm-dpu-vs-wall.md`, and `cagra-gpu-optimize-v1.md`. Re-run `ovvs_bakeoff` after this split; `ms` is cold (includes L0 fill), `ms_hot` is repeated infer with fingerprint-sticky operands.
 
 | Op | Shape | CPU | NPU | iGPU | AUTO |
 |---|---|---|---|---|---|
@@ -27,6 +27,7 @@ Sources: `tables/arrow-lake/gemm.json`, `gemm_large.json`, `gemm_f16.json`, `gem
 | TopK | tiny and 32×1e5 k=10 | **1.9 ms** | 114 ms | 750 ms | CPU |
 | Gather | 4096 rows from 1e5×768 | **4 ms** | 213 ms | 24 ms | CPU |
 | Graph walk | CAGRA | host fallback | no | **SYCL fused** | GPU |
+| CAGRA optimize/prune/merge | SIFT1M, intermediate/final degree 32/16 | 9.034 s | no | **0.641 s** | GPU through intermediate degree 64 |
 | PQ ADC | bounded fixed-bucket batch fallback | SHAVE C | **Batched Gather+ReduceSum when range-safe** | fused FORCE_GPU scan/select | Existing safe AUTO attempt / unsafe CPU fallback; no Arrow Lake NPU promotion |
 | Hamming / Lp | pairwise graph | AVX | GreaterEqual/Xor or Abs/Power | SYCL | FORCE_* honest; AUTO follows size |
 
@@ -56,9 +57,11 @@ CAGRA search
   candidate scoring inside the walk → fused in the SYCL kernel
 
 CAGRA build
-  NN-Descent init n>4096 → iGPU SYCL under AUTO (90.444 s / 90.36% of clean SIFT1M median build; synchronization/readback is a separate construction target)
-  prune               → CPU until T13.3 (9.034 s clean SIFT1M median; full FORCE_GPU build is unavailable)
-  attribution         → success-only V1 stages plus call-local GPU lifecycle counters; external API wall remains the end-to-end measure
+  NN-Descent init n>4096 → iGPU SYCL under AUTO (90.883 s median after T13.3 promotion; device-phase profiling is the primary construction target)
+  optimize/prune/merge → exact iGPU SYCL through intermediate degree 64 (0.641 s vs 9.034 s CPU baseline; 91.987 s complete build)
+  policy              → AUTO/GPU_IF_FASTER/HETERO use GPU when supported; cap/device absence may use CPU; selected GPU failure is fail-closed
+  FORCE_GPU           → NN-Descent initializer plus supported GPU optimizer; capability absence returns DEVICE_UNAVAILABLE, while execution/correctness and allocation failures retain ERROR/OOM with no CPU fallback; FORCE_CPU retains CPU
+  attribution         → success-only V1 stages plus initializer lifecycle counters; optimizer-specific transfers/submissions remain unexposed, so external API wall is canonical
 
 Vamana / NN-Descent
   NN-Descent n>4096  → iGPU SYCL bounded NEW/OLD forward+reverse join (the resulting measured graph reaches 0.9609 with higher walk effort; T12.5 IVF-PQ comparison/prune open)
@@ -113,6 +116,7 @@ Primary references: [Intel NPU Acceleration Library EOL](https://github.com/inte
 2. GEMM is oneMKL SYCL (`float`, `sycl::half`, `int8→float`). Naive `parallel_for` is the fallback, not the product path.
 3. fp32→half / fp32→int8 packing is a SYCL kernel, not a host `for`.
 4. CAGRA walk is the fused SYCL kernel. Do not lower the walk to NPU.
+5. CAGRA optimize/prune/merge uses two bounded device-allocation phases and publishes only after device validation plus final readback. The current initializer graph still returns to host before this stage; measure any resident handoff end to end.
 
 ## Mixer (`choose_device`)
 
@@ -121,6 +125,7 @@ AUTO:
 - `topk` / `gather` → CPU
 - GEMM / pairwise → CPU unless `flops ≥ large_gemm_flops` and `gemm_large.json` names NPU or GPU (Arrow Lake: CPU)
 - CAGRA walk → GPU (`prim_graph_walk`)
+- CAGRA optimize/prune/merge → GPU through intermediate degree 64 (`prim_cagra_optimize_ranked`); adaptive cap/device absence may use CPU, but a selected GPU execution failure does not
 - IVF-PQ ADC → the existing range-safe NPU attempt with unsafe CPU fallback on AUTO; fused iGPU scan/select is FORCE_GPU-only, and no Arrow Lake NPU expansion is active until a complete per-SKU table wins
 - `FORCE_NPU` / `FORCE_GPU` still hit that device or return `DEVICE_UNAVAILABLE`
 

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-29 08:06:44 UTC",
+  "purpose": "Exact dataset-free CAGRA graph comparison between the frozen product-code parent and the committed GPU optimizer",
+  "dataset": {
+    "path": "data/sift-128-euclidean.hdf5",
+    "sha256": "DD6F0A6ED6B7EBB8934680F861A33ED01FF33991EAEE4FD60914D854A0CA5984",
+    "base_key": "train"
+  },
+  "build": {
+    "policy": "AUTO",
+    "algorithm": "nndescent",
+    "metric": "L2_EXPANDED",
+    "graph_degree": 16,
+    "intermediate_degree": 32,
+    "process_isolation": "one fresh Python process per DLL",
+    "serialization": "ovvsCagraSerializeEx(include_dataset=0)",
+    "timing_disposition": "diagnostic only; these sequential current-load walls are excluded from performance claims"
+  },
+  "libraries": {
+    "parent": {
+      "path": "out/bench/nnd-sync-active-count-v1/dlls/ovvs-baseline-e2f8a04.dll",
+      "sha256": "1828C050A447B47E3690511A8CB2DC88C57D3095A2A20408DD13B6CF6F95C4C5",
+      "bytes": 1134592,
+      "final_device": "CPU"
+    },
+    "candidate": {
+      "path": "build-icpx/bin/ovvs.dll",
+      "sha256": "C8448624DDED7F1490AAAB623C96A3B811E8C93DF682A7EB0C03924D3125880D",
+      "bytes": 1204736,
+      "source_commit": "28f2dbd539d4844a7008f53ba5767dc96e078ff4",
+      "final_device": "GPU"
+    }
+  },
+  "checks": [
+    {
+      "rows": 100000,
+      "dim": 128,
+      "degree": 16,
+      "format_magic": "0x31475243",
+      "format_version": 2,
+      "flags": 0,
+      "file_bytes": 6400036,
+      "parent_build_seconds_diagnostic": 8.920372199965641,
+      "candidate_build_seconds_diagnostic": 7.90879729995504,
+      "whole_file_sha256": "3DDBC4936F1307AC2B842AF2FCCB9B7FE06E6AA82718255FF6CC917C6F60FE32",
+      "graph_payload_sha256": "86430690AA22190D86A418F254A68232ED820BDA48F329CC5A3B5CB2CFEE77A4",
+      "exact_match": true
+    },
+    {
+      "rows": 1000000,
+      "dim": 128,
+      "degree": 16,
+      "format_magic": "0x31475243",
+      "format_version": 2,
+      "flags": 0,
+      "file_bytes": 64000036,
+      "parent_build_seconds_diagnostic": 108.14623299997766,
+      "candidate_build_seconds_diagnostic": 91.90056079998612,
+      "whole_file_sha256": "0A792378EFD0652A4410894BF7ABAF888EEC314B5C4CAE7F7463532002AF15BE",
+      "graph_payload_sha256": "59CADBE6FD1F4A288502475D4EBC30418B7A03E343E5217BF8ED7FC480D8B315",
+      "exact_match": true
+    }
+  ],
+  "verdict": {
+    "status": "pass",
+    "exact_graph_bytes": true,
+    "performance_claim_from_this_artifact": false
+  }
+}

@@ -2344,6 +2344,43 @@ OVVS_TEST(cagra_rank_optimizer_gpu_matches_cpu) {
              OVVS_STATUS_UNSUPPORTED,
          "GPU rank optimizer degree cap must fail closed");
   expect(failed.empty(), "degree-cap failure publishes no GPU output");
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_AUTO),
+                "AUTO rank optimizer policy");
+  failed = {99};
+  expect(ovvs::impl::prim_cagra_optimize_ranked(
+             *resources, malformed.data(), n, initial_degree, 5, failed) ==
+             OVVS_STATUS_ERROR,
+         "AUTO rank optimizer must propagate malformed GPU work");
+  expect(failed.empty(), "AUTO malformed GPU work publishes no output");
+
+  const auto cap_data = make_data(cap_n, 8, 318);
+  ovvsCagraIndex_t cap_index = reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+  expect_status(ovvsCagraBuildEx(
+                    res.r, cap_data.data(), cap_n, 8, OVVS_METRIC_L2_EXPANDED,
+                    32, cap_degree, OVVS_CAGRA_BUILD_NN_DESCENT, &cap_index),
+                "AUTO degree-cap CAGRA CPU fallback");
+  expect(cap_index != nullptr, "AUTO degree-cap fallback publishes an index");
+  ovvsDevice last = OVVS_DEVICE_AUTO;
+  expect_status(ovvsResourcesLastDevice(res.r, &last),
+                "AUTO degree-cap fallback attribution");
+  expect(last == OVVS_DEVICE_CPU,
+         "AUTO degree-cap capability fallback must finish on CPU");
+  ovvsCagraDestroy(cap_index);
+
+  expect_status(ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU),
+                "forced CAGRA initializer policy");
+  for (const ovvsCagraBuildAlgo algo : {OVVS_CAGRA_BUILD_IVF_PQ,
+                                       OVVS_CAGRA_BUILD_ITERATIVE}) {
+    ovvsCagraIndex_t rejected =
+        reinterpret_cast<ovvsCagraIndex_t>(uintptr_t{1});
+    expect(ovvsCagraBuildEx(res.r, cap_data.data(), cap_n, 8,
+                            OVVS_METRIC_L2_EXPANDED, 32, cap_degree, algo,
+                            &rejected) == OVVS_STATUS_DEVICE_UNAVAILABLE,
+           "FORCE_GPU unsupported CAGRA initializer rejection");
+    expect(rejected == nullptr,
+           "FORCE_GPU unsupported initializer publishes no index");
+  }
 }
 
 OVVS_TEST(nndescent_gpu_n_over_4096) {

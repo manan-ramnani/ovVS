@@ -58,6 +58,7 @@ explicitly non-canonical context. The public compiler boundary is retained in
 `../../../compiler/shave/PUBLIC_TOOLCHAIN_GATE.md`.
 
 Other evidence manifests: [`cagra-build-v1/`](cagra-build-v1/README.md),
+[`cagra-gpu-optimize-v1/`](cagra-gpu-optimize-v1/README.md),
 [`cagra-search-v1/`](cagra-search-v1/README.md),
 [`cagra-cached-worst-v1/`](cagra-cached-worst-v1/README.md),
 [`cagra-frontier-v1/`](cagra-frontier-v1/README.md),

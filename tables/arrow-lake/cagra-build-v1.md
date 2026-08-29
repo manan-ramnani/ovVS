@@ -62,3 +62,15 @@ Both sizes exhausted the six-iteration budget. At SIFT1M, changed and pending-NE
 The first measured construction target is the GPU NN-Descent initializer, which owns 90.36% of complete SIFT1M build wall and exposes 2,458 submissions, 1,820 waits, and 459 readbacks. Begin with the repeated reverse/proposal loop in `src/prim/gpu/backend_gpu.cpp`; the telemetry does not time that sub-loop separately. The host optimizer is the second target at 9.03 s. No NPU work is justified by this evidence.
 
 Promote a construction change only after interleaved repeated complete-wall measurements preserve recall and structural correctness, improve median SIFT1M build by at least 10%, keep search p99 within 5%, and avoid more than 5% peak-memory growth. A later same-index curve demonstrates 0.9609 recall with higher walk effort, but loses comparable-recall QPS and energy; it does not change this construction evidence. Product acceleration still requires recall at least 0.95, faster construction and search than full-strength hnswlib, competitive batch-one tails, and repeated complete curves plus energy. Search evidence: `tables/arrow-lake/cagra-search-v1.md`.
+
+## Subsequent T13.3 disposition
+
+The exact GPU optimizer later reduced this report's 9.034-second CPU stage to
+0.641 seconds and repeated complete build wall to 91.987 seconds (-8.10%), with
+exact SIFT1M graph bytes, unchanged recall and initializer counters, and 3.13%
+lower peak RSS. The generic 10% whole-build criterion above was not met; an
+isolated stage representing only 9.03% of baseline wall cannot meet it even at
+zero cost. A scoped exception therefore promotes T13.3 through intermediate
+degree 64 while retaining the 10% gate for initializer or multi-stage changes.
+ovVS still builds 1.182× slower than unchanged hnswlib in the candidate cohort.
+Evidence and limitations: `tables/arrow-lake/cagra-gpu-optimize-v1.md`.
