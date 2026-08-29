@@ -1260,15 +1260,24 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
     size_t convergence_local_bytes = 0;
     size_t matrix_cells = 0;
     size_t join_local_bytes = 0;
+    size_t minimum_cells = 0;
+    size_t minimum_local_bytes = 0;
     if (!checked_product(convergence_hash_capacity, sizeof(int32_t), convergence_local_bytes) ||
         !checked_product(max_bi_samples, max_bi_samples, matrix_cells) ||
         !checked_product(matrix_cells, 2u * sizeof(float), join_local_bytes) ||
+        !checked_product(max_bi_samples, 3u, minimum_cells) ||
+        !checked_product(minimum_cells, sizeof(uint32_t) + sizeof(float),
+                         minimum_local_bytes) ||
         max_bi_samples >
             (std::numeric_limits<size_t>::max() - join_local_bytes - 2u * sizeof(int32_t)) /
                 (2u * sizeof(uint32_t))) {
       return OVVS_STATUS_SHAPE_MISMATCH;
     }
     join_local_bytes += max_bi_samples * 2u * sizeof(uint32_t) + 2u * sizeof(int32_t);
+    if (minimum_local_bytes > std::numeric_limits<size_t>::max() - join_local_bytes) {
+      return OVVS_STATUS_SHAPE_MISMATCH;
+    }
+    join_local_bytes += minimum_local_bytes;
     const size_t local_mem = device.get_info<sycl::info::device::local_mem_size>();
     if (std::max(join_local_bytes, convergence_local_bytes) > local_mem) {
       return OVVS_STATUS_OOM;
@@ -1655,6 +1664,8 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
            sycl::local_accessor<uint32_t, 1> old_ids(sycl::range<1>(max_bi_samples), h);
            sycl::local_accessor<float, 1> new_new_distances(sycl::range<1>(matrix_cells), h);
            sycl::local_accessor<float, 1> new_old_distances(sycl::range<1>(matrix_cells), h);
+           sycl::local_accessor<uint32_t, 1> minimum_ids(sycl::range<1>(minimum_cells), h);
+           sycl::local_accessor<float, 1> minimum_distances(sycl::range<1>(minimum_cells), h);
            sycl::local_accessor<int32_t, 1> state(sycl::range<1>(2), h);
            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size),
                                            sycl::range<1>(work_group_size)),
@@ -1791,6 +1802,56 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
              }
              item.barrier(sycl::access::fence_space::local_space);
 
+             auto nearer = [](float lhs_distance, uint32_t lhs_id,
+                              float rhs_distance, uint32_t rhs_id) {
+               return lhs_distance < rhs_distance ||
+                      (lhs_distance == rhs_distance && lhs_id < rhs_id);
+             };
+             const size_t new_new_minimum_base = 0;
+             const size_t new_old_row_minimum_base = new_count;
+             const size_t new_old_column_minimum_base = 2u * new_count;
+             const size_t minimum_count = 2u * new_count + old_count;
+             for (size_t minimum_index = lid; minimum_index < minimum_count;
+                  minimum_index += work_group_size) {
+               uint32_t best_id = kInvalidId;
+               float best_distance = std::numeric_limits<float>::max();
+               if (minimum_index < new_old_row_minimum_base) {
+                 const size_t i = minimum_index;
+                 for (size_t j = 0; j < new_count; ++j) {
+                   if (i == j) continue;
+                   const float distance = new_new_distances[i * new_count + j];
+                   if (best_id == kInvalidId ||
+                       nearer(distance, new_ids[j], best_distance, best_id)) {
+                     best_id = new_ids[j];
+                     best_distance = distance;
+                   }
+                 }
+               } else if (minimum_index < new_old_column_minimum_base) {
+                 const size_t i = minimum_index - new_old_row_minimum_base;
+                 for (size_t j = 0; j < old_count; ++j) {
+                   const float distance = new_old_distances[i * old_count + j];
+                   if (best_id == kInvalidId ||
+                       nearer(distance, old_ids[j], best_distance, best_id)) {
+                     best_id = old_ids[j];
+                     best_distance = distance;
+                   }
+                 }
+               } else {
+                 const size_t j = minimum_index - new_old_column_minimum_base;
+                 for (size_t i = 0; i < new_count; ++i) {
+                   const float distance = new_old_distances[i * old_count + j];
+                   if (best_id == kInvalidId ||
+                       nearer(distance, new_ids[i], best_distance, best_id)) {
+                     best_id = new_ids[i];
+                     best_distance = distance;
+                   }
+                 }
+               }
+               minimum_ids[minimum_index] = best_id;
+               minimum_distances[minimum_index] = best_distance;
+             }
+             item.barrier(sycl::access::fence_space::local_space);
+
              if (lid == 0) {
                const size_t proposal_base =
                    item.get_group_linear_id() * proposals_per_vertex;
@@ -1823,54 +1884,28 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
                  emit_directed(a, b, distance);
                  emit_directed(b, a, distance);
                };
-               auto nearer = [](float lhs_distance, uint32_t lhs_id, float rhs_distance,
-                                uint32_t rhs_id) {
-                 return lhs_distance < rhs_distance ||
-                        (lhs_distance == rhs_distance && lhs_id < rhs_id);
-               };
 
                for (size_t i = 0; i < new_count; ++i) {
-                 uint32_t best_id = kInvalidId;
-                 float best_distance = std::numeric_limits<float>::max();
-                 for (size_t j = 0; j < new_count; ++j) {
-                   if (i == j) continue;
-                   const float distance = new_new_distances[i * new_count + j];
-                   if (best_id == kInvalidId ||
-                       nearer(distance, new_ids[j], best_distance, best_id)) {
-                     best_id = new_ids[j];
-                     best_distance = distance;
-                   }
-                 }
+                 uint32_t best_id = minimum_ids[new_new_minimum_base + i];
+                 float best_distance =
+                     minimum_distances[new_new_minimum_base + i];
                  if (best_id != kInvalidId) {
                    emit_reciprocal(new_ids[i], best_id, best_distance);
                  }
 
-                 best_id = kInvalidId;
-                 best_distance = std::numeric_limits<float>::max();
-                 for (size_t j = 0; j < old_count; ++j) {
-                   const float distance = new_old_distances[i * old_count + j];
-                   if (best_id == kInvalidId ||
-                       nearer(distance, old_ids[j], best_distance, best_id)) {
-                     best_id = old_ids[j];
-                     best_distance = distance;
-                   }
-                 }
+                 best_id = minimum_ids[new_old_row_minimum_base + i];
+                 best_distance =
+                     minimum_distances[new_old_row_minimum_base + i];
                  if (best_id != kInvalidId) {
                    emit_reciprocal(new_ids[i], best_id, best_distance);
                  }
                }
 
                for (size_t j = 0; j < old_count; ++j) {
-                 uint32_t best_id = kInvalidId;
-                 float best_distance = std::numeric_limits<float>::max();
-                 for (size_t i = 0; i < new_count; ++i) {
-                   const float distance = new_old_distances[i * old_count + j];
-                   if (best_id == kInvalidId ||
-                       nearer(distance, new_ids[i], best_distance, best_id)) {
-                     best_id = new_ids[i];
-                     best_distance = distance;
-                   }
-                 }
+                 const uint32_t best_id =
+                     minimum_ids[new_old_column_minimum_base + j];
+                 const float best_distance =
+                     minimum_distances[new_old_column_minimum_base + j];
                  if (best_id != kInvalidId) {
                    emit_reciprocal(old_ids[j], best_id, best_distance);
                  }
