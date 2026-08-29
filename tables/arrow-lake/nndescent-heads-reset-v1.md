@@ -52,8 +52,9 @@ Package energy was disabled.
 
 The structural signature is exact: SIFT1M removed 438 submissions and changed
 no other tracked GPU-work counter. hnswlib build wall was 78,063.239 ms in the
-parent process and 77,433.518 ms in the earlier candidate process (-0.81%), so
-the ovVS loss is not explained by a generally slower candidate run. Search
+parent process and 77,433.518 ms in the earlier candidate process (-0.81%).
+That opposite drift argues against a global process slowdown, but one
+non-interleaved pair cannot exclude phase-specific machine noise. Search
 timings moved in opposite directions between ovVS and hnswlib and are not
 attributed to this construction-only patch.
 
@@ -82,7 +83,8 @@ The result shows that fewer submissions alone is not a performance proxy. On
 this Arrow Lake stack, the scattered-reset candidate lost to the baseline
 bulk-fill design; these runs do not isolate whether stores, cache/coherency, or
 submission behavior caused the loss. The next bounded synchronization
-experiment should keep the bulk fills and dynamic ranges, then replace only
-queue-wide producer barriers with explicit producer→active-count-copy
-dependencies. T13.3 GPU optimize/prune/merge remains the next independent
-construction stage after that bounded screen.
+experiment kept the bulk fills and dynamic ranges and replaced only queue-wide
+producer barriers with explicit producer→active-count-copy dependencies. It
+also lost at SIFT1M and was rejected. T13.3 GPU optimize/prune/merge is now the
+next independent construction implementation target. Evidence:
+[`nndescent-producer-copy-event-v1.md`](nndescent-producer-copy-event-v1.md).

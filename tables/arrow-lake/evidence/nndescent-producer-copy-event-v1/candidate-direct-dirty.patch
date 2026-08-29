@@ -1,0 +1,81 @@
+diff --git a/src/prim/gpu/backend_gpu.cpp b/src/prim/gpu/backend_gpu.cpp
+index 402ec91..f4934e2 100644
+--- a/src/prim/gpu/backend_gpu.cpp
++++ b/src/prim/gpu/backend_gpu.cpp
+@@ -1518,7 +1518,8 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+           q.wait_and_throw();
+ 
+           note_kernel();
+-          q.parallel_for(sycl::range<1>(source_count), [=](sycl::id<1> source_index) {
++          sycl::event producer_event =
++              q.parallel_for(sycl::range<1>(source_count), [=](sycl::id<1> source_index) {
+             const size_t local_source = source_index[0];
+             const size_t source = source_offset + local_source;
+             size_t sample_rank = 0;
+@@ -1546,14 +1547,13 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+               ++sample_rank;
+             }
+           });
+-          note_wait();
+-          q.wait_and_throw();
+ 
+           int32_t active_count = 0;
+           note_d2h(sizeof(active_count));
+-          q.memcpy(&active_count, scalars_ptr, sizeof(active_count));
++          sycl::event active_count_copy =
++              q.memcpy(&active_count, scalars_ptr, sizeof(active_count), producer_event);
+           note_wait();
+-          q.wait_and_throw();
++          active_count_copy.wait_and_throw();
+           if (active_count < 0 || static_cast<size_t>(active_count) > N) {
+             return OVVS_STATUS_ERROR;
+           }
+@@ -1649,7 +1649,7 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+         q.wait_and_throw();
+ 
+         note_kernel();
+-        q.submit([&](sycl::handler& h) {
++        sycl::event producer_event = q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> new_ids(sycl::range<1>(max_bi_samples), h);
+            sycl::local_accessor<uint32_t, 1> old_ids(sycl::range<1>(max_bi_samples), h);
+            sycl::local_accessor<float, 1> new_new_distances(sycl::range<1>(matrix_cells), h);
+@@ -1877,14 +1877,13 @@ ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n
+              }
+            });
+          });
+-        note_wait();
+-        q.wait_and_throw();
+ 
+         int32_t scalar_values[2] = {0, 0};
+         note_d2h(sizeof(scalar_values));
+-        q.memcpy(scalar_values, scalars_ptr, sizeof(scalar_values));
++        sycl::event scalar_copy =
++            q.memcpy(scalar_values, scalars_ptr, sizeof(scalar_values), producer_event);
+         note_wait();
+-        q.wait_and_throw();
++        scalar_copy.wait_and_throw();
+         if (scalar_values[1] != 0) return OVVS_STATUS_INVALID_ARGUMENT;
+         const int32_t active_count = scalar_values[0];
+         if (active_count < 0 || static_cast<size_t>(active_count) > N) {
+diff --git a/tests/test_neighbors.cpp b/tests/test_neighbors.cpp
+index e8756a1..3d49fa5 100644
+--- a/tests/test_neighbors.cpp
++++ b/tests/test_neighbors.cpp
+@@ -2314,7 +2314,7 @@ OVVS_TEST(nndescent_gpu_bounded_scale) {
+   expect_status(ovvsResourcesGpuAvailable(res.r, &gpu), "scale NN-Descent GPU availability");
+   if (!gpu) skip_test("GPU device unavailable");
+ 
+-  const int64_t n = 16384, dim = 16;
++  const int64_t n = 16385, dim = 16;
+   const int32_t degree = 16, iterations = 4;
+   auto data = make_data(n, dim, 306);
+   ovvsResourcesSetPolicy(res.r, OVVS_POLICY_FORCE_GPU);
+@@ -3166,7 +3166,7 @@ OVVS_TEST(cagra_sycl_walk_n_over_4096) {
+              build_stats.nndescent_gpu_d2h_bytes > 0 &&
+              build_stats.nndescent_gpu_kernel_launches == 3 + 8 * gpu_iterations &&
+              build_stats.nndescent_gpu_submission_calls == 7 + 21 * gpu_iterations &&
+-             build_stats.nndescent_gpu_wait_calls == 20 + 16 * gpu_iterations,
++             build_stats.nndescent_gpu_wait_calls == 20 + 13 * gpu_iterations,
+          "fixed large CAGRA fixture publishes exact explicit GPU work counters");
+   expect(build_stats.total_wall_ns >= cagra_named_stage_ns(build_stats),
+          "large CAGRA named stage sum must not exceed total build wall");
