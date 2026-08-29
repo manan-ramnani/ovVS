@@ -2396,7 +2396,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 
            if (lid == 0) {
              const int32_t count = state[0];
-             for (int32_t a = 0; a < count; ++a) {
+             const int32_t selected_count = std::min(count, static_cast<int32_t>(KK));
+             for (int32_t a = 0; a < selected_count; ++a) {
                int32_t best = a;
                for (int32_t b = a + 1; b < count; ++b) {
                  if (candidate_distances[static_cast<size_t>(b)] <
