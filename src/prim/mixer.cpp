@@ -1,6 +1,8 @@
 #include "internal.hpp"
 
+#include <atomic>
 #include <cstring>
+#include <thread>
 
 namespace ovvs {
 namespace impl {
@@ -536,7 +538,12 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     }
     return OVVS_STATUS_SUCCESS;
   };
-  for (int64_t q = 0; q < nq; ++q) {
+  /* Each query's walk is fully independent -- every scratch buffer below is per-iteration
+     and the output rows are disjoint -- so queries fan out across worker threads with
+     bit-identical results at any thread count.
+     TEMPORARY default: all hardware threads; OVVS_CPU_WALK_THREADS overrides (1 = the old
+     serial behaviour) until a thread-count parameter earns a place in the ABI. */
+  auto walk_one = [&](int64_t q) -> ovvsStatus {
     const float* query = queries + q * dim;
     std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
     std::vector<char> expanded(static_cast<size_t>(n), 0);
@@ -565,7 +572,7 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
         neighbors[q * k + t] = -1;
         distances[q * k + t] = kInf;
       }
-      continue;
+      return OVVS_STATUS_SUCCESS; /* this query is done (was `continue` in the loop) */
     }
     int iters = 0;
     const int max_iters = std::max(24, itopk * 6);
@@ -630,8 +637,49 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
         distances[q * k + t] = kInf;
       }
     }
+    return OVVS_STATUS_SUCCESS;
+  };
+
+  const int walk_threads = [&]() -> int {
+    const char* env = std::getenv("OVVS_CPU_WALK_THREADS");
+    long parsed = 0;
+    if (env && *env) parsed = std::strtol(env, nullptr, 10);
+    if (parsed <= 0) parsed = static_cast<long>(std::thread::hardware_concurrency());
+    if (parsed < 1) parsed = 1;
+    return static_cast<int>(std::min<long>(parsed, 256));
+  }();
+  if (walk_threads <= 1 || nq <= 1) {
+    for (int64_t q = 0; q < nq; ++q) {
+      const ovvsStatus s = walk_one(q);
+      if (s != OVVS_STATUS_SUCCESS) return s;
+    }
+    return OVVS_STATUS_SUCCESS;
   }
-  return OVVS_STATUS_SUCCESS;
+  /* Work-stealing over queries: per-query cost varies, so workers claim the next index
+     from an atomic counter rather than taking fixed chunks. First failure wins; workers
+     drain out on it. */
+  std::atomic<ovvsStatus> walk_status{OVVS_STATUS_SUCCESS};
+  std::atomic<int64_t> next_query{0};
+  const int worker_count = static_cast<int>(std::min<int64_t>(walk_threads, nq));
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<size_t>(worker_count));
+  for (int t = 0; t < worker_count; ++t) {
+    workers.emplace_back([&]() {
+      for (;;) {
+        const int64_t q = next_query.fetch_add(1, std::memory_order_relaxed);
+        if (q >= nq) return;
+        if (walk_status.load(std::memory_order_relaxed) != OVVS_STATUS_SUCCESS) return;
+        const ovvsStatus s = walk_one(q);
+        if (s != OVVS_STATUS_SUCCESS) {
+          ovvsStatus expected = OVVS_STATUS_SUCCESS;
+          walk_status.compare_exchange_strong(expected, s);
+          return;
+        }
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  return walk_status.load();
 }
 
 ovvsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,

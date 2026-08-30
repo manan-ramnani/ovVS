@@ -1121,3 +1121,30 @@ Append newest last. One line per real event: what landed, what number it produce
   eval — build is our strong side, 22% faster at 1M with GPU idle headroom), or (d) the
   B20 float-corpus + SQ8 lane, which changes the byte economics 4× and is required for
   the product claim anyway. (c) and (d) are the two with headroom left.**
+- **2026-08-31** — **THE HYBRID UNLOCK. User reframed the premise ("CPU + GPU combined
+  should beat raw hnswlib") and exposed the campaign's blind spot: the entire G1 fight had
+  been iGPU-alone vs 20 cores — parity-class silicon fighting one-handed. ovVS's CPU walk
+  had NEVER been benchmarked; it was a serial single-thread loop (`mixer.cpp
+  prim_graph_walk`, `for q < nq`) doing 6.4K QPS @ 0.9962 on ONE core — already ~1.4×
+  hnswlib per-core at matched recall, courtesy of the d32 graph's evals-per-recall edge.**
+  1. **Threaded the CPU walk** (work-stealing atomic query claim, per-query scratch was
+     already loop-local, outputs disjoint → bit-identical at any thread count; TEMPORARY
+     env `OVVS_CPU_WALK_THREADS`, default = all hardware threads, 1 = old serial). Serial
+     re-measured identical (6.2K); **threaded: 38.5K QPS @ 0.9962** (6.2× on 20 cores,
+     bandwidth-capped like hnswlib). 9/9 CTest.
+  2. **⚡ Batch-1 flipped: 0.175 ms p50 (5.5K QPS) on CPU vs 1.9 ms on GPU — now FASTER
+     than hnswlib's own single query at higher recall.** The product story becomes
+     routing: small nq → CPU (or GPU when the CPU is busy with the LLM); large → both.
+  3. **Concurrent two-process probe (both engines, same corpus, same config, overlapping
+     measure windows, contended p50s confirm true overlap): GPU 32.7K + CPU 30.7K =
+     ~63.4K QPS @ 0.9962** (each side −20-29% from shared power/bandwidth) **vs hnswlib
+     45-53K @ 0.9957 → ~1.2-1.4× AHEAD. First G1-passing number of the campaign** — under
+     the hybrid reading of G1, which is the product premise (use the whole SoC; hnswlib
+     unweakened at its full 20 threads).
+  ⚠ Provisional until: (a) a single-process router (`OVVS_POLICY_HYBRID`: split nq across
+  a GPU submit thread + CPU workers, ~60-80 lines in the search dispatch) replaces the
+  two-process estimate; (b) an ab_g1-style shared-window score with a hybrid lane;
+  (c) the thread default gets an ABI story instead of an env knob. Also noted: the CPU
+  walk reads fp32 rows — pointing it at the int8 mirror (AVX2) would cut its bandwidth
+  4× and should lift the contended sum further. **NEXT: implement OVVS_POLICY_HYBRID and
+  score it properly.**
