@@ -530,6 +530,25 @@ void pq_encode_rows(const float* x, int64_t n, int64_t dim, int32_t pq_m, int32_
   }
 }
 
+/* Re-encodes every row into PQ codes from whichever primary storage is live. fp32 goes
+   through pq_encode_rows directly; fp16 converts one row at a time into a scratch --
+   memory stays O(dim), which matters at R3 scale where a transient fp32 copy of the
+   dataset would be 5 GB. */
+static void cagra_pq_encode_all(CagraIndex* ix) {
+  ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+  if (!ix->ds.x.empty()) {
+    pq_encode_rows(ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->pq_m, ix->pq_ks, ix->dsub,
+                   ix->codebooks.data(), ix->codes.data());
+    return;
+  }
+  std::vector<float> rowbuf(static_cast<size_t>(ix->ds.dim));
+  for (int64_t i = 0; i < ix->ds.n; ++i) {
+    cagra_row_f32(*ix, i, rowbuf.data());
+    pq_encode_rows(rowbuf.data(), 1, ix->ds.dim, ix->pq_m, ix->pq_ks, ix->dsub,
+                   ix->codebooks.data(), ix->codes.data() + i * ix->pq_m);
+  }
+}
+
 float pq_adc(const float* query, int64_t dim, const uint8_t* code, int32_t pq_m, int32_t ks, int32_t dsub,
              const float* codebooks) {
   float s = 0.f;
@@ -1986,8 +2005,7 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
       }
     }
     if (ix->pq_m > 0 && !ix->codes.empty()) {
-      pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub,
-                     ix->codebooks.data(), ix->codes.data());
+      cagra_pq_encode_all(ix);
     }
     resources->last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
@@ -2179,9 +2197,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
       ix->generation.resize(static_cast<size_t>(ix->ds.n), 0u);
     }
     if (ix->pq_m > 0) {
-      ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
-      pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub,
-                     ix->codebooks.data(), ix->codes.data());
+      cagra_pq_encode_all(ix);
     }
     resources->last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
@@ -2200,7 +2216,7 @@ ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const fl
 ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_t pq_m, int32_t pq_nbits) {
   if (!res || !index || pq_m <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
-  if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!cagra_dataset_present(*ix)) return OVVS_STATUS_INVALID_ARGUMENT;
   if (ix->ds.dim % pq_m != 0) return OVVS_STATUS_SHAPE_MISMATCH;
   auto* resources = rd(res);
   if (resources->policy == OVVS_POLICY_FORCE_NPU) {
@@ -2229,10 +2245,18 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
                            static_cast<size_t>(staged.dsub));
     for (int32_t m = 0; m < staged.pq_m; ++m) {
       for (int64_t i = 0; i < staged.ds.n; ++i) {
-        std::memcpy(sub.data() + i * staged.dsub,
-                    staged.ds.x.data() + i * staged.ds.dim +
-                        static_cast<int64_t>(m) * staged.dsub,
-                    static_cast<size_t>(staged.dsub) * sizeof(float));
+        if (!staged.ds.x.empty()) {
+          std::memcpy(sub.data() + i * staged.dsub,
+                      staged.ds.x.data() + i * staged.ds.dim +
+                          static_cast<int64_t>(m) * staged.dsub,
+                      static_cast<size_t>(staged.dsub) * sizeof(float));
+        } else {
+          /* fp16: convert just the m-th sub-vector slice, no full-row scratch. */
+          const uint16_t* src =
+              staged.ds.x16.data() + i * staged.ds.dim + static_cast<int64_t>(m) * staged.dsub;
+          float* dst = sub.data() + i * staged.dsub;
+          for (int32_t j = 0; j < staged.dsub; ++j) dst[j] = f16_bits_to_f32(src[j]);
+        }
       }
       std::vector<float> cents;
       const ovvsStatus status =
@@ -2243,11 +2267,7 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
                       static_cast<size_t>(m) * staged.pq_ks * staged.dsub,
                   cents.data(), cents.size() * sizeof(float));
     }
-    staged.codes.resize(static_cast<size_t>(staged.ds.n) *
-                        static_cast<size_t>(staged.pq_m));
-    pq_encode_rows(staged.ds.x.data(), staged.ds.n, staged.ds.dim, staged.pq_m,
-                   staged.pq_ks, staged.dsub, staged.codebooks.data(),
-                   staged.codes.data());
+    cagra_pq_encode_all(&staged);
     *ix = std::move(staged);
     resources->last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
@@ -2263,6 +2283,9 @@ ovvsStatus ovvsCagraDetachDataset(ovvsCagraIndex_t index) {
   auto* ix = reinterpret_cast<CagraIndex*>(index);
   ix->ds.x.clear();
   ix->ds.x.shrink_to_fit();
+  UsmU16Vec().swap(ix->ds.x16);
+  UsmU8Vec().swap(ix->mirror8);
+  ix->mirror8_ok = false;
   ix->has_dataset = false;
   return OVVS_STATUS_SUCCESS;
 }
