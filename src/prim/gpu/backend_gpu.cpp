@@ -2784,6 +2784,14 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
      are provably dead and DS stays null. */
   if (!dataset && !dataset_u8 && !dataset_f16) return false;
   if (!graph || !queries || !neighbors || !distances) return false;
+  /* fp32-storage walks may install or rebuild the Resources-cached int8 mirror, and a
+     rebuild frees the buffer a concurrent walk could still be reading -- serialize
+     them. fp16 walks have no cached GPU state (DS16/mirror8 are caller-owned, staging
+     is per-call scoped) and may overlap freely. */
+  std::unique_lock<std::mutex> mirror_walk_lock;
+  if (dataset != nullptr) {
+    mirror_walk_lock = std::unique_lock<std::mutex>(r.gpu_walk_mutex);
+  }
   if (n <= 0 || nq <= 0 || k <= 0 || dim <= 0 || degree <= 0) return false;
   if (n > std::numeric_limits<int32_t>::max() || k > std::numeric_limits<int32_t>::max()) return false;
   if (metric != OVVS_METRIC_L2_EXPANDED && metric != OVVS_METRIC_L2_SQRT_EXPANDED &&

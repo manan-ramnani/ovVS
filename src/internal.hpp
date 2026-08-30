@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <shared_mutex>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -459,7 +460,10 @@ struct ResourcesData {
   ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
   bool gpu_available = false;
-  ovvsDevice last_device = OVVS_DEVICE_CPU;
+  /* Telemetry that concurrent searches may race on; atomics keep the races defined.
+     last_device answers "what ran most recently", which is inherently fuzzy under
+     concurrency -- callers wanting per-call attribution must serialize themselves. */
+  std::atomic<ovvsDevice> last_device{OVVS_DEVICE_CPU};
   ovvsDType last_compute_dtype = OVVS_DTYPE_F32;
   std::string sku = "generic-cpu";
   std::string npu_name;
@@ -467,7 +471,7 @@ struct ResourcesData {
   std::string cache_dir;
   int32_t npu_compile_fails = 0;
   int32_t npu_runtime_fails = 0;
-  int32_t npu_fallbacks = 0;
+  std::atomic<int32_t> npu_fallbacks{0};
   std::mutex cagra_transfer_mutex;
   int64_t cagra_walk_calls = 0;
   int64_t cagra_direct_index_calls = 0;
@@ -542,6 +546,11 @@ struct ResourcesData {
      source pointer plus a sampled fingerprint so a freed-and-reallocated dataset landing
      on the same address cannot be mistaken for a cache hit. */
   std::mutex gpu_int8_mutex;
+  /* Serializes GPU walks that can touch the Resources-cached fp32 int8 mirror: a
+     rebuild (first touch, or after a mutation-time invalidate) frees the old device
+     buffer, and another in-flight walk may still be reading it. fp16-storage walks
+     have no cached GPU state and run without this lock. */
+  std::mutex gpu_walk_mutex;
   const void* gpu_int8_source = nullptr;
   size_t gpu_int8_rows = 0;
   size_t gpu_int8_dim = 0;
@@ -730,11 +739,15 @@ OVVS_API ovvsStatus prim_cagra_optimize_ranked(ResourcesData& r,
 OVVS_API ovvsStatus cagra_optimize_ranked(const int32_t* initial, int64_t n,
                                           int32_t initial_degree, int32_t final_degree,
                                           std::vector<int32_t>& output);
+/* policy_override (-1 = use r.policy): mutation-time repair searches pass their
+   engine choice explicitly so they never mutate r.policy, which concurrent readers
+   are consulting. */
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances,
-                           const uint16_t* dataset_f16 = nullptr, const uint8_t* dataset_u8 = nullptr);
+                           const uint16_t* dataset_f16 = nullptr, const uint8_t* dataset_u8 = nullptr,
+                           int32_t policy_override = -1);
 
 /* Temporary sweep instrument: OVVS_CAGRA_SEEDS pins the seed count so the recall-vs-QPS
    curve can be measured in one process instead of one rebuild per point. Read once.

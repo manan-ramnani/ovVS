@@ -498,10 +498,13 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances,
-                           const uint16_t* dataset_f16, const uint8_t* dataset_u8) {
+                           const uint16_t* dataset_f16, const uint8_t* dataset_u8,
+                           int32_t policy_override) {
+  const ovvsPolicy pol =
+      policy_override >= 0 ? static_cast<ovvsPolicy>(policy_override) : r.policy;
   /* The graph walk has no NPU implementation. A forced device must either run
      the complete walk or fail; it must never cross into the scalar host path. */
-  if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  if (pol == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
   if (!dataset && !dataset_f16) return OVVS_STATUS_INVALID_ARGUMENT;
 
   const bool metric_walkable = metric == OVVS_METRIC_L2_EXPANDED ||
@@ -512,10 +515,10 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
      per query when present), so any real storage form is offerable. */
   const bool gpu_dataset_ok = dataset != nullptr || dataset_f16 != nullptr;
   const bool gpu_metric_supported = metric_walkable && gpu_dataset_ok;
-  const bool gpu_policy = r.policy == OVVS_POLICY_AUTO ||
-                          r.policy == OVVS_POLICY_GPU_IF_FASTER ||
-                          r.policy == OVVS_POLICY_HETERO ||
-                          r.policy == OVVS_POLICY_FORCE_GPU;
+  const bool gpu_policy = pol == OVVS_POLICY_AUTO ||
+                          pol == OVVS_POLICY_GPU_IF_FASTER ||
+                          pol == OVVS_POLICY_HETERO ||
+                          pol == OVVS_POLICY_FORCE_GPU;
   /* Hybrid split: run the iGPU and the CPU workers on disjoint query ranges of the same
      batch, one wall clock. Per-query CPU/GPU parity is a tested invariant, so the merged
      output is bit-identical to either engine alone at any split. A forced device stays
@@ -544,7 +547,7 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
      The 320K boundary is interpolated between the 100K and 1M anchors, not probed;
      re-measure it during R2 validation. OVVS_HYBRID_MIN_NQ overrides the crossover;
      OVVS_HYBRID_WALK forces a CPU+GPU split at any corpus size (sweep knob). */
-  const bool hetero = r.policy == OVVS_POLICY_HETERO;
+  const bool hetero = pol == OVVS_POLICY_HETERO;
   const bool hetero_large = hetero && n >= 320000;
   const int64_t hetero_min_nq = [&]() -> int64_t {
     const char* env = std::getenv("OVVS_HYBRID_MIN_NQ");
@@ -557,8 +560,8 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
   const bool hetero_cpu_only = hetero && nq < hetero_min_nq;
   const bool hybrid_ok = !hetero_cpu_only && hybrid_frac > 0.0 && gpu_metric_supported &&
                          nq >= 2 &&
-                         (r.policy == OVVS_POLICY_AUTO || r.policy == OVVS_POLICY_GPU_IF_FASTER ||
-                          r.policy == OVVS_POLICY_HETERO);
+                         (pol == OVVS_POLICY_AUTO || pol == OVVS_POLICY_GPU_IF_FASTER ||
+                          pol == OVVS_POLICY_HETERO);
   int64_t cpu_begin = 0;
   bool hybrid_active = false;
   bool gpu_leg_ok = false;
@@ -571,7 +574,7 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
       return OVVS_STATUS_SUCCESS;
     }
   }
-  if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+  if (pol == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
   if (hybrid_ok) {
     cpu_begin = static_cast<int64_t>(hybrid_frac * static_cast<double>(nq) + 0.5);
     cpu_begin = std::max<int64_t>(1, std::min<int64_t>(cpu_begin, nq - 1));

@@ -119,6 +119,18 @@ struct NnGraph {
   std::vector<int32_t> ids;
 };
 
+/* Concurrency contract (v1): any number of concurrent searches; one mutation at a
+   time (enforced by `writer`); searches may run DURING a mutation. Mutations hold `rw`
+   exclusive only for their write phases (row writes, grows, edge rewrites + back-link
+   prunes) and release it across the long repair search, which is a pure read -- so a
+   reader's stall is bounded by a write phase (ms-scale), not by the mutation. Readers
+   hold `rw` shared for the whole public call, which also pins vector/graph pointers
+   across grows. Index destruction is the caller's lifetime problem, as ever. */
+struct CagraSync {
+  std::shared_mutex rw;
+  std::mutex writer;
+};
+
 struct CagraIndex {
   Dataset ds;
   int32_t degree = 0;
@@ -130,6 +142,7 @@ struct CagraIndex {
      first time a mutation stores a vector that is not integer-valued in [0,255]. */
   UsmU8Vec mirror8;
   bool mirror8_ok = false;
+  std::shared_ptr<CagraSync> sync = std::make_shared<CagraSync>();
   int32_t pq_m = 0;
   int32_t pq_ks = 0;
   int32_t dsub = 0;
@@ -506,9 +519,10 @@ ovvsStatus graph_search(ResourcesData& r, const float* dataset, int64_t n, int64
                         const float* queries, int64_t nq, int64_t k, int32_t itopk,
                         int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                         float* distances, const uint16_t* dataset_f16 = nullptr,
-                        const uint8_t* dataset_u8 = nullptr) {
+                        const uint8_t* dataset_u8 = nullptr, int32_t policy_override = -1) {
   return prim_graph_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk,
-                         search_width, bitset, neighbors, distances, dataset_f16, dataset_u8);
+                         search_width, bitset, neighbors, distances, dataset_f16, dataset_u8,
+                         policy_override);
 }
 
 void pq_encode_rows(const float* x, int64_t n, int64_t dim, int32_t pq_m, int32_t ks, int32_t dsub,
@@ -1400,6 +1414,7 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
   if (nq > std::numeric_limits<int64_t>::max() / k) return OVVS_STATUS_SHAPE_MISMATCH;
   try {
     auto* ix = reinterpret_cast<CagraIndex*>(index);
+    std::shared_lock<std::shared_mutex> read_lock(ix->sync->rw);
     if (ix->pq_m > 0 && !ix->codes.empty()) {
     auto* resources = rd(res);
     if (resources->policy == OVVS_POLICY_FORCE_GPU || resources->policy == OVVS_POLICY_FORCE_NPU) {
@@ -1506,6 +1521,7 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
 ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_t include_dataset) {
   if (!index || !path) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::shared_lock<std::shared_mutex> read_lock(ix->sync->rw);
   std::ofstream f(path, std::ios::binary);
   if (!f) return OVVS_STATUS_IO;
   f.write(reinterpret_cast<const char*>(&kCagraMagic), 4);
@@ -1662,6 +1678,7 @@ ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const in
   if (!res || !index || !ids || nids < 0) return OVVS_STATUS_INVALID_ARGUMENT;
   if (nids == 0) return OVVS_STATUS_SUCCESS;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
   std::vector<int64_t> slots(static_cast<size_t>(nids));
   for (int64_t i = 0; i < nids; ++i) {
     if (!cagra_resolve_id(*ix, ids[i], &slots[static_cast<size_t>(i)])) {
@@ -1669,6 +1686,7 @@ ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const in
     }
   }
   try {
+    std::unique_lock<std::shared_mutex> ex(ix->sync->rw);
     if (ix->deleted.empty()) {
       ix->deleted.assign(static_cast<size_t>((ix->ds.n + 7) / 8), 0u);
     }
@@ -1693,6 +1711,7 @@ ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const in
 ovvsStatus ovvsCagraCounts(ovvsCagraIndex_t index, int64_t* live, int64_t* deleted) {
   if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::shared_lock<std::shared_mutex> read_lock(ix->sync->rw);
   if (live) *live = ix->ds.n - ix->deleted_count;
   if (deleted) *deleted = ix->deleted_count;
   return OVVS_STATUS_SUCCESS;
@@ -1835,20 +1854,39 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
   const CagraStorage st = cagra_storage(*ix);
   int32_t relink_itopk = 0, relink_width = 0;
   cagra_relink_effort(degree, &relink_itopk, &relink_width);
-  const ovvsPolicy caller_policy = r.policy;
   ovvsPolicy relink_policy = OVVS_POLICY_FORCE_CPU;
-  if (cagra_is_f16(*ix) && caller_policy != OVVS_POLICY_FORCE_CPU) {
+  if (cagra_is_f16(*ix) && r.policy != OVVS_POLICY_FORCE_CPU) {
     const char* env = std::getenv("OVVS_CAGRA_MUTATE_GPU");
     if (!env || *env != '0') relink_policy = OVVS_POLICY_HETERO;
   }
-  r.policy = relink_policy;
-  const ovvsStatus status =
-      graph_search(r, st.f32, ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
-                   qbuf.data(), count, degree, relink_itopk, relink_width, nullptr, nb.data(),
-                   nd.data(), st.f16, st.u8);
-  r.policy = caller_policy;
-  if (status != OVVS_STATUS_SUCCESS) return status;
+  /* The repair search is a pure read and runs WITHOUT the rw lock: concurrent readers
+     coexist with it (they see the new vectors with the old edges -- the documented
+     chunk-entry semantics). The engine choice travels as an override so r.policy,
+     which those readers are consulting, is never touched. It is also SUB-BATCHED:
+     a whole 4096-query chunk owned the engine in one burst -- on the iGPU that is
+     hundreds of ms, and concurrent reader batches queued behind it (p95 560ms
+     measured). ~512 queries keeps every CPU worker busy and bounds a GPU burst near
+     ~25ms at 1M, so readers slot between bursts. */
+  constexpr int64_t kSearchSub = 512;
+  for (int64_t lo = 0; lo < count; lo += kSearchSub) {
+    const int64_t sub = std::min<int64_t>(kSearchSub, count - lo);
+    const ovvsStatus status = graph_search(
+        r, st.f32, ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree, qbuf.data() + lo * dim,
+        sub, degree, relink_itopk, relink_width, nullptr, nb.data() + lo * degree,
+        nd.data() + lo * degree, st.f16, st.u8, static_cast<int32_t>(relink_policy));
+    if (status != OVVS_STATUS_SUCCESS) return status;
+  }
 
+  /* Edge publication runs WITHOUT the rw lock, deliberately. Every store is an
+     aligned int32 into a row this mutation owns (mutated rows here; disjoint
+     back-link target rows in the prunes below), so no individual edge can tear on
+     this hardware, and a reader that overlaps a half-rewritten row sees a mixture of
+     old and new VALID ids (or -1) -- edges are hints, and the walk already treats
+     them as advisory. Holding rw exclusive here was measured to CONVOY readers
+     instead of protecting them: the writer re-acquired within microseconds of each
+     release and reader tails hit 475-581ms. */
+  std::vector<std::pair<int32_t, int32_t>> links;
+  std::vector<std::pair<size_t, size_t>> groups;
   for (int64_t i = 0; i < count; ++i) {
     const int64_t row = slots[i];
     for (int32_t t = 0; t < degree; ++t) {
@@ -1859,7 +1897,6 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
   }
 
   /* (target row, new in-neighbour) pairs, grouped by target row. */
-  std::vector<std::pair<int32_t, int32_t>> links;
   links.reserve(static_cast<size_t>(count) * static_cast<size_t>(degree));
   for (int64_t i = 0; i < count; ++i) {
     for (int32_t t = 0; t < degree; ++t) {
@@ -1868,7 +1905,6 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
     }
   }
   std::sort(links.begin(), links.end());
-  std::vector<std::pair<size_t, size_t>> groups;
   for (size_t b = 0; b < links.size();) {
     size_t e = b + 1;
     while (e < links.size() && links[e].first == links[b].first) ++e;
@@ -1944,6 +1980,7 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
     return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
   if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
   std::vector<int64_t> slots(static_cast<size_t>(nids));
   for (int64_t i = 0; i < nids; ++i) {
     if (!cagra_resolve_id(*ix, ids[i], &slots[static_cast<size_t>(i)])) {
@@ -1953,6 +1990,7 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
   const int64_t dim = ix->ds.dim;
   try {
     if (cagra_serial_mutate() && !cagra_is_f16(*ix)) {
+      std::unique_lock<std::shared_mutex> serial_ex(ix->sync->rw);
       for (int64_t i = 0; i < nids; ++i) {
         const int64_t row = slots[static_cast<size_t>(i)];
         /* Keep the old vector so a failed relink can be undone; the graph rows the relink rewrites
@@ -1981,20 +2019,25 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
       for (int64_t base = 0; base < nids; base += chunk) {
         const int64_t cnt = std::min<int64_t>(chunk, nids - base);
         std::vector<float> previous(static_cast<size_t>(cnt) * static_cast<size_t>(dim));
-        for (int64_t i = 0; i < cnt; ++i) {
-          const int64_t row = slots[static_cast<size_t>(base + i)];
-          cagra_row_f32(*ix, row, previous.data() + i * dim);
-          cagra_write_row(ix, row, vectors + (base + i) * dim);
+        {
+          std::unique_lock<std::shared_mutex> chunk_ex(ix->sync->rw);
+          for (int64_t i = 0; i < cnt; ++i) {
+            const int64_t row = slots[static_cast<size_t>(base + i)];
+            cagra_row_f32(*ix, row, previous.data() + i * dim);
+            cagra_write_row(ix, row, vectors + (base + i) * dim);
+          }
         }
         const ovvsStatus status =
             cagra_relink_batch(ix, *resources, slots.data() + base, cnt, nullptr);
         if (status != OVVS_STATUS_SUCCESS) {
+          std::unique_lock<std::shared_mutex> undo_ex(ix->sync->rw);
           for (int64_t i = 0; i < cnt; ++i) {
             const int64_t row = slots[static_cast<size_t>(base + i)];
             cagra_write_row(ix, row, previous.data() + i * dim);
           }
           return status;
         }
+        std::unique_lock<std::shared_mutex> revive_ex(ix->sync->rw);
         for (int64_t i = 0; i < cnt; ++i) {
           const int64_t row = slots[static_cast<size_t>(base + i)];
           if (cagra_row_deleted(*ix, row)) {
@@ -2006,6 +2049,7 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
       }
     }
     if (ix->pq_m > 0 && !ix->codes.empty()) {
+      std::unique_lock<std::shared_mutex> pq_ex(ix->sync->rw);
       cagra_pq_encode_all(ix);
     }
     resources->last_device = OVVS_DEVICE_CPU;
@@ -2045,6 +2089,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
     return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
   if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
   const int64_t dim = ix->ds.dim;
   if (nextra > std::numeric_limits<int32_t>::max() - ix->ds.n ||
       dim > std::numeric_limits<int64_t>::max() / nextra) {
@@ -2069,20 +2114,25 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
       if (buffer.capacity() >= needed) return;
       buffer.reserve(std::max(needed, buffer.capacity() + buffer.capacity() / 2));
     };
-    if (!ix->ds.x16.empty()) {
-      grow(ix->ds.x16, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
-      if (ix->mirror8_ok) {
-        grow(ix->mirror8, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+    {
+      /* Reserves can move the buffers; no reader may be in flight while they do. */
+      std::unique_lock<std::shared_mutex> grow_ex(ix->sync->rw);
+      if (!ix->ds.x16.empty()) {
+        grow(ix->ds.x16, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+        if (ix->mirror8_ok) {
+          grow(ix->mirror8, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+        }
+      } else {
+        grow(ix->ds.x, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
       }
-    } else {
-      grow(ix->ds.x, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+      grow(ix->graph, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(ix->degree));
     }
-    grow(ix->graph, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(ix->degree));
     std::vector<CagraGraphRowBackup> journal;
     bool failed = false;
     ovvsStatus failure = OVVS_STATUS_SUCCESS;
 
     if (cagra_serial_mutate() && !cagra_is_f16(*ix)) {
+      std::unique_lock<std::shared_mutex> serial_ex(ix->sync->rw);
       for (int64_t i = 0; i < nextra && !failed; ++i) {
         /* Reuse is only offered when the caller can be told which rows it got. Without out_ids a
            reused row would be invisible to them, so plain Extend keeps appending. */
@@ -2128,6 +2178,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
         const int64_t cnt = std::min<int64_t>(chunk, nextra - base);
         std::vector<int64_t> slots(static_cast<size_t>(cnt));
         std::vector<std::pair<int64_t, std::vector<float>>> reused_prev;
+        std::unique_lock<std::shared_mutex> chunk_ex(ix->sync->rw);
         for (int64_t i = 0; i < cnt; ++i) {
           const float* vec = extra + (base + i) * dim;
           int64_t reused = -1;
@@ -2151,10 +2202,12 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
           }
         }
         ix->graph.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree), -1);
+        chunk_ex.unlock();
         const ovvsStatus status = cagra_relink_batch(ix, *resources, slots.data(), cnt, &journal);
         if (status != OVVS_STATUS_SUCCESS) {
           /* Give back this chunk's reused slots; appended rows are truncated below with
              the rest of the call, and the journal restore covers rewritten rows. */
+          std::unique_lock<std::shared_mutex> undo_ex(ix->sync->rw);
           for (const auto& rp : reused_prev) {
             cagra_write_row(ix, rp.first, rp.second.data());
             ix->deleted[static_cast<size_t>(rp.first) >> 3] |=
@@ -2168,6 +2221,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
       }
     }
 
+    std::unique_lock<std::shared_mutex> tail_ex(ix->sync->rw);
     if (failed) {
       /* Unwound newest first, so a row rewritten by several inserts lands back on its oldest
          snapshot -- the state it had before this call started. */
@@ -2234,6 +2288,7 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
               static_cast<uint64_t>(pq_m)) {
     return OVVS_STATUS_SHAPE_MISMATCH;
   }
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
   try {
     CagraIndex staged = *ix;
     staged.pq_m = pq_m;
@@ -2269,7 +2324,10 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
                   cents.data(), cents.size() * sizeof(float));
     }
     cagra_pq_encode_all(&staged);
-    *ix = std::move(staged);
+    {
+      std::unique_lock<std::shared_mutex> publish_ex(ix->sync->rw);
+      *ix = std::move(staged);
+    }
     resources->last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
@@ -2303,6 +2361,7 @@ ovvsStatus ovvsCagraCalibrate(ovvsResources_t res, ovvsCagraIndex_t index, float
   const int64_t live = n - ix->deleted_count;
   if (live <= k + 1) return OVVS_STATUS_INVALID_ARGUMENT;
   try {
+    std::shared_lock<std::shared_mutex> cal_lock(ix->sync->rw);
     const int64_t want = std::min<int64_t>(256, live);
     std::vector<int64_t> sample;
     sample.reserve(static_cast<size_t>(want));
@@ -2419,6 +2478,7 @@ ovvsStatus ovvsCagraCalibrate(ovvsResources_t res, ovvsCagraIndex_t index, float
     };
     resources->pool(static_cast<int>(hw > 0 ? hw : 1)).run(0, nq, scan);
     if (threw.load()) return OVVS_STATUS_OOM;
+    cal_lock.unlock(); /* ladder Search calls take their own shared locks */
 
     struct Cfg {
       int32_t it;
@@ -2494,6 +2554,8 @@ ovvsStatus ovvsCagraCalibrate(ovvsResources_t res, ovvsCagraIndex_t index, float
 ovvsStatus ovvsCagraDetachDataset(ovvsCagraIndex_t index) {
   if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
+  std::unique_lock<std::shared_mutex> ex(ix->sync->rw);
   ix->ds.x.clear();
   ix->ds.x.shrink_to_fit();
   UsmU16Vec().swap(ix->ds.x16);
@@ -2506,6 +2568,8 @@ ovvsStatus ovvsCagraDetachDataset(ovvsCagraIndex_t index) {
 ovvsStatus ovvsCagraAttachDataset(ovvsCagraIndex_t index, const float* dataset, int64_t n, int64_t dim) {
   if (!index || !dataset || n <= 0 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
+  std::unique_lock<std::shared_mutex> ex(ix->sync->rw);
   if (n != ix->ds.n || dim != ix->ds.dim) return OVVS_STATUS_SHAPE_MISMATCH;
   ix->ds.x.assign(dataset, dataset + n * dim);
   ix->has_dataset = true;
@@ -2522,6 +2586,7 @@ ovvsStatus ovvsHnswFromCagra(ovvsResources_t res, ovvsCagraIndex_t cagra, ovvsHn
   *index = nullptr;
   if (!res || !cagra) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* cg = reinterpret_cast<CagraIndex*>(cagra);
+  std::shared_lock<std::shared_mutex> read_lock(cg->sync->rw);
   if (!cg->has_dataset || cg->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
   if (cg->ds.metric != OVVS_METRIC_L2_EXPANDED || cg->degree > 10000) {
     return OVVS_STATUS_UNSUPPORTED;
