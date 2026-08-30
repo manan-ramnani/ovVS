@@ -1447,4 +1447,53 @@ Append newest last. One line per real event: what landed, what number it produce
   default; the mode is now safe and complete enough to enable per-corpus today
   (lossless data: pure win; float data: −0.0006 recall for half the memory, CPU 1.5×
   faster below 320K, GPU 1.15× over hnswlib at 1M). Remaining fp16 items: PQ-on-fp16,
-  the ABI storage parameter, and (hardware-gated) XMX fp16 compute on SKUs that have it.
+  the ABI storage parameter, and (hardware-gated) XMX fp16 compute on SKUs that have it.- **2026-08-31** — **THE PERF/LATENCY BLOCK CLOSES: relink effort swept (1.5x faster
+  mutation, graph provably not worse), GPU-assisted mutation landed for f16 mode,
+  mixed-load p99 measured (writes do not stall reads; b32 tail 2.4x better than
+  hnswlib), spin-up floor root-caused, merged work queue closed with data.** (User:
+  "let's proceed with the steps.")
+  1. **Relink effort default is now itopk = degree, width = 1** (was 2*degree / 2 —
+     never swept). `relink_sweep.py` (round-robin interleaved, thermal-fair): 1.53x
+     update throughput at 100K. New paired judge `relink_quality.py`: two indexes,
+     IDENTICAL delete/update/insert streams (pubid-tracked through slot reuse),
+     different relink effort, alternating query rounds + live truth in one window.
+     Verdict: recall delta +0.0000 at 100K under 20% cumulative churn WITH deletes,
+     -0.0006 (inside the ±0.002 noise band) at 1M, and the churned low-effort graph
+     queries 1.02-1.06x FASTER. churn.py with the new default: update 16-18us/op (was
+     34-39). Sweep knobs OVVS_CAGRA_RELINK_ITOPK / _WIDTH. [78ed6ab]
+  2. **GPU-assisted mutation (f16 mode) [53b1e8f]**: the FORCE_CPU pin on the repair
+     search was an fp32-mirror artifact (fingerprinted Resources cache would need a
+     128MB rebuild per chunk). f16 mode has NO cached GPU state — x16, mirror8 and the
+     graph are shared USM read live, and mirror8 is updated in place by the very row
+     writes that precede the relink — so the repair search now routes HETERO: GPU takes
+     the 4096-query chunks at >=320K rows, singles stay CPU, caller FORCE_CPU is an
+     absolute veto, OVVS_CAGRA_MUTATE_GPU=0 disables, fp32 keeps the pin. Paired A/B at
+     1M f16: op on a hot GPU 1.22-1.24x over CPU relink; the FIRST op after the iGPU
+     parked pays the ramp and reads 0.87-0.90x — order-swap proved the penalty follows
+     POSITION, not op. Recall delta +0.0000 in both orders; churned-graph query
+     throughput identical. Sustained/mixed workloads run hot and get the 1.25x.
+  3. **Spin-up floor root-caused (timeboxed, no code change)**: b1 FORCE_GPU ladder at
+     100K f16 — back-to-back p50 **1.28ms** (the structural per-call floor: submit +
+     staging + sync), after 250ms idle 2.13ms, **after 1s idle 42ms p50** — driver RC6
+     deep park + re-clock is THE dominant GPU latency hazard and the true face of the
+     mutation cold-entry penalty. L0 immediate command lists: ZERO effect on or off —
+     the command-list-reuse hypothesis is dead. First-call JIT only +12ms. Under HETERO
+     singles never touch the GPU, so the park-wake taxes only the first BATCH after
+     >=1s idle; sustained traffic never parks it (verified in 4). Future option if a
+     workload ever shows park-wakes in its tail: an opt-in keep-alive knob.
+  4. **p99 under mixed read/write load (`tools/bench/mixed_load.py`, 1M f16,
+     interleaved single-thread — neither engine reads during writes) [09da115]**:
+     ovVS b32 mixed p99 **2.53ms vs read-only 2.81ms — mutation does NOT stall
+     reads**; post-write first-queries pay a bounded +0.7ms (hnswlib pays +0.35 of its
+     own); b1 mixed p99 0.76ms vs 0.85 read-only. Against the frozen comparator: b32
+     tail 2.4x better (p99 2.5 vs 6.0ms), b1 remains hnswlib's (0.28 vs 0.76). No
+     mirror-rebuild spikes, no park-wake spikes — the in-place mirror8 design bought
+     exactly the tail it was built for.
+  5. **Merged CPU+GPU work queue: CLOSED with data on BOTH lanes.** The routing law's
+     "splits lose at every fraction" was measured on the int8 lane (GPU 39.7K vs CPU
+     14.6K). Re-asked on DS16 at 1M where the GPU lead is smallest (mirror dropped,
+     GPU-whole 28.8K this window): frac 0.85 -> 0.88x, 0.75 -> 0.86x, 0.65 -> 0.82x,
+     0.50 -> 0.75x, CPU-only 0.52x. The additive ideal (~1.5x) never materializes —
+     package power/bandwidth sharing makes any CPU co-run cost the GPU more than it
+     adds. No regime on this silicon where a merged queue pays; revisit only on
+     hardware with separate GPU power/memory domains (dGPU).
