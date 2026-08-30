@@ -1740,9 +1740,15 @@ static void cagra_prune_rows(CagraIndex* ix, int64_t p, std::vector<int32_t>& ca
    both): searches inside one chunk see the graph as it stood at chunk entry, and a
    target named by several inserts is pruned once with all of them together.
 
-   The search is pinned to the CPU engine: the GPU backend keeps device mirrors of the
-   dataset and graph, and running it mid-mutation would need a cache-invalidation audit
-   that has not happened. Mutation stays a CPU-side affair, as documented. */
+   Engine choice for the search: in fp32 mode it is pinned to the CPU -- the GPU
+   backend caches a fingerprinted int8 mirror of the fp32 dataset, and every chunk's
+   in-place row rewrites would force a full-mirror rebuild (128MB rescan at 1M) to stay
+   correct. In fp16 mode there is NO cached GPU state at all: x16, mirror8 and the graph
+   are shared USM read live by the kernel, and mirror8 is updated in place by the very
+   row writes that precede this call -- so the adaptive router may hand chunks to the
+   GPU where it wins (>=320K-row corpora; chunks are 256-4096 queries, singles still
+   land on the CPU). A caller policy of FORCE_CPU is an absolute veto in both modes;
+   OVVS_CAGRA_MUTATE_GPU=0 disables the GPU assist for sweeps. */
 static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int64_t* slots,
                                      int64_t count, std::vector<CagraGraphRowBackup>* journal) {
   if (count <= 0) return OVVS_STATUS_SUCCESS;
@@ -1762,7 +1768,12 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
   int32_t relink_itopk = 0, relink_width = 0;
   cagra_relink_effort(degree, &relink_itopk, &relink_width);
   const ovvsPolicy caller_policy = r.policy;
-  r.policy = OVVS_POLICY_FORCE_CPU;
+  ovvsPolicy relink_policy = OVVS_POLICY_FORCE_CPU;
+  if (cagra_is_f16(*ix) && caller_policy != OVVS_POLICY_FORCE_CPU) {
+    const char* env = std::getenv("OVVS_CAGRA_MUTATE_GPU");
+    if (!env || *env != '0') relink_policy = OVVS_POLICY_HETERO;
+  }
+  r.policy = relink_policy;
   const ovvsStatus status =
       graph_search(r, st.f32, ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
                    qbuf.data(), count, degree, relink_itopk, relink_width, nullptr, nb.data(),
