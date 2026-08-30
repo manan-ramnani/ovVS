@@ -315,6 +315,13 @@ OVVS_API ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index,
    recall degrades gradually instead of the graph fragmenting, but they are never returned as
    results. Idempotent: deleting an already-deleted id succeeds. Ids are row offsets, as returned
    by a search. Phase 1 does not reclaim the storage -- see .claude/plans/2026-08-30-ovvs-cagra-mutation.md */
+/* Like ovvsCagraExtend, but reports the id assigned to each new vector in `out_ids` and may
+   therefore reuse rows freed by a previous delete, which is what keeps churn from growing the
+   footprint. Plain ovvsCagraExtend never reuses: without out_ids the caller could not learn that
+   a row had been recycled. A reused row's generation is bumped, so every id previously handed out
+   for it is rejected rather than silently resolving to the new occupant. */
+OVVS_API ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const float* extra,
+                                      int64_t nextra, int64_t* out_ids);
 OVVS_API ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const int64_t* ids,
                                     int64_t nids);
 /* Overwrite the vectors stored at `ids` and repair their graph neighbourhoods. Ids are unchanged,

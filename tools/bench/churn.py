@@ -72,6 +72,8 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=4)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--search-policy", choices=("gpu", "cpu"), default="gpu")
+    ap.add_argument("--reuse", action="store_true",
+                    help="insert via extend_ex, which recycles rows freed by delete")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -104,6 +106,9 @@ def main() -> int:
     # Mirror of what the store should contain, so truth can be recomputed independently of ovVS.
     vectors = base.copy()
     alive = np.ones(n0, dtype=bool)
+    # Public id per slot. Only diverges from the slot number once a row has been reused, since a
+    # reused row's generation is packed into the high half of the id.
+    pubid = np.arange(n0, dtype=np.int64)
 
     def query_round():
         t0 = time.perf_counter()
@@ -111,7 +116,9 @@ def main() -> int:
             queries, k=args.k, itopk_size=args.itopk, search_width=args.width
         )
         elapsed = time.perf_counter() - t0
-        got = np.asarray(ids, dtype=np.int64).reshape(args.queries, args.k)
+        raw = np.asarray(ids, dtype=np.int64).reshape(args.queries, args.k)
+        # Search returns public ids; the mirror is indexed by slot, so strip the generation.
+        got = np.where(raw >= 0, raw & 0xFFFFFFFF, -1)
         live_rows = np.flatnonzero(alive)
         truth = live_truth(vectors, live_rows, queries, args.k)
         returned = float((got >= 0).sum()) / (args.queries * args.k)
@@ -131,7 +138,7 @@ def main() -> int:
         if args.delete:
             victims = rng.choice(np.flatnonzero(alive), size=min(args.delete, int(alive.sum())),
                                  replace=False)
-            elapsed = mutate(index.delete, victims)
+            elapsed = mutate(index.delete, pubid[victims])
             timings["delete_ms"] = round(elapsed * 1000.0, 3)
             timings["delete_per_op_us"] = round(elapsed * 1e6 / max(1, len(victims)), 2)
             alive[victims] = False
@@ -142,7 +149,7 @@ def main() -> int:
             fresh = np.ascontiguousarray(
                 base[rng.integers(0, n0, size=len(targets))] + rng.normal(0, 4, (len(targets), dim)),
                 dtype=np.float32)
-            elapsed = mutate(index.update, targets, fresh)
+            elapsed = mutate(index.update, pubid[targets], fresh)
             timings["update_ms"] = round(elapsed * 1000.0, 3)
             timings["update_per_op_us"] = round(elapsed * 1e6 / max(1, len(targets)), 2)
             vectors[targets] = fresh
@@ -151,17 +158,37 @@ def main() -> int:
             extra = np.ascontiguousarray(
                 base[rng.integers(0, n0, size=args.insert)] + rng.normal(0, 4, (args.insert, dim)),
                 dtype=np.float32)
-            elapsed = mutate(index.extend, extra)
+            if args.reuse:
+                assigned = []
+
+                def do_insert():
+                    assigned.extend(index.extend_ex(extra))
+
+                elapsed = mutate(do_insert)
+                for j, new_id in enumerate(assigned):
+                    slot = int(new_id) & 0xFFFFFFFF
+                    if slot < vectors.shape[0]:
+                        vectors[slot] = extra[j]
+                        alive[slot] = True
+                        pubid[slot] = int(new_id)
+                    else:
+                        vectors = np.vstack([vectors, extra[j : j + 1]])
+                        alive = np.concatenate([alive, [True]])
+                        pubid = np.concatenate([pubid, [int(new_id)]])
+            else:
+                elapsed = mutate(index.extend, extra)
+                vectors = np.vstack([vectors, extra])
+                alive = np.concatenate([alive, np.ones(args.insert, dtype=bool)])
+                pubid = np.concatenate(
+                    [pubid, np.arange(vectors.shape[0] - args.insert, vectors.shape[0], dtype=np.int64)])
             timings["insert_ms"] = round(elapsed * 1000.0, 3)
             timings["insert_per_op_us"] = round(elapsed * 1e6 / max(1, args.insert), 2)
-            vectors = np.vstack([vectors, extra])
-            alive = np.concatenate([alive, np.ones(args.insert, dtype=bool)])
 
         recall, qps, returned = query_round()
         live, deleted = index.counts()
         row = {"round": r, "recall": round(recall, 4), "query_qps": round(qps, 1),
                "returned_frac": round(returned, 4), "live": live, "deleted": deleted,
-               "rows_total": int(alive.size), **timings}
+               "rows_total": int(alive.size), "slots": live + deleted, **timings}
         rows.append(row)
         print(json.dumps(row), flush=True)
 

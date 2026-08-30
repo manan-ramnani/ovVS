@@ -778,3 +778,55 @@ Append newest last. One line per real event: what landed, what number it produce
   is *detectably* stale; a freshly built index has all generations 0 and behaves identically.
   Also no graph repair on delete: tombstoned nodes keep their edges, and the quality curve is
   measured rather than prevented.
+- **2026-08-30 (realign tick 5)** — **Degree 32 confirmed faster AND more accurate than degree 16,
+  but the G1 re-score is PARKED as untrustworthy.**
+  Interleaved d16 `64/4` vs d32 `32/2` at b1024, 5 pairs: ratios 1.375 / 0.980 / 1.918 / 0.760 /
+  1.286, **median 1.286**; the least-throttled reading of each (33,652 vs 42,205) agrees at 1.25x.
+  d32 delivers that at **higher** recall (0.9962 vs 0.9946), so it dominates d16 outright rather
+  than trading along the frontier. Direction is solid; the magnitude is soft.
+  ⚠ **The follow-up G1 run against hnswlib is NOT a usable number and is not recorded as one.**
+  ovVS spanned **14,951-35,976 QPS (2.4x) across five rounds of one `ab_g1.py` invocation**, and
+  the per-round ratio ranged 1.65-2.99. Standalone d32 runs minutes earlier gave ~42,000, so the
+  whole box was degraded, not the configuration. Reporting the 2.479 median would have been
+  worse than reporting nothing. **PARKED under rule 3 pending a genuine cool-down.**
+  Note the GPU had been idle through the entire CRUD stretch and still had not recovered — the
+  CPU-heavy mutation work heats the same package. A real cool-down means idle, not "different work".
+  **Carry forward:** the last G1 number measured under conditions that passed the noise check
+  remains **1.34-1.37x behind at d16**. d32 should improve it; that is a prediction, not a result.
+  Also unmeasured and required before d32 becomes a default: **G3 at 1M** — the d32 graph is
+  128 MB against d16's 64 MB, putting resident at ~768 MB versus hnswlib's 803 MB. Inside the
+  gate, but with almost no headroom left.
+- **2026-08-30** — **MUTATION PHASE 2 LANDED: slot reuse with generations. The G3-under-churn hole
+  is closed.** New ABI `ovvsCagraExtendEx(..., int64_t* out_ids)`. All 9 CTest lanes pass and the
+  search path is unchanged where nothing has been reused (recall 0.9946 / 0.9992, evals/q
+  1276.1 / 2208.6 — identical).
+  - A public id is now `slot | (generation << 32)`. **Generation 0 packs to the bare slot**, so an
+    index that has never reused a row returns byte-identical ids and both new vectors stay empty:
+    the feature costs nothing until it is used.
+  - Reuse bumps the row's generation, so every id previously handed out for that row becomes
+    **detectably stale** and is rejected, instead of silently resolving to whoever now occupies it.
+    That was the whole reason phase 1 refused to reuse slots.
+  - **Reuse is offered only through `ExtendEx`.** Plain `ovvsCagraExtend` still appends, because
+    without `out_ids` the caller cannot learn that a row was recycled. The API shape enforces this
+    rather than documenting it.
+  - Generations are serialized alongside the tombstones under the v3 section, and the free list is
+    rebuilt from the tombstones on load rather than stored.
+
+  **Verified behaviour** (`tools/bench/churn.py --reuse`, plus a direct test):
+  plain `extend` leaves `deleted` untouched; `extend_ex` recycles rows and drops `deleted` 5 -> 2;
+  a stale bare id is **rejected**; the freshly packed id is accepted; search-returned ids round-trip
+  through delete.
+
+  **G3 under churn, 4,000 deletes + 4,000 inserts per round, footprint in slots:**
+
+  | round | append-only | with reuse |
+  |---|---:|---:|
+  | 1 | 104,000 | **100,000** |
+  | 2 | 108,000 | **100,000** |
+  | 3 | 112,000 | **100,000** |
+  | 4 | 116,000 | **100,000** |
+
+  Append-only grows linearly with churn forever; reuse is **flat**, with `deleted` returning to 0
+  every round and recall unchanged (0.9630 vs 0.9607 at round 4).
+  **All four gates now have a real measurement at R1: G1 fails at 1.34-1.37x, G2 passes, G3 passes
+  including under churn, G4 passes at 20% deletion.**

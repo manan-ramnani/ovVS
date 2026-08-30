@@ -218,6 +218,7 @@ try:
     _lib.ovvsCagraDelete.argtypes = [c_void_p, c_void_p, POINTER(c_int64), c_int64]
     _lib.ovvsCagraUpdate.argtypes = [c_void_p, c_void_p, POINTER(c_int64), POINTER(c_float), c_int64]
     _lib.ovvsCagraCounts.argtypes = [c_void_p, POINTER(c_int64), POINTER(c_int64)]
+    _lib.ovvsCagraExtendEx.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64, POINTER(c_int64)]
     _HAS_CAGRA_MUTATION = True
 except AttributeError:  # pragma: no cover - older library
     _HAS_CAGRA_MUTATION = False
@@ -760,6 +761,17 @@ class CagraIndex(_Index):
         _check_status(rc, "CAGRA extend")
         self.n += n
         return keep
+
+    def extend_ex(self, extra):
+        """Insert and return the assigned ids. May reuse rows freed by a delete."""
+        _require_mutation()
+        keep, ptr, n, _d = _dataset_ptr(extra, self.dim)
+        out = (c_int64 * n)()
+        rc = _lib.ovvsCagraExtendEx(self._res._h, self._h, ptr, c_int64(n), out)
+        _check_status(rc, "CAGRA extend_ex")
+        live, deleted = self.counts()
+        self.n = live + deleted
+        return list(out)
 
     def delete(self, ids):
         _require_mutation()

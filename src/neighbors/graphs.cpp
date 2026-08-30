@@ -126,7 +126,39 @@ struct CagraIndex {
      deleted, so an unmutated index allocates nothing for this. */
   std::vector<uint8_t> deleted;
   int64_t deleted_count = 0;
+  /* Slot reuse. A tombstoned row can be handed to a later insert, which is what stops churn from
+     growing the footprint forever -- but reusing a row recycles its id, and a caller still holding
+     the old id would silently read someone else's vector. So each row carries a generation, and a
+     public id is `slot | (generation << 32)`. Generation 0 packs to the bare slot, so an index
+     that has never reused anything returns exactly the ids it always did, and both vectors stay
+     empty until the first reuse. A stale id is then detectably stale rather than silently wrong. */
+  std::vector<uint32_t> generation;
+  std::vector<int32_t> free_slots;
 };
+
+inline uint32_t cagra_generation_of(const CagraIndex& ix, int64_t slot) {
+  if (ix.generation.empty() || slot < 0 ||
+      static_cast<size_t>(slot) >= ix.generation.size()) {
+    return 0u;
+  }
+  return ix.generation[static_cast<size_t>(slot)];
+}
+
+inline int64_t cagra_pack_id(const CagraIndex& ix, int64_t slot) {
+  if (ix.generation.empty() || slot < 0) return slot;
+  return slot | (static_cast<int64_t>(cagra_generation_of(ix, slot)) << 32);
+}
+
+/* Splits a public id and rejects it if the row has been reused since the id was handed out. */
+inline bool cagra_resolve_id(const CagraIndex& ix, int64_t id, int64_t* slot) {
+  if (id < 0) return false;
+  const int64_t row = id & 0xFFFFFFFFLL;
+  const uint32_t gen = static_cast<uint32_t>(static_cast<uint64_t>(id) >> 32);
+  if (row >= ix.ds.n) return false;
+  if (gen != cagra_generation_of(ix, row)) return false;
+  *slot = row;
+  return true;
+}
 
 inline bool cagra_row_deleted(const CagraIndex& ix, int64_t row) {
   if (ix.deleted.empty() || row < 0) return false;
@@ -1197,7 +1229,7 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
           if (t < nc) {
             const int64_t selected = fi[static_cast<size_t>(t)];
             if (selected < 0 || selected >= nc) return OVVS_STATUS_ERROR;
-            neighbors[q * k + t] = cand[static_cast<size_t>(selected)];
+            neighbors[q * k + t] = cagra_pack_id(*ix, cand[static_cast<size_t>(selected)]);
             float d = fv[static_cast<size_t>(t)];
             if (ix->ds.metric == OVVS_METRIC_INNER_PRODUCT) d = -d;
             distances[q * k + t] = d;
@@ -1232,7 +1264,7 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
         for (int64_t t = 0; t < k_internal && kept < k; ++t) {
           const int64_t candidate = wide_ids[static_cast<size_t>(q * k_internal + t)];
           if (candidate < 0 || cagra_row_deleted(*ix, candidate)) continue;
-          neighbors[q * k + kept] = candidate;
+          neighbors[q * k + kept] = cagra_pack_id(*ix, candidate);
           distances[q * k + kept] = wide_distances[static_cast<size_t>(q * k_internal + t)];
           ++kept;
         }
@@ -1243,9 +1275,15 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
       }
       return OVVS_STATUS_SUCCESS;
     }
-    return prim_graph_walk(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim,
-                           ix->ds.metric, ix->graph.data(), ix->degree, queries, nq, k,
-                           itopk_size, search_width, bitset, neighbors, distances);
+    const ovvsStatus status = prim_graph_walk(
+        *rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+        ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
+    if (status == OVVS_STATUS_SUCCESS && !ix->generation.empty()) {
+      for (int64_t t = 0; t < nq * k; ++t) {
+        if (neighbors[t] >= 0) neighbors[t] = cagra_pack_id(*ix, neighbors[t]);
+      }
+    }
+    return status;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
   } catch (...) {
@@ -1263,7 +1301,8 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
      deleted from still writes v2 and stays readable by existing builds; one that HAS been deleted
      from writes v3, so an older build rejects the file outright instead of silently ignoring the
      tombstone section and resurrecting deleted rows. Failing closed is the point. */
-  const bool has_tombstones = ix->deleted_count > 0 && !ix->deleted.empty();
+  const bool has_tombstones =
+      (ix->deleted_count > 0 && !ix->deleted.empty()) || !ix->generation.empty();
   int32_t ver = has_tombstones ? 3 : 2;
   f.write(reinterpret_cast<const char*>(&ver), 4);
   int32_t flags = 0;
@@ -1293,8 +1332,15 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
   }
   if (flags & 4) {
     f.write(reinterpret_cast<const char*>(&ix->deleted_count), 8);
+    int64_t deleted_bytes = static_cast<int64_t>(ix->deleted.size());
+    f.write(reinterpret_cast<const char*>(&deleted_bytes), 8);
     f.write(reinterpret_cast<const char*>(ix->deleted.data()),
             static_cast<std::streamsize>(ix->deleted.size()));
+    /* Generations must round-trip or reuse would stop detecting stale ids across a reload. */
+    int64_t generation_rows = static_cast<int64_t>(ix->generation.size());
+    f.write(reinterpret_cast<const char*>(&generation_rows), 8);
+    f.write(reinterpret_cast<const char*>(ix->generation.data()),
+            static_cast<std::streamsize>(ix->generation.size() * sizeof(uint32_t)));
   }
   return f.good() ? OVVS_STATUS_SUCCESS : OVVS_STATUS_IO;
 }
@@ -1345,12 +1391,32 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
   }
   if (flags & 4) {
     f.read(reinterpret_cast<char*>(&ix->deleted_count), 8);
-    ix->deleted.resize(static_cast<size_t>((ix->ds.n + 7) / 8));
+    int64_t deleted_bytes = 0;
+    f.read(reinterpret_cast<char*>(&deleted_bytes), 8);
+    int64_t generation_rows = 0;
+    const int64_t expected_bytes = (ix->ds.n + 7) / 8;
+    if (deleted_bytes < 0 || deleted_bytes > expected_bytes) {
+      delete ix;
+      return OVVS_STATUS_IO;
+    }
+    ix->deleted.resize(static_cast<size_t>(deleted_bytes));
     f.read(reinterpret_cast<char*>(ix->deleted.data()),
            static_cast<std::streamsize>(ix->deleted.size()));
+    f.read(reinterpret_cast<char*>(&generation_rows), 8);
+    if (generation_rows < 0 || generation_rows > ix->ds.n) {
+      delete ix;
+      return OVVS_STATUS_IO;
+    }
+    ix->generation.resize(static_cast<size_t>(generation_rows));
+    f.read(reinterpret_cast<char*>(ix->generation.data()),
+           static_cast<std::streamsize>(ix->generation.size() * sizeof(uint32_t)));
     if (ix->deleted_count < 0 || ix->deleted_count > ix->ds.n) {
       delete ix;
       return OVVS_STATUS_IO;
+    }
+    /* Tombstoned rows are reusable again after a reload; the free list is derived, not stored. */
+    for (int64_t row = 0; row < ix->ds.n; ++row) {
+      if (cagra_row_deleted(*ix, row)) ix->free_slots.push_back(static_cast<int32_t>(row));
     }
   }
   if (!f) {
@@ -1366,19 +1432,24 @@ ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const in
   if (!res || !index || !ids || nids < 0) return OVVS_STATUS_INVALID_ARGUMENT;
   if (nids == 0) return OVVS_STATUS_SUCCESS;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::vector<int64_t> slots(static_cast<size_t>(nids));
   for (int64_t i = 0; i < nids; ++i) {
-    if (ids[i] < 0 || ids[i] >= ix->ds.n) return OVVS_STATUS_INVALID_ARGUMENT;
+    if (!cagra_resolve_id(*ix, ids[i], &slots[static_cast<size_t>(i)])) {
+      return OVVS_STATUS_INVALID_ARGUMENT;
+    }
   }
   try {
     if (ix->deleted.empty()) {
       ix->deleted.assign(static_cast<size_t>((ix->ds.n + 7) / 8), 0u);
     }
     for (int64_t i = 0; i < nids; ++i) {
-      const size_t byte = static_cast<size_t>(ids[i]) >> 3;
-      const uint8_t mask = static_cast<uint8_t>(1u << (ids[i] & 7));
+      const int64_t slot = slots[static_cast<size_t>(i)];
+      const size_t byte = static_cast<size_t>(slot) >> 3;
+      const uint8_t mask = static_cast<uint8_t>(1u << (slot & 7));
       if ((ix->deleted[byte] & mask) != 0) continue;  /* idempotent */
       ix->deleted[byte] |= mask;
       ++ix->deleted_count;
+      ix->free_slots.push_back(static_cast<int32_t>(slot));
     }
     rd(res)->last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
@@ -1442,13 +1513,16 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
     return OVVS_STATUS_DEVICE_UNAVAILABLE;
   }
   if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  std::vector<int64_t> slots(static_cast<size_t>(nids));
   for (int64_t i = 0; i < nids; ++i) {
-    if (ids[i] < 0 || ids[i] >= ix->ds.n) return OVVS_STATUS_INVALID_ARGUMENT;
+    if (!cagra_resolve_id(*ix, ids[i], &slots[static_cast<size_t>(i)])) {
+      return OVVS_STATUS_INVALID_ARGUMENT;
+    }
   }
   const int64_t dim = ix->ds.dim;
   try {
     for (int64_t i = 0; i < nids; ++i) {
-      const int64_t row = ids[i];
+      const int64_t row = slots[static_cast<size_t>(i)];
       /* Keep the old vector so a failed relink can be undone; the graph rows the relink rewrites
          are repaired by the relink itself on the next successful call, and leaving a stale edge
          is safe because edges are only hints. Losing the caller's vector would not be. */
@@ -1479,8 +1553,25 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
   }
 }
 
-ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const float* extra,
-                           int64_t nextra) {
+/* Claims a tombstoned row for a new vector: bumps its generation so every id handed out for the
+   previous occupant is now detectably stale, revives it, overwrites the vector, and repairs the
+   neighbourhood. Returns false only if there is no reusable row. */
+static bool cagra_claim_free_slot(CagraIndex* ix, int64_t* slot) {
+  while (!ix->free_slots.empty()) {
+    const int64_t candidate = ix->free_slots.back();
+    ix->free_slots.pop_back();
+    /* A row can be revived by ovvsCagraUpdate while it still sits on this list, so entries are
+       validated on the way out rather than removed eagerly on revival. */
+    if (candidate >= 0 && candidate < ix->ds.n && cagra_row_deleted(*ix, candidate)) {
+      *slot = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const float* extra,
+                             int64_t nextra, int64_t* out_ids) {
   if (!res || !index || !extra || nextra <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
   if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
@@ -1521,11 +1612,40 @@ ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const fl
     ovvsStatus failure = OVVS_STATUS_SUCCESS;
 
     for (int64_t i = 0; i < nextra && !failed; ++i) {
+      /* Reuse is only offered when the caller can be told which rows it got. Without out_ids a
+         reused row would be invisible to them, so plain Extend keeps appending. */
+      int64_t reused = -1;
+      if (out_ids != nullptr && cagra_claim_free_slot(ix, &reused)) {
+        std::vector<float> previous(ix->ds.x.begin() + reused * dim,
+                                    ix->ds.x.begin() + (reused + 1) * dim);
+        std::copy(extra + i * dim, extra + (i + 1) * dim, ix->ds.x.begin() + reused * dim);
+        if (ix->generation.empty()) ix->generation.assign(static_cast<size_t>(ix->ds.n), 0u);
+        ++ix->generation[static_cast<size_t>(reused)];
+        ix->deleted[static_cast<size_t>(reused) >> 3] &=
+            static_cast<uint8_t>(~(1u << (reused & 7)));
+        --ix->deleted_count;
+        const ovvsStatus status = cagra_relink_one(ix, *resources, reused);
+        if (status != OVVS_STATUS_SUCCESS) {
+          std::copy(previous.begin(), previous.end(), ix->ds.x.begin() + reused * dim);
+          ix->deleted[static_cast<size_t>(reused) >> 3] |=
+              static_cast<uint8_t>(1u << (reused & 7));
+          ++ix->deleted_count;
+          ix->free_slots.push_back(static_cast<int32_t>(reused));
+          failed = true;
+          failure = status;
+          break;
+        }
+        out_ids[i] = cagra_pack_id(*ix, reused);
+        continue;
+      }
+      const int64_t appended = ix->ds.n;
       const ovvsStatus status = cagra_insert_one(ix, *resources, extra + i * dim, &journal);
       if (status != OVVS_STATUS_SUCCESS) {
         failed = true;
         failure = status;
+        break;
       }
+      if (out_ids != nullptr) out_ids[i] = appended;
     }
 
     if (failed) {
@@ -1547,6 +1667,9 @@ ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const fl
     if (!ix->deleted.empty()) {
       ix->deleted.resize(static_cast<size_t>((ix->ds.n + 7) / 8), 0u);
     }
+    if (!ix->generation.empty()) {
+      ix->generation.resize(static_cast<size_t>(ix->ds.n), 0u);
+    }
     if (ix->pq_m > 0) {
       ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
       pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub,
@@ -1559,6 +1682,11 @@ ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const fl
   } catch (...) {
     return OVVS_STATUS_ERROR;
   }
+}
+
+ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const float* extra,
+                           int64_t nextra) {
+  return ovvsCagraExtendEx(res, index, extra, nextra, nullptr);
 }
 
 ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_t pq_m, int32_t pq_nbits) {
