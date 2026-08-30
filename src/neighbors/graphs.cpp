@@ -211,22 +211,44 @@ static void cagra_build_mirror8(CagraIndex* ix) {
    documented deal) and after loading an fp32 file (lossless conversions only -- the file
    predates the env, and silently rounding stored float data on load is the one footgun;
    OVVS_CAGRA_F16=force overrides). */
-static void cagra_finalize_storage(CagraIndex* ix, bool allow_lossy) {
-  if (!cagra_f16_mode() || ix->ds.x.empty()) return;
-  if (!allow_lossy) {
-    const char* env = std::getenv("OVVS_CAGRA_F16");
-    const bool force = env && std::strcmp(env, "force") == 0;
-    if (!force) {
-      for (const float v : ix->ds.x) {
-        if (f16_bits_to_f32(f32_to_f16_bits(v)) != v) return; /* stay fp32 */
-      }
-    }
+static bool cagra_f32_roundtrips_f16(const CagraIndex& ix) {
+  for (const float v : ix.ds.x) {
+    if (f16_bits_to_f32(f32_to_f16_bits(v)) != v) return false;
   }
+  return true;
+}
+
+static void cagra_convert_to_f16(CagraIndex* ix) {
   const size_t count = ix->ds.x.size();
   ix->ds.x16.resize(count);
   for (size_t i = 0; i < count; ++i) ix->ds.x16[i] = f32_to_f16_bits(ix->ds.x[i]);
   UsmFloatVec().swap(ix->ds.x);
   cagra_build_mirror8(ix);
+}
+
+static void cagra_finalize_storage(CagraIndex* ix, bool allow_lossy) {
+  if (!cagra_f16_mode() || ix->ds.x.empty()) return;
+  if (!allow_lossy) {
+    const char* env = std::getenv("OVVS_CAGRA_F16");
+    const bool force = env && std::strcmp(env, "force") == 0;
+    if (!force && !cagra_f32_roundtrips_f16(*ix)) return; /* stay fp32 */
+  }
+  cagra_convert_to_f16(ix);
+}
+
+/* Build-time storage selection: the ovvsCagraStorage ABI parameter decides; AUTO
+   defers to the OVVS_CAGRA_F16 env override (the pre-ABI behaviour, and still the
+   way benches flip the mode process-wide). */
+static void cagra_finalize_storage_build(CagraIndex* ix, ovvsCagraStorage storage) {
+  if (storage == OVVS_CAGRA_STORAGE_AUTO) {
+    cagra_finalize_storage(ix, /*allow_lossy=*/true);
+    return;
+  }
+  if (storage == OVVS_CAGRA_STORAGE_FP32 || ix->ds.x.empty()) return;
+  if (storage == OVVS_CAGRA_STORAGE_FP16_IF_LOSSLESS && !cagra_f32_roundtrips_f16(*ix)) {
+    return; /* stay fp32 */
+  }
+  cagra_convert_to_f16(ix);
 }
 
 /* The walk-storage trio graph_search forwards to the engines. */
@@ -1191,9 +1213,10 @@ ovvsStatus ovvsNnDescentDestroy(ovvsNnDescentGraph_t graph) {
   return OVVS_STATUS_SUCCESS;
 }
 
-ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
-                            ovvsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
-                            ovvsCagraBuildAlgo algo, ovvsCagraIndex_t* index) {
+static ovvsStatus cagra_build_impl(ovvsResources_t res, const float* dataset, int64_t n,
+                                   int64_t dim, ovvsMetric metric, int32_t graph_degree,
+                                   int32_t intermediate_degree, ovvsCagraBuildAlgo algo,
+                                   ovvsCagraStorage storage, ovvsCagraIndex_t* index) {
   if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
   *index = nullptr;
   if (!res || !dataset || n <= 1 || dim <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
@@ -1305,7 +1328,7 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
        Telemetry merge, handle publication, and serialization are outside it. */
     call_stats.total_wall_ns = elapsed_ns(total_begin);
     publish_cagra_build_stats(*resources, call_stats);
-    cagra_finalize_storage(ix.get(), /*allow_lossy=*/true);
+    cagra_finalize_storage_build(ix.get(), storage);
     *index = reinterpret_cast<ovvsCagraIndex_t>(ix.release());
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
@@ -1313,6 +1336,31 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
   } catch (...) {
     return OVVS_STATUS_ERROR;
   }
+}
+
+ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                            ovvsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
+                            ovvsCagraBuildAlgo algo, ovvsCagraIndex_t* index) {
+  return cagra_build_impl(res, dataset, n, dim, metric, graph_degree, intermediate_degree, algo,
+                          OVVS_CAGRA_STORAGE_AUTO, index);
+}
+
+ovvsStatus ovvsCagraBuildEx2(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
+                             ovvsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
+                             ovvsCagraBuildAlgo algo, ovvsCagraStorage storage,
+                             ovvsCagraIndex_t* index) {
+  switch (storage) {
+    case OVVS_CAGRA_STORAGE_AUTO:
+    case OVVS_CAGRA_STORAGE_FP32:
+    case OVVS_CAGRA_STORAGE_FP16:
+    case OVVS_CAGRA_STORAGE_FP16_IF_LOSSLESS:
+      break;
+    default:
+      if (index) *index = nullptr;
+      return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  return cagra_build_impl(res, dataset, n, dim, metric, graph_degree, intermediate_degree, algo,
+                          storage, index);
 }
 
 ovvsStatus ovvsCagraBuild(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,

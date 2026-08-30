@@ -53,6 +53,19 @@ typedef enum ovvsCagraBuildAlgo {
   OVVS_CAGRA_BUILD_ITERATIVE = 2
 } ovvsCagraBuildAlgo;
 
+/* Primary vector storage precision for a CAGRA build. The ABI parameter is the
+   authoritative home for this decision; the OVVS_CAGRA_F16 environment variable
+   remains a bench/sweep override that only AUTO consults. FP16 stores binary16
+   (round-to-nearest-even; values that round-trip exactly -- integers up to 2048
+   among them -- are stored losslessly). FP16_IF_LOSSLESS converts only when every
+   value in the dataset round-trips exactly, otherwise the index stays FP32. */
+typedef enum ovvsCagraStorage {
+  OVVS_CAGRA_STORAGE_AUTO = 0,
+  OVVS_CAGRA_STORAGE_FP32 = 1,
+  OVVS_CAGRA_STORAGE_FP16 = 2,
+  OVVS_CAGRA_STORAGE_FP16_IF_LOSSLESS = 3
+} ovvsCagraStorage;
+
 typedef struct ovvsResourcesImpl* ovvsResources_t;
 typedef struct ovvsBruteForceIndexImpl* ovvsBruteForceIndex_t;
 typedef struct ovvsIvfFlatIndexImpl* ovvsIvfFlatIndex_t;
@@ -298,6 +311,10 @@ OVVS_API ovvsStatus ovvsCagraBuild(ovvsResources_t res, const float* dataset, in
 OVVS_API ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n, int64_t dim,
                                      ovvsMetric metric, int32_t graph_degree, int32_t intermediate_degree,
                                      ovvsCagraBuildAlgo algo, ovvsCagraIndex_t* index);
+OVVS_API ovvsStatus ovvsCagraBuildEx2(ovvsResources_t res, const float* dataset, int64_t n,
+                                      int64_t dim, ovvsMetric metric, int32_t graph_degree,
+                                      int32_t intermediate_degree, ovvsCagraBuildAlgo algo,
+                                      ovvsCagraStorage storage, ovvsCagraIndex_t* index);
 OVVS_API ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const float* queries,
                                     int64_t nq, int64_t k, int32_t itopk_size, int32_t search_width,
                                     const uint8_t* bitset, int64_t* neighbors, float* distances);

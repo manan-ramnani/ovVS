@@ -198,6 +198,26 @@ else:
         POINTER(c_void_p),
     ]
     _cagra_build_ex.restype = c_int32
+try:
+    _cagra_build_ex2 = _lib.ovvsCagraBuildEx2
+except AttributeError:
+    _cagra_build_ex2 = None
+else:
+    _cagra_build_ex2.argtypes = [
+        c_void_p,
+        POINTER(c_float),
+        c_int64,
+        c_int64,
+        c_int32,
+        c_int32,
+        c_int32,
+        c_int32,
+        c_int32,
+        POINTER(c_void_p),
+    ]
+    _cagra_build_ex2.restype = c_int32
+
+_CAGRA_STORAGE = {"auto": 0, "fp32": 1, "fp16": 2, "fp16_if_lossless": 3}
 _lib.ovvsCagraSearch.argtypes = [
     c_void_p,
     c_void_p,
@@ -993,18 +1013,39 @@ class neighbors:
             intermediate_degree=32,
             resources=None,
             build_algo="nndescent",
+            storage="auto",
         ):
             if build_algo not in _CAGRA_BUILD_ALGOS:
                 choices = ", ".join(_CAGRA_BUILD_ALGOS)
                 raise ValueError(f"build_algo must be one of: {choices}")
+            if storage not in _CAGRA_STORAGE:
+                choices = ", ".join(_CAGRA_STORAGE)
+                raise ValueError(f"storage must be one of: {choices}")
             if _cagra_build_ex is None and build_algo != "nndescent":
                 raise RuntimeError(
                     f"CAGRA build algorithm {build_algo!r} requires ovvsCagraBuildEx"
                 )
+            if _cagra_build_ex2 is None and storage != "auto":
+                raise RuntimeError(
+                    f"CAGRA storage {storage!r} requires ovvsCagraBuildEx2"
+                )
             res = resources or Resources()
             keep, ptr, n, d = _dataset_ptr(dataset, dim)
             ix = c_void_p()
-            if _cagra_build_ex is not None:
+            if _cagra_build_ex2 is not None:
+                rc = _cagra_build_ex2(
+                    res._h,
+                    ptr,
+                    c_int64(n),
+                    c_int64(d),
+                    c_int32(metric),
+                    c_int32(graph_degree),
+                    c_int32(intermediate_degree),
+                    c_int32(_CAGRA_BUILD_ALGOS[build_algo]),
+                    c_int32(_CAGRA_STORAGE[storage]),
+                    ctypes.byref(ix),
+                )
+            elif _cagra_build_ex is not None:
                 rc = _cagra_build_ex(
                     res._h,
                     ptr,
