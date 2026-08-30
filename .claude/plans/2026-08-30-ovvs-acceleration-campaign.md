@@ -830,3 +830,205 @@ Append newest last. One line per real event: what landed, what number it produce
   every round and recall unchanged (0.9630 vs 0.9607 at round 4).
   **All four gates now have a real measurement at R1: G1 fails at 1.34-1.37x, G2 passes, G3 passes
   including under churn, G4 passes at 20% deletion.**
+- **2026-08-30** — **CORRECTION: step 2 (sub-group per candidate) was under-credited, and I never
+  re-measured it.** Prompted by a direct question about whether step 2 was ever really done.
+  It was: it is `subgroup_distance` in the kernel, shipped in `d30e995`. But it was only ever
+  measured **bundled** with the int8 mirror and the parallel gather (1.229x), and I recorded that
+  as "the isolated 4.5-5.9x geometry gate did NOT translate" — then never revisited it after
+  removing the eviction rescan that was masking everything.
+  Re-added the pre-rewrite whole-work-group geometry behind `OVVS_GPU_SUBGROUP_GEOM=0`, with the
+  int8 fast path mirrored into it so the toggle changes **geometry and nothing else**. Both
+  geometries produce identical recall and identical work counters (0.9946, evals/q 1276.1),
+  confirming a clean single-variable test.
+
+  | point | old geometry | new geometry | median of 5 pair ratios |
+  |---|---|---|---:|
+  | `64/2` b32 | 9855 10048 10078 8245 10076 | 14888 14944 11559 14890 14869 | **1.487** |
+  | `64/4` b1024 | 17678 12977 13001 12853 17695 | 26768 17713 18755 26818 26806 | **1.514** |
+
+  **Step 2 is worth ~1.5x on its own.** Neither-vs-both (`geom=0,int8=0` against `geom=1,int8=1`)
+  at b1024 gives a median 1.79x, though that pairing was noisy (0.92-2.69) and the two isolated
+  numbers are the trustworthy ones.
+  **The lesson is one this file already states and I failed to apply to my own work:** "the share
+  of a component is not a property of the component -- re-measure every attribution after each
+  landing." The 1.229x verdict was true on the day and wrong a few hours later, because the rescan
+  was consuming 60% of the kernel when step 2 landed. The gate's 4.5-5.9x was still an
+  overestimate — it isolated the distance engine — but "did not translate" under-sold a 1.5x.
+  `OVVS_GPU_SUBGROUP_GEOM` is temporary and must be removed with the other knobs.
+- **2026-08-30** — **SECOND-OPINION CONSULT on the performance wall (full-plan + kernel read).**
+  Key reframe, derived from our own numbers: b1 latency 1.92 ms vs b1024 per-slot latency 2.33 ms
+  (1024/27,507 QPS ÷ 16 queries/slot) — co-residency of 64 WGs costs only +21%, so **QPS = 64 /
+  per-query-latency and the device is concurrency-capped, not compute/bandwidth/barrier-bound.**
+  Little's law on 5.8 GB/s @ ~600 ns ⇒ ~50 lines in flight ≈ 0.1 outstanding requests/thread vs
+  hnswlib's ~200 machine-wide: we are losing the concurrency war ~4:1 with 512 thread slots.
+  ≥99.5% of thread-cycles are stall/idle. Residual mystery: bottom-up iteration model predicts
+  10-18 µs vs ~51 µs measured at nominal 2 GHz — suspects: GT clock ≪ 2 GHz during runs (prime,
+  given thermal history), fabric latency ≫ 600 ns, or spills (never checked).
+  **Plan adopted:** (1) d32 + max_iters +16 (already queued); (2) register-hoist the query row
+  (re-read from global per eval today, IGC can't hoist across visited-table aliasing) + vec/uint64
+  row loads instead of 8 scalar byte loads; (3) **delete the global visited hash** — intra-tile
+  dedup + beam-membership scan + the ≥worst pre-filter are PROVABLY output-identical (evicted ⇒
+  ≥ non-increasing beam-max forever; pre-full ⇒ everything admits ⇒ in-beam), counters gate:
+  recall/iters/survivors unchanged, evals ↑ ≤ probes−evals (963/q); kills 2,297 CAS/q + the
+  32 KB/q state; (4) **queries_per_wg ∈ {1,2,4,8}** remap — same 128-item WG, 8 independent
+  queries, zero WG barriers, exactly output-preserving (seeds are per-query), lifts queries in
+  flight 64 → up to 512; the sweep is itself the phase-wait-vs-memory-wait discriminator. d32
+  halves the beam and hence per-query SLM, which is what keeps 16 WGs/Xe-core resident under the
+  remap — adopt d32 first. Diagnostics queued for a quiet window: VTune gpu-hotspots (XVE
+  Stalled-vs-Idle split + real GT frequency), zeKernelGetProperties spillMemSize log.
+  **IGC shader-dump env route PARKED** (rule 3): release driver ignores the env flags; registry
+  route needs admin consent. Verdict: G1 winnable with margin (conservative d32 1.25 × remap 1.8
+  ≈ 80K vs hnswlib 48-50K at 0.992); if the qpw sweep is flat, that falsifies the diagnosis in
+  one day and the "OoO cores win graph walks" conclusion gets taken seriously.
+- **2026-08-30** — **USER DECISIONS: admin diagnostics granted; d32 adoption + kernel changes
+  approved.** VTune 2025.3 confirmed installed (`oneAPI\vtune\latest`, not on PATH).
+- **2026-08-30** — **QUERY-ROW REGISTER HOIST + PACKED ROW LOADS LANDED: +5.0% at `64/2` b256.**
+  The query row was re-read from global memory for every candidate (~1,300 redundant row fetches
+  per query — IGC cannot hoist it across the visited-table writes). Now each lane loads its slice
+  once into registers; the int8 data row becomes two dword loads per lane instead of eight byte
+  loads; L2 uses the integer identity sum(a-b)² = Σa² + Σb² − 2Σab (every term < 2²⁴ so int32 is
+  exact and per-lane values are bit-identical to the subtractive form). Specialised to
+  D == 8*subgroup_size so the register buffers are statically indexed and cannot demote to
+  scratch; any other shape keeps the original path. fp32 path gets the same hoist at the same
+  shape, iteration order unchanged (bit-exact).
+  **Exactness: recall 0.9721/0.9946/0.9992 and evals/q 736.5/1276.1/2208.6 identical; 9/9 CTest.**
+  Interleaved pairs vs saved pre-hoist DLL, `64/2` b256: 1.052/1.027/1.066/1.050/1.043 →
+  **median 1.050**. (Baseline DLL must live in build-icpx/bin — its runtime deps resolve from the
+  DLL's own directory; `out/ab/` copies fail to load.)
+- **2026-08-30** — **`max_iters` SLACK TIGHTENED +32 → +24 (d32-adoption prerequisite): combined
+  with the hoist, +8.8% at `64/4` b1024.** Measured maxima with 32 seeds: d16 76/75/71 at
+  BEAM/SW=64 (caps now 88, margin ≥12) and 41 at BEAM/SW=32 (cap 56, margin 15); d32 74/70 at 64
+  and 40/23 at 32/16 (margins ≥14). **The excess over BEAM/SW does not grow with the ratio**, so
+  +24 clears everything observed while moving d32 `32/2` AND d16 `64/4` back across a pow2
+  boundary: visited tables halve 64→32 KiB/query. Recall and every counter bit-identical on both
+  graphs (d32 values match the adoption table digit-for-digit); 9/9 CTest.
+  Interleaved pairs at `64/4` b1024 (hoist + halved table vs pre-hoist): 1.081/1.080/1.088/
+  1.099/1.090 → **median 1.088**; net of the hoist's 1.050 the table halving is worth ~+3.5-4%
+  at b1024, consistent with the L2-thrash mechanism. **d32 G1 re-score queued behind a 12-min
+  cool-down** (box warmed by ~25 min of builds + A/B pairs): `ab_g1.py --graph sift100k-d32
+  --itopk 32 --width 2 --ef 96` b1024, 20 threads, 5 rounds, p0 (patience stays off for the
+  first d32 score — keep it output-preserving-comparable).
+- **2026-08-30** — **d32 G1 SCORED 3×: gap ≈ 1.10-1.17× at ~0.996 recall (was 1.34-1.37×).
+  NOT a G1 pass — do not claim one.** Three back-to-back `ab_g1.py` runs (d32 `32/2` p0 vs
+  `ef=96`, b1024, 20t, after a 12-min cool-down; third saved to `out/quick/g1-d32-32x2-ef96.json`):
+  run1 median 0.923 (hnswlib BEHIND) but its rounds degraded 40.3K→33.0K; run2: ovVS stable
+  44.6-46.2K (spread 3.5%) vs hnswlib 50.2-53.1K → ~1.17; run3 median 0.943 but BOTH lanes
+  unstable (ovVS 33.8-45.1K; hnswlib rising 29.3K→45.8K).
+  ⚠ **New methodology trap found: a sub-1.0 median from `ab_g1.py` is NOT a win when one lane's
+  rounds are still cold** — round-alignment artifacts produce ratios spanning 0.76-1.37 inside
+  one run. Judge a run only if each lane's own rounds are stable (≤~10% spread); otherwise
+  compare healthy plateaus across runs. Healthy plateaus here: **ovVS 45.4K @ 0.9962 vs hnswlib
+  50-53K @ 0.9955** (ovVS at slightly higher recall). ovVS is now inside the comparator's own
+  run-to-run noise band — the remaining gap is smaller than hnswlib's variance, which is itself
+  the argument for landing beam-dedup + the qpw remap to make G1 unambiguous rather than
+  re-rolling the dice on scoring runs.
+  Cumulative today at `32/2`-class configs: d32 adoption (+~1.25×) + hoist (+5%) + table halving
+  (+~4%) took the b1024 flagship from ~36K to ~45.4K at higher recall.
+- **2026-08-30** — **BEAM-DEDUP LANDED AND GATED (env `OVVS_CAGRA_BEAM_DEDUP`, default = only
+  with qpw>1).** The visited hash is replaced by intra-tile dedup + an SLM beam-membership scan
+  + the existing ≥worst pre-filter, **provably output-identical when `nseeds <= itopk`** (a seed
+  phase that cannot overfill the beam ⇒ every previously-scored id is in-beam or forever above
+  the threshold). **Measured exactly as proved:** recall, iters/q and survivors/q bit-identical
+  at every point on both graphs; evals/q rises by the revisit rate — +24-41% at d16,
+  **+43-46% at d32** (graph-overlap property, width-independent: 32/1 +45.6%, 32/2 +43%).
+  ⚠ **At one-WG-per-query it is a 14% REGRESSION** (3 toggle pairs, d32 32/2 b1024: 0.676/
+  0.862/0.908) — extra evals cost more than 2,297 CAS probes save at 64 resident queries.
+  Kept as the enabler of the sub-group mapping only; hash stays the default.
+- **2026-08-30** — **SUB-GROUP-PER-QUERY (qpw=8) BUILT, BIT-EXACT, AND PARKED AT 0.84×.
+  The concurrency diagnosis was half right and the counters say precisely which half.**
+  Implementation: `OVVS_CAGRA_QPW=8` — one sub-group owns one query end to end, zero WG
+  barriers (tail-guard `return` is legal because none exist), per-query state in registers +
+  a <1 KiB SLM slot; v2 fuses score+admit against the frozen tile threshold (provably counter-
+  identical) and compacts the tile in place. **Gates: recall and every counter bit-identical
+  to the WG-dedup path at every config tried; 9/9 CTest in both modes; classic path untouched
+  (hash counters re-certified).**
+  **Timed verdicts (interleaved pairs, d32 32/2 b1024, same binary):**
+  | config | ratio vs qpw1 | note |
+  |---|---:|---|
+  | v1 (72 q/Xe-core) | **0.823** | qpw1 42K, qpw8 34.4K stable ±2.4% |
+  | v1 + seen-cache 256 (40 q/Xe) | **0.459** | throughput tracked residency, not evals |
+  | v1 + seen-cache 512 (32 q/Xe) | **0.495** | ditto — SLM/query is the binding resource |
+  | **v2 fused, ≤1 KiB/query (128 q/Xe)** | **0.843** | qpw8 38.0K ±1% vs qpw1 45.1K |
+  **What was confirmed:** the mapping raises machine eval throughput **58.8M → 70.8M evals/s
+  (+20%)** — queries-in-flight do convert to work, and throughput tracked SLM residency in
+  both directions. **What was refuted:** (1) an exact SLM dedup with hash-grade coverage does
+  not exist under the residency constraint — recency ring caught 16-47% (revisits are NOT
+  temporally local), direct-mapped cache 41-74% but every KiB/query costs more residency than
+  it recovers; (2) **evals/s saturates ≈70M beyond ~300 resident queries** — NOT bandwidth
+  (9.1 GB/s of ~102), NOT issue (~2.5%), NOT thread slots. Something serves random 128-B
+  reads at a fixed rate: DRAM row-activate service or L2 miss-handling concurrency are the
+  suspects, and **counters/A-B cannot distinguish them — this is exactly the VTune
+  memory-access question** for the admin-granted quiet window. Net ceiling if the tax were
+  zero at the saturated rate: 70.8M/1304 ≈ 54K ≈ 1.20× qpw1 — real but modest until the
+  70M wall itself is understood.
+  **Verdict: qpw stays default 1; qpw=8 + beam-dedup + seen-cache kept in-tree behind their
+  TEMPORARY knobs as the vehicle for the post-VTune revisit. Do not re-tune blind — measure
+  the wall first.** qpw1 flagship after today's landings: **~45-47K @ 0.9962** (was ~36K at
+  tick 5), vs healthy hnswlib ~50-53K @ 0.9955 → gap ~1.10-1.17×.
+- **2026-08-30 (realign tick 6)** — **VTUNE SESSION RUN (no admin needed after all — the env
+  route works when launched via a cmd.exe wrapper; Store-python can't be VTune's target
+  directly). Three collections + two follow-up experiments; the qpw story is now CLOSED with
+  a named cause and a shared wall.**
+  1. **qpw1 overview:** XVE Stalled/Idle 74.7%, occupancy **84.4%**, "L3 bandwidth bound"
+     3.5% of peak. Confirms the consult's stall accounting; byte-bandwidth is nowhere near
+     the limit.
+  2. **qpw8 v2 overview:** Stalled/Idle 78.2%, occupancy **29.0%** — the remap never held its
+     queries resident. Hypothesis: dispatch raggedness (128 coarse WGs, each pinned open by
+     its slowest of 8 queries; ~2 queries per claimant at b1024).
+  3. **v3 BUILT: persistent sub-groups + global atomic query queue** (`off_queue` in the
+     workspace; each sub-group claims the next query, serves it, claims again). Bit-identical
+     counters and recall; 9/9 CTest both modes. **Result: 0.840 median vs qpw1 — unchanged.**
+     VTune on v3: occupancy 31-33% still, but **Peak XVE Threads Occupancy = 100%** — no
+     resource cap; pure fill/drain.
+  4. **b4096 probe (8 queries/claimant, truth recomputed for 4096):** ratios 0.870/0.873/
+     0.874 — larger batches barely help. **Fill/drain falsified as the dominant term too.**
+  5. **The remaining explanation, consistent with every number:** both mappings converge on a
+     **shared request-rate wall ≈ 120-150M random 64-B line-requests/s (~9 GB/s, i.e. <10% of
+     byte bandwidth)** — qpw1 60.5M evals/s, qpw8 75.6M evals/s (+25% — the remap's true
+     concurrency yield), but qpw8's +43% dedup-eval tax eats it: net 0.84-0.87 at every
+     batch size and every dedup variant tried. Not occupancy, not barriers, not L3 bytes,
+     not dispatch. **This wall also owns qpw1's ceiling and therefore the remaining G1 gap.**
+  **PARKED (rule 3): the qpw=8 mapping**, three variants measured, verdict stable. Kept
+  in-tree behind knobs; revisit only if the wall itself moves.
+  **NEXT: characterize the wall directly with a standalone microbenchmark** (sg_gate-style,
+  ~30 lines: achievable random-line request rate vs outstanding-requests-per-thread and
+  vs footprint) — it yields the true roofline for ANY mapping, decides whether qpw1's 60M
+  evals/s is already at it (→ G1 must come from FEWER requests: graph-locality reorder of
+  the uint8 mirror + permuted adjacency, the tick-4 direction) or short of it (→ keep tuning
+  qpw1). CLI VTune cannot decompose LSC vs GTI vs DRAM (GUI-only grid); the microbenchmark
+  can, without admin.
+- **2026-08-30 (realign tick 7)** — **`out/req_gate.cpp` BUILT AND RUN. ⚠ IT REFUTES THE
+  "SHARED REQUEST-RATE WALL" RECORDED LAST TICK — that conclusion is RETRACTED.** The gate
+  measures random row reads in the walk's exact eval shape (one sub-group per row, lanes 8 B
+  apart, dependent chase = 1 outstanding/chain), quiet box, best of 3:
+
+  | sub-groups | fp | row | burst | rows/s | GB/s | chain ns |
+  |---:|---|---|---:|---:|---:|---:|
+  | 32 | 16 MiB | 128 B | 1 | 74.2M | 9.5 | 431 |
+  | 64 | 16 MiB | 128 B | 1 | 145.3M | 18.6 | 440 |
+  | 128 | 16 MiB | 128 B | 1 | 275.2M | 35.2 | 465 |
+  | 256 | 16 MiB | 128 B | 1 | 465.6M | 59.6 | 550 |
+  | **512** | **16 MiB** | **128 B** | **1** | **586.2M** | **75.0** | 873 |
+  | 128 | 16 MiB | 128 B | 2 | 401.5M | 51.4 | — |
+  | 512 | 16 MiB | 128 B | 2 | 476.0M | 60.9 | — (queue-saturated; B>1 hurts at 512) |
+  | 512 | **2 MiB** | 128 B | 1 | **2,256M** | **288.8** | 227 |
+  | 512 | 128 MiB | 128 B | 1 | 317.4M | 40.6 | 1,613 |
+  | 512 | 8 MiB | 64 B | 1 | 1,044.6M | 66.9 | 490 |
+
+  **Readings:** (1) at the walk's own concurrency and shape the fabric serves 145-586M
+  rows/s — the walk's 60-75M evals/s is **4-8× BELOW the memory roofline; the walk is
+  bookkeeping-bound, not memory-bound.** Estimated split at qpw8's effective ~130-170
+  resident sub-groups: fetches ≈ 27%, bookkeeping (commit dup-scan + beam scan + pick +
+  admit, all SLM-serial per candidate) ≈ **~73% of sub-group time**. This also reframes the
+  beam-dedup −14%: the cost was the O(count) membership SCANS, not the extra evals.
+  (2) **L2-resident footprint runs 3.8-15×** — the graph-locality reorder (tick-4 direction)
+  has a much higher ceiling than assumed; it helps both mappings and R2.
+  (3) 128 MiB (R2-like) still serves 317M rows/s — memory is not the R2 blocker either.
+  (4) 64-B rows double the rate — sub-byte/half-row packing has real headroom when B20 lands.
+  **REVISED ATTACK (in order):** (a) qpw8 bookkeeping diet — replace the per-candidate
+  O(count) beam scan with an exact SLM open-addressed hash of beam contents (insert on
+  admit, tombstone on evict, amortized rebuild), and the O(r) dup scan with a sub-group
+  ballot/shuffle pass; the mapping's +25% concurrency yield is real and currently buried
+  under self-inflicted SLM serialization. (b) locality reorder of the uint8 mirror +
+  permuted adjacency. (c) VTune GUI session for the LSC grid stays optional — the gate
+  answered the question CLI VTune could not.
