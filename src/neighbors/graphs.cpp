@@ -82,6 +82,12 @@ void publish_cagra_build_stats(ResourcesData& resources,
 
 struct Dataset {
   UsmFloatVec x;
+  /* fp16 primary storage (OVVS_CAGRA_F16=1): when populated, `x` is EMPTY and every
+     vector lives here as IEEE binary16 -- half the resident bytes of fp32 for every
+     corpus. Integer-valued data (SIFT-class) converts exactly, so results stay
+     bitwise-identical there; for general float corpora the storage rounds once at
+     insert and the effect is judged by measured recall, never assumed. */
+  UsmU16Vec x16;
   int64_t n = 0;
   int64_t dim = 0;
   ovvsMetric metric = OVVS_METRIC_L2_EXPANDED;
@@ -117,6 +123,12 @@ struct CagraIndex {
   int32_t degree = 0;
   UsmI32Vec graph;
   bool has_dataset = true;
+  /* Index-owned int8 mirror, fp16 mode only (shared USM: the GPU walk reads it too).
+     Unlike the Resources-cached fp32-mode mirror it is updated in place by mutation, so
+     it needs no fingerprinting and can never serve stale rows. Dropped permanently the
+     first time a mutation stores a vector that is not integer-valued in [0,255]. */
+  UsmU8Vec mirror8;
+  bool mirror8_ok = false;
   int32_t pq_m = 0;
   int32_t pq_ks = 0;
   int32_t dsub = 0;
@@ -144,6 +156,120 @@ inline uint32_t cagra_generation_of(const CagraIndex& ix, int64_t slot) {
     return 0u;
   }
   return ix.generation[static_cast<size_t>(slot)];
+}
+
+static bool cagra_f16_mode() {
+  const char* env = std::getenv("OVVS_CAGRA_F16");
+  return env && *env && *env != '0';
+}
+
+static bool cagra_is_f16(const CagraIndex& ix) { return !ix.ds.x16.empty(); }
+
+static bool cagra_dataset_present(const CagraIndex& ix) {
+  return ix.has_dataset && (!ix.ds.x.empty() || !ix.ds.x16.empty());
+}
+
+/* dst must hold dim floats. */
+static void cagra_row_f32(const CagraIndex& ix, int64_t row, float* dst) {
+  const int64_t dim = ix.ds.dim;
+  if (!ix.ds.x.empty()) {
+    std::copy(ix.ds.x.begin() + row * dim, ix.ds.x.begin() + (row + 1) * dim, dst);
+  } else {
+    f16_row_to_f32(ix.ds.x16.data() + row * dim, dst, dim);
+  }
+}
+
+static bool cagra_f16_row_int8_ok(const uint16_t* row, int64_t dim) {
+  for (int64_t i = 0; i < dim; ++i) {
+    const float v = f16_bits_to_f32(row[i]);
+    if (!(v >= 0.f && v <= 255.f && v == std::floor(v))) return false;
+  }
+  return true;
+}
+
+/* Rebuilds the index-owned int8 mirror from fp16 storage. Eligibility is judged on the
+   STORED (fp16) values -- the mirror only has to agree with what the walk would read. */
+static void cagra_build_mirror8(CagraIndex* ix) {
+  ix->mirror8_ok = false;
+  UsmU8Vec().swap(ix->mirror8);
+  if (ix->ds.x16.empty() || ix->ds.dim > 256) return;
+  const size_t count = ix->ds.x16.size();
+  for (size_t i = 0; i < count; ++i) {
+    const float v = f16_bits_to_f32(ix->ds.x16[i]);
+    if (!(v >= 0.f && v <= 255.f && v == std::floor(v))) return;
+  }
+  ix->mirror8.resize(count);
+  for (size_t i = 0; i < count; ++i) {
+    ix->mirror8[i] = static_cast<uint8_t>(
+        static_cast<int32_t>(f16_bits_to_f32(ix->ds.x16[i])));
+  }
+  ix->mirror8_ok = true;
+}
+
+/* Converts fp32 primary storage to fp16 and releases the fp32 copy. Called once at the
+   end of build and after loading an fp32 file with the mode enabled. */
+static void cagra_finalize_storage(CagraIndex* ix) {
+  if (!cagra_f16_mode() || ix->ds.x.empty()) return;
+  const size_t count = ix->ds.x.size();
+  ix->ds.x16.resize(count);
+  for (size_t i = 0; i < count; ++i) ix->ds.x16[i] = f32_to_f16_bits(ix->ds.x[i]);
+  UsmFloatVec().swap(ix->ds.x);
+  cagra_build_mirror8(ix);
+}
+
+/* The walk-storage trio graph_search forwards to the engines. */
+struct CagraStorage {
+  const float* f32 = nullptr;
+  const uint16_t* f16 = nullptr;
+  const uint8_t* u8 = nullptr;
+};
+static CagraStorage cagra_storage(const CagraIndex& ix) {
+  CagraStorage s;
+  if (!ix.ds.x.empty()) {
+    s.f32 = ix.ds.x.data();
+  } else if (!ix.ds.x16.empty()) {
+    s.f16 = ix.ds.x16.data();
+    if (ix.mirror8_ok) s.u8 = ix.mirror8.data();
+  }
+  return s;
+}
+
+/* Writes one vector into an existing slot, converting for the active storage and
+   keeping the int8 mirror coherent: updated in place, or dropped permanently the first
+   time an ineligible vector lands (the walk then reads fp16 directly). */
+static void cagra_write_row(CagraIndex* ix, int64_t slot, const float* vec) {
+  const int64_t dim = ix->ds.dim;
+  if (!ix->ds.x.empty()) {
+    std::copy(vec, vec + dim, ix->ds.x.begin() + slot * dim);
+    return;
+  }
+  uint16_t* dst = ix->ds.x16.data() + slot * dim;
+  f32_row_to_f16(vec, dst, dim);
+  if (ix->mirror8_ok) {
+    if (cagra_f16_row_int8_ok(dst, dim)) {
+      uint8_t* m = ix->mirror8.data() + slot * dim;
+      for (int64_t i = 0; i < dim; ++i) {
+        m[i] = static_cast<uint8_t>(static_cast<int32_t>(f16_bits_to_f32(dst[i])));
+      }
+    } else {
+      ix->mirror8_ok = false;
+      UsmU8Vec().swap(ix->mirror8);
+    }
+  }
+}
+
+static void cagra_append_row(CagraIndex* ix, const float* vec) {
+  const int64_t dim = ix->ds.dim;
+  const int64_t slot = ix->ds.n;
+  if (!ix->ds.x16.empty()) {
+    ix->ds.x16.resize(ix->ds.x16.size() + static_cast<size_t>(dim));
+    if (ix->mirror8_ok) ix->mirror8.resize(ix->mirror8.size() + static_cast<size_t>(dim));
+    ix->ds.n = slot + 1;
+    cagra_write_row(ix, slot, vec);
+  } else {
+    ix->ds.x.insert(ix->ds.x.end(), vec, vec + dim);
+    ix->ds.n = slot + 1;
+  }
 }
 
 inline int64_t cagra_pack_id(const CagraIndex& ix, int64_t slot) {
@@ -344,9 +470,10 @@ ovvsStatus graph_search(ResourcesData& r, const float* dataset, int64_t n, int64
                         ovvsMetric metric, const int32_t* graph, int32_t degree,
                         const float* queries, int64_t nq, int64_t k, int32_t itopk,
                         int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
-                        float* distances) {
+                        float* distances, const uint16_t* dataset_f16 = nullptr,
+                        const uint8_t* dataset_u8 = nullptr) {
   return prim_graph_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk,
-                         search_width, bitset, neighbors, distances);
+                         search_width, bitset, neighbors, distances, dataset_f16, dataset_u8);
 }
 
 void pq_encode_rows(const float* x, int64_t n, int64_t dim, int32_t pq_m, int32_t ks, int32_t dsub,
@@ -1166,6 +1293,7 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
        Telemetry merge, handle publication, and serialization are outside it. */
     call_stats.total_wall_ns = elapsed_ns(total_begin);
     publish_cagra_build_stats(*resources, call_stats);
+    cagra_finalize_storage(ix.get());
     *index = reinterpret_cast<ovvsCagraIndex_t>(ix.release());
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
@@ -1244,7 +1372,8 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
     }
       return OVVS_STATUS_SUCCESS;
     }
-    if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+    if (!cagra_dataset_present(*ix)) return OVVS_STATUS_INVALID_ARGUMENT;
+    const CagraStorage st = cagra_storage(*ix);
     if (ix->deleted_count > 0) {
       /* Tombstoned rows are traversed like any other -- they are routing hops for their
          neighbours, and dropping them from the walk would fragment the graph -- so they are
@@ -1257,9 +1386,9 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
       std::vector<int64_t> wide_ids(static_cast<size_t>(nq * k_internal));
       std::vector<float> wide_distances(static_cast<size_t>(nq * k_internal));
       const ovvsStatus status = prim_graph_walk(
-          *rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+          *rd(res), st.f32, ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
           ix->degree, queries, nq, k_internal, itopk_size, search_width, bitset, wide_ids.data(),
-          wide_distances.data());
+          wide_distances.data(), st.f16, st.u8);
       if (status != OVVS_STATUS_SUCCESS) return status;
       for (int64_t q = 0; q < nq; ++q) {
         int64_t kept = 0;
@@ -1278,8 +1407,9 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
       return OVVS_STATUS_SUCCESS;
     }
     const ovvsStatus status = prim_graph_walk(
-        *rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
-        ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors, distances);
+        *rd(res), st.f32, ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+        ix->degree, queries, nq, k, itopk_size, search_width, bitset, neighbors, distances,
+        st.f16, st.u8);
     if (status == OVVS_STATUS_SUCCESS && !ix->generation.empty()) {
       for (int64_t t = 0; t < nq * k; ++t) {
         if (neighbors[t] >= 0) neighbors[t] = cagra_pack_id(*ix, neighbors[t]);
@@ -1305,12 +1435,16 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
      tombstone section and resurrecting deleted rows. Failing closed is the point. */
   const bool has_tombstones =
       (ix->deleted_count > 0 && !ix->deleted.empty()) || !ix->generation.empty();
-  int32_t ver = has_tombstones ? 3 : 2;
-  f.write(reinterpret_cast<const char*>(&ver), 4);
+  const bool f16_store = ix->ds.x.empty() && !ix->ds.x16.empty();
   int32_t flags = 0;
-  if (include_dataset && ix->has_dataset && !ix->ds.x.empty()) flags |= 1;
+  if (include_dataset && ix->has_dataset && (!ix->ds.x.empty() || f16_store)) flags |= 1;
   if (ix->pq_m > 0 && !ix->codes.empty()) flags |= 2;
   if (has_tombstones) flags |= 4;
+  if (f16_store && (flags & 1)) flags |= 8;
+  /* v4 = fp16 dataset payload; older builds fail closed on it, exactly as v3 made them
+     fail closed on tombstones rather than resurrect deleted rows. */
+  int32_t ver = (flags & 8) ? 4 : (has_tombstones ? 3 : 2);
+  f.write(reinterpret_cast<const char*>(&ver), 4);
   f.write(reinterpret_cast<const char*>(&flags), 4);
   f.write(reinterpret_cast<const char*>(&ix->ds.n), 8);
   f.write(reinterpret_cast<const char*>(&ix->ds.dim), 8);
@@ -1320,8 +1454,13 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
   f.write(reinterpret_cast<const char*>(ix->graph.data()),
           static_cast<std::streamsize>(ix->graph.size() * sizeof(int32_t)));
   if (flags & 1) {
-    f.write(reinterpret_cast<const char*>(ix->ds.x.data()),
-            static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+    if (flags & 8) {
+      f.write(reinterpret_cast<const char*>(ix->ds.x16.data()),
+              static_cast<std::streamsize>(ix->ds.x16.size() * sizeof(uint16_t)));
+    } else {
+      f.write(reinterpret_cast<const char*>(ix->ds.x.data()),
+              static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+    }
   }
   if (flags & 2) {
     f.write(reinterpret_cast<const char*>(&ix->pq_m), 4);
@@ -1360,7 +1499,7 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
   if (magic != kCagraMagic) return OVVS_STATUS_IO;
   int32_t ver = 0;
   f.read(reinterpret_cast<char*>(&ver), 4);
-  if (ver > 3) return OVVS_STATUS_IO;
+  if (ver > 4) return OVVS_STATUS_IO;
   auto* ix = new CagraIndex();
   int32_t flags = 1;
   if (ver >= 2) f.read(reinterpret_cast<char*>(&flags), 4);
@@ -1374,9 +1513,17 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
   f.read(reinterpret_cast<char*>(ix->graph.data()),
          static_cast<std::streamsize>(ix->graph.size() * sizeof(int32_t)));
   if (flags & 1) {
-    ix->ds.x.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim));
-    f.read(reinterpret_cast<char*>(ix->ds.x.data()),
-           static_cast<std::streamsize>(ix->ds.x.size() * sizeof(float)));
+    const size_t count = static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->ds.dim);
+    if (flags & 8) {
+      ix->ds.x16.resize(count);
+      f.read(reinterpret_cast<char*>(ix->ds.x16.data()),
+             static_cast<std::streamsize>(count * sizeof(uint16_t)));
+      cagra_build_mirror8(ix);
+    } else {
+      ix->ds.x.resize(count);
+      f.read(reinterpret_cast<char*>(ix->ds.x.data()),
+             static_cast<std::streamsize>(count * sizeof(float)));
+    }
     ix->has_dataset = true;
   } else {
     ix->has_dataset = false;
@@ -1425,6 +1572,7 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
     delete ix;
     return OVVS_STATUS_IO;
   }
+  cagra_finalize_storage(ix); /* fp32 file + OVVS_CAGRA_F16=1: convert on load */
   *index = reinterpret_cast<ovvsCagraIndex_t>(ix);
   return OVVS_STATUS_SUCCESS;
 }
@@ -1517,6 +1665,33 @@ static int64_t cagra_mutate_chunk(int64_t n) {
   return std::clamp<int64_t>(n / 64, 256, 4096);
 }
 
+/* robust_prune over either storage form. fp32 goes straight through; fp16 materializes
+   the target and candidate rows into an fp32 scratch, runs the identical prune logic on
+   remapped local ids, and maps the kept ids back. The remap is stable because both the
+   wrapper and robust_prune sort ids ascending before deduping. */
+static void cagra_prune_rows(CagraIndex* ix, int64_t p, std::vector<int32_t>& cand, float alpha,
+                             int32_t* out_row) {
+  const int64_t dim = ix->ds.dim;
+  if (!ix->ds.x.empty()) {
+    robust_prune(ix->ds.x.data(), dim, ix->ds.metric, p, cand, ix->degree, alpha, out_row);
+    return;
+  }
+  std::sort(cand.begin(), cand.end());
+  cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+  std::vector<float> scratch((cand.size() + 1) * static_cast<size_t>(dim));
+  cagra_row_f32(*ix, p, scratch.data());
+  std::vector<int32_t> local(cand.size());
+  for (size_t i = 0; i < cand.size(); ++i) {
+    cagra_row_f32(*ix, cand[i], scratch.data() + (i + 1) * static_cast<size_t>(dim));
+    local[i] = static_cast<int32_t>(i + 1);
+  }
+  robust_prune(scratch.data(), dim, ix->ds.metric, 0, local, ix->degree, alpha, out_row);
+  for (int32_t tt = 0; tt < ix->degree; ++tt) {
+    const int32_t v = out_row[tt];
+    out_row[tt] = v > 0 ? cand[static_cast<size_t>(v - 1)] : -1;
+  }
+}
+
 /* Batched form of the insert/update repair `cagra_relink_one` performs: `count` rows
    whose vectors are already in place get their out-edges rebuilt from ONE batched
    graph_search -- the threaded CPU walk, so mutation finally uses every core -- and the
@@ -1543,16 +1718,17 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
   const int32_t degree = ix->degree;
   std::vector<float> qbuf(static_cast<size_t>(count) * static_cast<size_t>(dim));
   for (int64_t i = 0; i < count; ++i) {
-    std::copy(ix->ds.x.begin() + slots[i] * dim, ix->ds.x.begin() + (slots[i] + 1) * dim,
-              qbuf.begin() + i * dim);
+    cagra_row_f32(*ix, slots[i], qbuf.data() + i * dim);
   }
   std::vector<int64_t> nb(static_cast<size_t>(count) * static_cast<size_t>(degree));
   std::vector<float> nd(static_cast<size_t>(count) * static_cast<size_t>(degree));
+  const CagraStorage st = cagra_storage(*ix);
   const ovvsPolicy caller_policy = r.policy;
   r.policy = OVVS_POLICY_FORCE_CPU;
   const ovvsStatus status =
-      graph_search(r, ix->ds.x.data(), ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
-                   qbuf.data(), count, degree, degree * 2, 2, nullptr, nb.data(), nd.data());
+      graph_search(r, st.f32, ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
+                   qbuf.data(), count, degree, degree * 2, 2, nullptr, nb.data(), nd.data(),
+                   st.f16, st.u8);
   r.policy = caller_policy;
   if (status != OVVS_STATUS_SUCCESS) return status;
 
@@ -1599,8 +1775,7 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
       if (v >= 0) cand.push_back(v);
     }
     for (size_t l = groups[gi].first; l < groups[gi].second; ++l) cand.push_back(links[l].second);
-    robust_prune(ix->ds.x.data(), dim, ix->ds.metric, u, cand, degree, 1.2f,
-                 ix->graph.data() + u * degree);
+    cagra_prune_rows(ix, u, cand, 1.2f, ix->graph.data() + u * degree);
   };
 
   int64_t nthreads = [&]() -> int64_t {
@@ -1645,7 +1820,7 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
   if (!res || !index || !ids || !vectors || nids < 0) return OVVS_STATUS_INVALID_ARGUMENT;
   if (nids == 0) return OVVS_STATUS_SUCCESS;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
-  if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!cagra_dataset_present(*ix)) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* resources = rd(res);
   if (resources->policy == OVVS_POLICY_FORCE_NPU) {
     ++resources->npu_fallbacks;
@@ -1660,7 +1835,7 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
   }
   const int64_t dim = ix->ds.dim;
   try {
-    if (cagra_serial_mutate()) {
+    if (cagra_serial_mutate() && !cagra_is_f16(*ix)) {
       for (int64_t i = 0; i < nids; ++i) {
         const int64_t row = slots[static_cast<size_t>(i)];
         /* Keep the old vector so a failed relink can be undone; the graph rows the relink rewrites
@@ -1691,18 +1866,15 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
         std::vector<float> previous(static_cast<size_t>(cnt) * static_cast<size_t>(dim));
         for (int64_t i = 0; i < cnt; ++i) {
           const int64_t row = slots[static_cast<size_t>(base + i)];
-          std::copy(ix->ds.x.begin() + row * dim, ix->ds.x.begin() + (row + 1) * dim,
-                    previous.begin() + i * dim);
-          std::copy(vectors + (base + i) * dim, vectors + (base + i + 1) * dim,
-                    ix->ds.x.begin() + row * dim);
+          cagra_row_f32(*ix, row, previous.data() + i * dim);
+          cagra_write_row(ix, row, vectors + (base + i) * dim);
         }
         const ovvsStatus status =
             cagra_relink_batch(ix, *resources, slots.data() + base, cnt, nullptr);
         if (status != OVVS_STATUS_SUCCESS) {
           for (int64_t i = 0; i < cnt; ++i) {
             const int64_t row = slots[static_cast<size_t>(base + i)];
-            std::copy(previous.begin() + i * dim, previous.begin() + (i + 1) * dim,
-                      ix->ds.x.begin() + row * dim);
+            cagra_write_row(ix, row, previous.data() + i * dim);
           }
           return status;
         }
@@ -1750,7 +1922,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
                              int64_t nextra, int64_t* out_ids) {
   if (!res || !index || !extra || nextra <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* ix = reinterpret_cast<CagraIndex*>(index);
-  if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!cagra_dataset_present(*ix)) return OVVS_STATUS_INVALID_ARGUMENT;
   auto* resources = rd(res);
   if (resources->policy == OVVS_POLICY_FORCE_NPU) {
     ++resources->npu_fallbacks;
@@ -1781,13 +1953,20 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
       if (buffer.capacity() >= needed) return;
       buffer.reserve(std::max(needed, buffer.capacity() + buffer.capacity() / 2));
     };
-    grow(ix->ds.x, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+    if (!ix->ds.x16.empty()) {
+      grow(ix->ds.x16, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+      if (ix->mirror8_ok) {
+        grow(ix->mirror8, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+      }
+    } else {
+      grow(ix->ds.x, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+    }
     grow(ix->graph, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(ix->degree));
     std::vector<CagraGraphRowBackup> journal;
     bool failed = false;
     ovvsStatus failure = OVVS_STATUS_SUCCESS;
 
-    if (cagra_serial_mutate()) {
+    if (cagra_serial_mutate() && !cagra_is_f16(*ix)) {
       for (int64_t i = 0; i < nextra && !failed; ++i) {
         /* Reuse is only offered when the caller can be told which rows it got. Without out_ids a
            reused row would be invisible to them, so plain Extend keeps appending. */
@@ -1837,10 +2016,10 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
           const float* vec = extra + (base + i) * dim;
           int64_t reused = -1;
           if (out_ids != nullptr && cagra_claim_free_slot(ix, &reused)) {
-            reused_prev.emplace_back(
-                reused, std::vector<float>(ix->ds.x.begin() + reused * dim,
-                                           ix->ds.x.begin() + (reused + 1) * dim));
-            std::copy(vec, vec + dim, ix->ds.x.begin() + reused * dim);
+            std::vector<float> previous(static_cast<size_t>(dim));
+            cagra_row_f32(*ix, reused, previous.data());
+            reused_prev.emplace_back(reused, std::move(previous));
+            cagra_write_row(ix, reused, vec);
             if (ix->generation.empty()) ix->generation.assign(static_cast<size_t>(ix->ds.n), 0u);
             ++ix->generation[static_cast<size_t>(reused)];
             ix->deleted[static_cast<size_t>(reused) >> 3] &=
@@ -1850,8 +2029,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
             out_ids[base + i] = cagra_pack_id(*ix, reused);
           } else {
             const int64_t appended = ix->ds.n;
-            ix->ds.x.insert(ix->ds.x.end(), vec, vec + dim);
-            ix->ds.n = appended + 1;
+            cagra_append_row(ix, vec);
             slots[static_cast<size_t>(i)] = appended;
             if (out_ids != nullptr) out_ids[base + i] = appended;
           }
@@ -1862,7 +2040,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
           /* Give back this chunk's reused slots; appended rows are truncated below with
              the rest of the call, and the journal restore covers rewritten rows. */
           for (const auto& rp : reused_prev) {
-            std::copy(rp.second.begin(), rp.second.end(), ix->ds.x.begin() + rp.first * dim);
+            cagra_write_row(ix, rp.first, rp.second.data());
             ix->deleted[static_cast<size_t>(rp.first) >> 3] |=
                 static_cast<uint8_t>(1u << (rp.first & 7));
             ++ix->deleted_count;
@@ -1884,7 +2062,14 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
                     ix->graph.begin() + backup.row * ix->degree);
         }
       }
-      ix->ds.x.resize(static_cast<size_t>(original_n) * static_cast<size_t>(dim));
+      if (!ix->ds.x16.empty()) {
+        ix->ds.x16.resize(static_cast<size_t>(original_n) * static_cast<size_t>(dim));
+        if (ix->mirror8_ok) {
+          ix->mirror8.resize(static_cast<size_t>(original_n) * static_cast<size_t>(dim));
+        }
+      } else {
+        ix->ds.x.resize(static_cast<size_t>(original_n) * static_cast<size_t>(dim));
+      }
       ix->ds.n = original_n;
       ix->graph.resize(static_cast<size_t>(original_n) * static_cast<size_t>(ix->degree));
       return failure;

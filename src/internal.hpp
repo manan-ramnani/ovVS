@@ -25,6 +25,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#endif
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -68,6 +75,141 @@ inline float l2sq_u8(const uint8_t* a, const uint8_t* b, int64_t d) {
   }
   return static_cast<float>(s);
 }
+
+/* IEEE binary16 <-> binary32, round-to-nearest-even, no FPU environment involvement.
+   Integers up to 2048 convert exactly in both directions, so SIFT-class data stored as
+   fp16 loses nothing and distance results stay bitwise-equal to the fp32 path. */
+inline uint16_t f32_to_f16_bits(float value) {
+  uint32_t f;
+  std::memcpy(&f, &value, sizeof(f));
+  const uint16_t sign = static_cast<uint16_t>((f >> 16) & 0x8000u);
+  const uint32_t abs = f & 0x7FFFFFFFu;
+  if (abs > 0x7F800000u) return static_cast<uint16_t>(sign | 0x7E00u); /* NaN */
+  if (abs >= 0x47800000u) return static_cast<uint16_t>(sign | 0x7C00u); /* inf / overflow */
+  if (abs >= 0x38800000u) { /* normal half */
+    const uint32_t mant = abs & 0x7FFFFFu;
+    const uint32_t exp = (abs >> 23) - 112u;
+    uint32_t half = (exp << 10) | (mant >> 13);
+    const uint32_t rest = mant & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (half & 1u))) ++half; /* RNE; carry is fine */
+    return static_cast<uint16_t>(sign | half);
+  }
+  if (abs <= 0x33000000u) return sign; /* underflows to +-0 (2^-25 rounds to even 0) */
+  const uint32_t mant = (abs & 0x7FFFFFu) | 0x800000u; /* subnormal half */
+  const uint32_t shift = 126u - (abs >> 23);
+  uint32_t half = mant >> shift;
+  const uint32_t rest = mant & ((1u << shift) - 1u);
+  const uint32_t halfway = 1u << (shift - 1u);
+  if (rest > halfway || (rest == halfway && (half & 1u))) ++half;
+  return static_cast<uint16_t>(sign | half);
+}
+
+inline float f16_bits_to_f32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1Fu;
+  const uint32_t mant = h & 0x3FFu;
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = sign;
+    } else {
+      uint32_t e = 113u;
+      uint32_t m = mant;
+      while (!(m & 0x400u)) {
+        m <<= 1;
+        --e;
+      }
+      f = sign | (e << 23) | ((m & 0x3FFu) << 13);
+    }
+  } else if (exp == 31u) {
+    f = sign | 0x7F800000u | (mant << 13);
+  } else {
+    f = sign | ((exp + 112u) << 23) | (mant << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+
+inline void f16_row_to_f32(const uint16_t* src, float* dst, int64_t d) {
+  for (int64_t i = 0; i < d; ++i) dst[i] = f16_bits_to_f32(src[i]);
+}
+
+inline void f32_row_to_f16(const float* src, uint16_t* dst, int64_t d) {
+  for (int64_t i = 0; i < d; ++i) dst[i] = f32_to_f16_bits(src[i]);
+}
+
+/* Same accumulation order as l2sq, so on integer-valued data (exact halves, partial
+   sums under 2^24) the result is bitwise-equal to the fp32 walk. Half the bytes. */
+inline float l2sq_f16(const float* q, const uint16_t* row, int64_t d) {
+  float s = 0.f;
+  for (int64_t i = 0; i < d; ++i) {
+    const float t = q[i] - f16_bits_to_f32(row[i]);
+    s += t * t;
+  }
+  return s;
+}
+
+#if (defined(_M_X64) || defined(__x86_64__)) && defined(__clang__)
+/* Hardware half->float conversion: without it the scalar bit-twiddle turns the walk
+   compute-bound and eats the bandwidth win (measured 22K vs 38K fp32 at 100K). The
+   8-lane accumulation order differs from the scalar loop, which only matters on data
+   where fp16 already rounds -- on integer-valued corpora every partial sum is exact and
+   the result is still bitwise-equal to fp32. One path is chosen once per process. */
+__attribute__((target("avx2,fma,f16c"))) inline float l2sq_f16_avx2(const float* q,
+                                                                    const uint16_t* row,
+                                                                    int64_t d) {
+  __m256 acc = _mm256_setzero_ps();
+  int64_t i = 0;
+  for (; i + 8 <= d; i += 8) {
+    const __m256 b =
+        _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(row + i)));
+    const __m256 a = _mm256_loadu_ps(q + i);
+    const __m256 t = _mm256_sub_ps(a, b);
+    acc = _mm256_fmadd_ps(t, t, acc);
+  }
+  __m128 lo = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+  lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+  lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+  float s = _mm_cvtss_f32(lo);
+  for (; i < d; ++i) {
+    const float t = q[i] - f16_bits_to_f32(row[i]);
+    s += t * t;
+  }
+  return s;
+}
+
+inline bool cpu_has_avx2_f16c() {
+  int regs[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+  __cpuid(regs, 1);
+#else
+  __asm__ volatile("cpuid" : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
+                   : "a"(1), "c"(0));
+#endif
+  const bool f16c = (regs[2] & (1 << 29)) != 0;
+  const bool fma = (regs[2] & (1 << 12)) != 0;
+  const bool osxsave = (regs[2] & (1 << 27)) != 0;
+  if (!f16c || !fma || !osxsave) return false;
+  if ((_xgetbv(0) & 0x6) != 0x6) return false; /* OS saves YMM state */
+#if defined(_MSC_VER)
+  __cpuidex(regs, 7, 0);
+#else
+  __asm__ volatile("cpuid" : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
+                   : "a"(7), "c"(0));
+#endif
+  return (regs[1] & (1 << 5)) != 0; /* AVX2 */
+}
+
+inline float l2sq_f16_dispatch(const float* q, const uint16_t* row, int64_t d) {
+  static const bool fast = cpu_has_avx2_f16c();
+  return fast ? l2sq_f16_avx2(q, row, d) : l2sq_f16(q, row, d);
+}
+#else
+inline float l2sq_f16_dispatch(const float* q, const uint16_t* row, int64_t d) {
+  return l2sq_f16(q, row, d);
+}
+#endif
 
 inline float dot(const float* a, const float* b, int64_t d) {
   float s = 0.f;
@@ -455,6 +597,7 @@ struct UsmAllocator {
 
 using UsmFloatVec = std::vector<float, UsmAllocator<float>>;
 using UsmI32Vec = std::vector<int32_t, UsmAllocator<int32_t>>;
+using UsmU16Vec = std::vector<uint16_t, UsmAllocator<uint16_t>>;
 using UsmI64Vec = std::vector<int64_t, UsmAllocator<int64_t>>;
 using UsmU8Vec = std::vector<uint8_t, UsmAllocator<uint8_t>>;
 
@@ -502,10 +645,15 @@ OVVS_API ovvsStatus gpu_cagra_optimize_ranked(ResourcesData& r,
 const uint8_t* gpu_cagra_int8_mirror_host(ResourcesData& r, const float* dataset, int64_t rows,
                                           int64_t dim);
 void ovvs_gpu_mirror_invalidate();
+/* dataset may be null when dataset_f16 is provided (fp16 primary storage). In that
+   mode the GPU walk runs ONLY via dataset_u8 (the int8 mirror) and the caller must
+   guarantee every query qualifies for the int8 path -- the kernel never touches the
+   fp32 pointer then. dataset_f16 itself is reserved for the phase-2 fp16 kernel. */
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
-                    float* distances);
+                    float* distances, const uint16_t* dataset_f16 = nullptr,
+                    const uint8_t* dataset_u8 = nullptr);
 bool gpu_pairwise(ResourcesData& r, ovvsMetric metric, const float* x, int64_t nx, const float* y,
                   int64_t ny, int64_t dim, float* out, float metric_arg,
                   GpuWorkStats* stats = nullptr);
@@ -584,7 +732,8 @@ OVVS_API ovvsStatus cagra_optimize_ranked(const int32_t* initial, int64_t n,
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
-                           const uint8_t* bitset, int64_t* neighbors, float* distances);
+                           const uint8_t* bitset, int64_t* neighbors, float* distances,
+                           const uint16_t* dataset_f16 = nullptr, const uint8_t* dataset_u8 = nullptr);
 
 /* Temporary sweep instrument: OVVS_CAGRA_SEEDS pins the seed count so the recall-vs-QPS
    curve can be measured in one process instead of one rebuild per point. Read once.

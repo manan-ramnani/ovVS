@@ -497,15 +497,30 @@ ovvsStatus prim_cagra_optimize_ranked(ResourcesData& r, const int32_t* initial,
 ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,
                            ovvsMetric metric, const int32_t* graph, int32_t degree, const float* queries,
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
-                           const uint8_t* bitset, int64_t* neighbors, float* distances) {
+                           const uint8_t* bitset, int64_t* neighbors, float* distances,
+                           const uint16_t* dataset_f16, const uint8_t* dataset_u8) {
   /* The graph walk has no NPU implementation. A forced device must either run
      the complete walk or fail; it must never cross into the scalar host path. */
   if (r.policy == OVVS_POLICY_FORCE_NPU) return finish_forced_fail(r);
+  if (!dataset && !dataset_f16) return OVVS_STATUS_INVALID_ARGUMENT;
 
-  const bool gpu_metric_supported = metric == OVVS_METRIC_L2_EXPANDED ||
-                                    metric == OVVS_METRIC_L2_SQRT_EXPANDED ||
-                                    metric == OVVS_METRIC_INNER_PRODUCT ||
-                                    metric == OVVS_METRIC_COSINE_EXPANDED;
+  const bool metric_walkable = metric == OVVS_METRIC_L2_EXPANDED ||
+                               metric == OVVS_METRIC_L2_SQRT_EXPANDED ||
+                               metric == OVVS_METRIC_INNER_PRODUCT ||
+                               metric == OVVS_METRIC_COSINE_EXPANDED;
+  /* fp16 primary storage (dataset == null): the GPU kernel has no fp16 path yet, so it
+     may run ONLY when the whole batch can live on the int8 mirror -- mirror present and
+     every query integer-valued in [0,255]. The kernel then never touches the fp32
+     pointer. Anything else walks on the CPU, which reads fp16 directly. */
+  const bool gpu_dataset_ok = dataset != nullptr || [&]() -> bool {
+    if (!dataset_u8 || metric != OVVS_METRIC_L2_EXPANDED) return false;
+    for (int64_t i = 0; i < nq * dim; ++i) {
+      const float v = queries[i];
+      if (!(v >= 0.f && v <= 255.f && v == std::floor(v))) return false;
+    }
+    return true;
+  }();
+  const bool gpu_metric_supported = metric_walkable && gpu_dataset_ok;
   const bool gpu_policy = r.policy == OVVS_POLICY_AUTO ||
                           r.policy == OVVS_POLICY_GPU_IF_FASTER ||
                           r.policy == OVVS_POLICY_HETERO ||
@@ -560,7 +575,7 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
 
   if (gpu_policy && gpu_metric_supported && !hybrid_ok && !hetero_cpu_only) {
     if (gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width,
-                       bitset, neighbors, distances)) {
+                       bitset, neighbors, distances, dataset_f16, dataset_u8)) {
       r.last_device = OVVS_DEVICE_GPU;
       return OVVS_STATUS_SUCCESS;
     }
@@ -573,7 +588,8 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     gpu_worker = std::thread([&, cpu_begin]() {
       try {
         gpu_leg_ok = gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, cpu_begin,
-                                    k, itopk, search_width, bitset, neighbors, distances);
+                                    k, itopk, search_width, bitset, neighbors, distances,
+                                    dataset_f16, dataset_u8);
       } catch (...) {
         gpu_leg_ok = false; /* the CPU picks this range up after the join */
       }
@@ -596,10 +612,12 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     if (metric != OVVS_METRIC_L2_EXPANDED) return nullptr;
     const char* env = std::getenv("OVVS_CPU_INT8");
     if (env && *env && *env == '0') return nullptr;
-    return gpu_cagra_int8_mirror_host(r, dataset, n, dim);
+    if (dataset_u8) return dataset_u8; /* index-owned mirror (fp16 primary storage) */
+    return dataset ? gpu_cagra_int8_mirror_host(r, dataset, n, dim) : nullptr;
   }();
   auto score_ids = [&](const float* query, const uint8_t* q8_query,
                        const std::vector<int64_t>& ids, std::vector<float>& sc) -> ovvsStatus {
+    thread_local std::vector<float> f16_scratch;
     sc.resize(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
       const int64_t id = ids[i];
@@ -607,8 +625,17 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
         sc[i] = kInf;
         continue;
       }
-      sc[i] = q8_query ? l2sq_u8(q8_query, q8_rows + id * dim, dim)
-                       : distance_one(metric, query, dataset + id * dim, dim, 2.f);
+      if (q8_query) {
+        sc[i] = l2sq_u8(q8_query, q8_rows + id * dim, dim);
+      } else if (dataset) {
+        sc[i] = distance_one(metric, query, dataset + id * dim, dim, 2.f);
+      } else if (metric == OVVS_METRIC_L2_EXPANDED) {
+        sc[i] = l2sq_f16_dispatch(query, dataset_f16 + id * dim, dim);
+      } else {
+        f16_scratch.resize(static_cast<size_t>(dim));
+        f16_row_to_f32(dataset_f16 + id * dim, f16_scratch.data(), dim);
+        sc[i] = distance_one(metric, query, f16_scratch.data(), dim, 2.f);
+      }
     }
     return OVVS_STATUS_SUCCESS;
   };

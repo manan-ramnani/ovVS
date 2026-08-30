@@ -1368,4 +1368,46 @@ Append newest last. One line per real event: what landed, what number it produce
   now exists — audit is unblocked); merged CPU+GPU work queue (only matters ≥320K now);
   insert-effort sweep; L0 command-list reuse for the ~1.8 ms GPU floor; p99 under mixed
   read/write load (harness gap); 1M b1 0.46× (CPU singles latency-bound — L2 prefetch
-  of neighbor rows is the next idea there).
+  of neighbor rows is the next idea there).- **2026-08-31** — **FP16 PRIMARY STORAGE LANDED (`OVVS_CAGRA_F16=1`, opt-in): the B20
+  general-corpus lane opens, and G3 at 1M flips from 4.6% over to 26% UNDER hnswlib.**
+  (User directive: "lets go for the fp16 primary storage".)
+  **Design:** `Dataset.x16` (shared-USM binary16) replaces `x` when the mode is on — one
+  active representation, never both. Index-owned int8 `mirror8` (shared USM, GPU-readable)
+  replaces the Resources-cached mirror in this mode: updated in place by mutation, no
+  fingerprinting, can never serve stale rows; dropped permanently on the first ineligible
+  vector. Conversions are exact RNE both ways; integers ≤2048 round-trip losslessly, so
+  SIFT-class corpora stay BITWISE identical. Serialization v4 + flags bit 8 (fail-closed
+  for older builds, mirroring the v3 tombstone precedent); fp32 files convert on load
+  when the mode is on; v4 files halve on disk (1M: 640→384 MB). Walk plumbing:
+  `prim_graph_walk`/`gpu_cagra_walk`/`graph_search` gained trailing `dataset_f16` /
+  `dataset_u8` (defaulted — zero legacy call-site churn). The GPU has NO fp16 kernel yet
+  (phase 2): in fp16 mode it runs ONLY mirror-complete batches (mirror present + every
+  query integer-eligible, verified host-side) with the fp32 pointer NULL — audited that
+  the kernel int8 path never reads DS; a crash would have said otherwise, none did.
+  Mutation goes through generic row writers (fp16 convert + mirror coherence); the
+  serial-mutate escape hatch is fp32-only; PQ/quantize refuses fp16 (phase 2). A scalar
+  half→float walk was measured COMPUTE-bound (22.1K vs 38.2K fp32) → added an
+  `avx2,fma,f16c` target-attribute fast path (`_mm256_cvtph_ps` + FMA, cpuid-dispatched
+  once per process; icx accepts GNU target attributes in MSVC mode).
+  **Validation (9/9 CTest default mode at every step):**
+  - SIFT bit-exactness: recall EXACTLY 0.9962 (100K b1/b32/b1000 CPU) and 0.9735 (1M) in
+    fp16 mode; speeds match the int8-mirror path (b1000 96.2K CPU at 100K).
+  - **1M hetero with NO fp32 array in existence: 39.5K @ 0.9735** — GPU-whole off the
+    index-owned mirror, DS=nullptr.
+  - **Memory: 1M idle 574 / active 629 MB vs hnswlib 846 → G3 at 0.74×** (fp32 mode was
+    885, 1.05×). 100K idle 114 MB from a native v4 file (the fp32-file load path
+    transiently peaks higher — USM pool retention of the conversion buffer, noted).
+  - Churn G4 (noisy mutations stored as fp16, mirror drops round 1 as designed): recall
+    0.9642/0.9646/0.9646 vs fp32 0.9642/0.9644/0.9638 — equal or better every round.
+    FORCE_GPU on a mirror-less fp16 index correctly returns DEVICE_UNAVAILABLE
+    (phase-1 semantics; churn's f16 lane runs --search-policy cpu).
+  - **B20 preview (SIFT÷3 — every value inexact in fp16, ranking-invariant truth,
+    `tools/bench/f16_preview.py`): fp16 60.6K vs fp32 40.5K = 1.50× at recall
+    0.9953 vs 0.9959 (−0.0006), at half the resident bytes.** The general-embedding
+    lane now sits within ~1.6× of the int8-exact SIFT lane.
+  **Default stays OPT-IN until phase 2**: (a) fp16 GPU kernel (restores GPU for
+  non-integer corpora ≥320K and FORCE_GPU semantics); (b) load-policy for fp32 files
+  (auto-convert only when lossless, else require explicit opt-in — silent rounding of
+  float corpora on load is the one footgun); (c) PQ-on-fp16. Then flip the default and
+  the R2/R3 G3 story rides on it (10M×128 fp16 = 2.56 GB vectors — R3 stops needing SQ8
+  for G3, SQ8 becomes a pure speed lane).

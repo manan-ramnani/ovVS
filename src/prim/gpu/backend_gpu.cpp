@@ -2748,10 +2748,16 @@ void ovvs_gpu_mirror_invalidate() { g_usm_free_generation.fetch_add(1, std::memo
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
-                    float* distances) {
+                    float* distances, const uint16_t* dataset_f16, const uint8_t* dataset_u8) {
 #if defined(OVVS_WITH_SYCL)
+  (void)dataset_f16; /* reserved for the phase-2 fp16 kernel */
   if (!gpu_available()) return false;
-  if (!dataset || !graph || !queries || !neighbors || !distances) return false;
+  /* fp16 primary storage: no fp32 dataset. The walk can still run entirely on the
+     caller-provided int8 mirror; prim_graph_walk only offers such batches after
+     verifying every query qualifies for the int8 path, so the fp32 fallback branches
+     are provably dead and DS stays null. */
+  if (!dataset && !dataset_u8) return false;
+  if (!graph || !queries || !neighbors || !distances) return false;
   if (n <= 0 || nq <= 0 || k <= 0 || dim <= 0 || degree <= 0) return false;
   if (n > std::numeric_limits<int32_t>::max() || k > std::numeric_limits<int32_t>::max()) return false;
   if (metric != OVVS_METRIC_L2_EXPANDED && metric != OVVS_METRIC_L2_SQRT_EXPANDED &&
@@ -3007,7 +3013,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                          std::max<size_t>(2u, static_cast<size_t>(visit_budget) * visited_headroom));
     if (visited_capacity == 0 || visited_capacity > kMaxVisitedBytesPerQuery / sizeof(int32_t)) return false;
 
-    const bool ds_direct = gpu_pointer_accessible(q, dataset);
+    const bool ds_direct = dataset ? gpu_pointer_accessible(q, dataset) : true;
     const bool graph_direct = gpu_pointer_accessible(q, graph);
     const bool query_direct = gpu_pointer_accessible(q, queries);
     const bool out_i_direct = gpu_pointer_accessible(q, neighbors);
@@ -3033,7 +3039,10 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 
     /* Built and cached once per dataset; nullptr whenever the corpus is not exactly
        representable as uint8, in which case every path below stays fp32. */
-    const uint8_t* DS8 = ds_direct ? gpu_int8_mirror(r, q, dataset, N, D, ds_count) : nullptr;
+    const uint8_t* DS8 = dataset_u8 ? dataset_u8
+                         : (dataset && ds_direct ? gpu_int8_mirror(r, q, dataset, N, D, ds_count)
+                                                 : nullptr);
+    if (!dataset && !DS8) return false;
 
     const size_t visited_bytes_per_query = visited_capacity * sizeof(int32_t);
     size_t queries_per_launch = std::max<size_t>(1u, kVisitedAllocationTarget / visited_bytes_per_query);
@@ -3110,7 +3119,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 
     int32_t* QUEUE = QPW > 1 ? reinterpret_cast<int32_t*>(ws + off_queue) : nullptr;
 
-    if (!ds_direct) q.memcpy(ds_copy.get(), dataset, dataset_bytes);
+    if (!ds_direct && dataset) q.memcpy(ds_copy.get(), dataset, dataset_bytes);
     if (!graph_direct) q.memcpy(graph_copy.get(), graph, graph_bytes);
     if (QUEUE) q.memset(QUEUE, 0, sizeof(int32_t));
     sycl::event query_upload;
@@ -4465,6 +4474,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
   (void)bitset;
   (void)neighbors;
   (void)distances;
+  (void)dataset_f16;
+  (void)dataset_u8;
   return false;
 #endif
 }
