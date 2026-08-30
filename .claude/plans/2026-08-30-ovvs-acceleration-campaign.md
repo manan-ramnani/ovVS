@@ -1251,3 +1251,34 @@ Append newest last. One line per real event: what landed, what number it produce
   reuse / JIT cache); (5) cold-box certification now covers TWO leads: 100K (tie→lead)
   and 1M (1.70×, clear). JSONs: `out/matrix/perf-*.json` (+ `-pre-naware` snapshots),
   `mem-*.json`, `frontier-1m.json`.
+- **2026-08-31** — **PARALLEL BATCH INSERT/UPDATE LANDED (`cagra_relink_batch`): 7-14×
+  mutation throughput at EQUAL-OR-BETTER churn recall; update now BEATS hnswlib at 100K.**
+  (User-mandated: "why are our insertion and updates not multi threaded?") Design as
+  specced in the previous entry: chunks of clamp(n/64, 256, 4096); slot claiming stays
+  serial bookkeeping; ONE batched graph_search per chunk (pinned FORCE_CPU inside the
+  batch — the GPU keeps device mirrors and mutation-time invalidation has not been
+  audited); back-links grouped by target row, one robust_prune per distinct target with
+  all new candidates, parallel over disjoint rows (deterministic at any thread count).
+  Journal/unwind, slot reuse + generations, tombstone revival all preserved. Serial path
+  kept behind `OVVS_CAGRA_SERIAL_MUTATE=1`; knobs `OVVS_CAGRA_MUTATE_CHUNK`,
+  `OVVS_CAGRA_MUTATE_THREADS`. 9/9 CTest.
+  **G4 churn A/B (100K, 5 rounds, same seed, reuse mode): batched recall ≥ serial at
+  EVERY round** (0.9642/0.9644/0.9638/0.9616/0.9576 vs 0.9636/0.9638/0.9624/0.9606/
+  0.9574) — the grouped prune sees all candidates at once and picks better neighborhoods.
+  Slot reuse verified through the batched path (deleted returns to 0 every round).
+  **Matrix CRUD rows after (batch ops/s, ovvs vs hnsw):**
+  - insert: 10K 30.8K vs 131.4K (0.23×, was 0.02×); 100K 13.8K vs 23.1K (0.60×, was
+    0.06×); 1M 5.0K vs 9.0K (0.55×, was 0.11×). Lifts of 14×/10×/5.3×.
+  - update: 10K 27.4K vs 30.1K (0.91×); **100K 15.8K vs 12.9K (1.23× — AHEAD)**; 1M
+    5.1K vs 5.8K (0.87×). Was 0.08-0.17× everywhere.
+  - query rows reproduced within noise (0.49/0.62/0.49 · 0.72/1.63/0.99 · 0.58/3.25/1.67).
+  **Regression caught and fixed:** phase-B pool spawned 19 threads for a 32-group
+  single-op prune (+1.3 ms). Now one worker per ~64 groups; singles p50 landed BELOW the
+  old serial path (insert 0.609 ms vs 0.74; update 0.604 vs 0.74 — beats hnswlib update
+  singles 0.90 ms; insert singles 1.6× behind, from 2×).
+  **Reading of the residual gap:** batched insert is now bound by the SAME bandwidth wall
+  as the query walk (walk threads at ~6.2× on 20 cores) — the int8-mirror CPU leg lifts
+  queries AND mutation together. hnswlib insert is also intrinsically cheaper per op than
+  its own update; our insert search rides itopk=2×degree (sweepable later, one variable).
+  **NEXT (per the user work program): persistent CPU worker pool → patience port to the
+  CPU walk → int8 CPU leg; then recall-target mode design; cold-box certification last.

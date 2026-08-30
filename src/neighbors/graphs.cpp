@@ -1,7 +1,9 @@
 #include "internal.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <fstream>
+#include <thread>
 
 using namespace ovvs::impl;
 
@@ -1501,6 +1503,143 @@ static ovvsStatus cagra_relink_one(CagraIndex* ix, ResourcesData& r, int64_t row
   return OVVS_STATUS_SUCCESS;
 }
 
+/* Mutation batches are processed in chunks so a search never runs against a graph more
+   than ~1.5% of the corpus stale. OVVS_CAGRA_MUTATE_CHUNK overrides for sweeps. */
+static int64_t cagra_mutate_chunk(int64_t n) {
+  const char* env = std::getenv("OVVS_CAGRA_MUTATE_CHUNK");
+  if (env && *env) {
+    const long parsed = std::strtol(env, nullptr, 10);
+    if (parsed > 0) return static_cast<int64_t>(parsed);
+  }
+  return std::clamp<int64_t>(n / 64, 256, 4096);
+}
+
+/* Batched form of the insert/update repair `cagra_relink_one` performs: `count` rows
+   whose vectors are already in place get their out-edges rebuilt from ONE batched
+   graph_search -- the threaded CPU walk, so mutation finally uses every core -- and the
+   in-neighbours the new rows name are re-pruned once per distinct target row with every
+   new candidate at hand, instead of once per (insert, target) pair.
+
+   Output is deterministic for a given input at any thread count: back-link groups are
+   disjoint rows, and all candidates are collected before any prune runs. Relative to the
+   serial path the semantics differ in two measured-not-assumed ways (churn.py judges
+   both): searches inside one chunk see the graph as it stood at chunk entry, and a
+   target named by several inserts is pruned once with all of them together.
+
+   The search is pinned to the CPU engine: the GPU backend keeps device mirrors of the
+   dataset and graph, and running it mid-mutation would need a cache-invalidation audit
+   that has not happened. Mutation stays a CPU-side affair, as documented. */
+static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int64_t* slots,
+                                     int64_t count, std::vector<CagraGraphRowBackup>* journal) {
+  if (count <= 0) return OVVS_STATUS_SUCCESS;
+  const int64_t dim = ix->ds.dim;
+  const int32_t degree = ix->degree;
+  std::vector<float> qbuf(static_cast<size_t>(count) * static_cast<size_t>(dim));
+  for (int64_t i = 0; i < count; ++i) {
+    std::copy(ix->ds.x.begin() + slots[i] * dim, ix->ds.x.begin() + (slots[i] + 1) * dim,
+              qbuf.begin() + i * dim);
+  }
+  std::vector<int64_t> nb(static_cast<size_t>(count) * static_cast<size_t>(degree));
+  std::vector<float> nd(static_cast<size_t>(count) * static_cast<size_t>(degree));
+  const ovvsPolicy caller_policy = r.policy;
+  r.policy = OVVS_POLICY_FORCE_CPU;
+  const ovvsStatus status =
+      graph_search(r, ix->ds.x.data(), ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
+                   qbuf.data(), count, degree, degree * 2, 2, nullptr, nb.data(), nd.data());
+  r.policy = caller_policy;
+  if (status != OVVS_STATUS_SUCCESS) return status;
+
+  for (int64_t i = 0; i < count; ++i) {
+    const int64_t row = slots[i];
+    for (int32_t t = 0; t < degree; ++t) {
+      int32_t found = static_cast<int32_t>(nb[static_cast<size_t>(i * degree + t)]);
+      if (found == static_cast<int32_t>(row)) found = -1; /* never self-loop */
+      ix->graph[static_cast<size_t>(row * degree + t)] = found;
+    }
+  }
+
+  /* (target row, new in-neighbour) pairs, grouped by target row. */
+  std::vector<std::pair<int32_t, int32_t>> links;
+  links.reserve(static_cast<size_t>(count) * static_cast<size_t>(degree));
+  for (int64_t i = 0; i < count; ++i) {
+    for (int32_t t = 0; t < degree; ++t) {
+      const int32_t u = ix->graph[static_cast<size_t>(slots[i] * degree + t)];
+      if (u >= 0) links.emplace_back(u, static_cast<int32_t>(slots[i]));
+    }
+  }
+  std::sort(links.begin(), links.end());
+  std::vector<std::pair<size_t, size_t>> groups;
+  for (size_t b = 0; b < links.size();) {
+    size_t e = b + 1;
+    while (e < links.size() && links[e].first == links[b].first) ++e;
+    groups.emplace_back(b, e);
+    b = e;
+  }
+  if (journal) {
+    for (const auto& g : groups) {
+      const int64_t u = links[g.first].first;
+      const auto row_begin = ix->graph.begin() + u * degree;
+      journal->push_back({u, std::vector<int32_t>(row_begin, row_begin + degree)});
+    }
+  }
+
+  const auto prune_group = [&](size_t gi) {
+    const int64_t u = links[groups[gi].first].first;
+    std::vector<int32_t> cand;
+    cand.reserve(static_cast<size_t>(degree) + (groups[gi].second - groups[gi].first));
+    for (int32_t e = 0; e < degree; ++e) {
+      const int32_t v = ix->graph[static_cast<size_t>(u * degree + e)];
+      if (v >= 0) cand.push_back(v);
+    }
+    for (size_t l = groups[gi].first; l < groups[gi].second; ++l) cand.push_back(links[l].second);
+    robust_prune(ix->ds.x.data(), dim, ix->ds.metric, u, cand, degree, 1.2f,
+                 ix->graph.data() + u * degree);
+  };
+
+  int64_t nthreads = [&]() -> int64_t {
+    const char* env = std::getenv("OVVS_CAGRA_MUTATE_THREADS");
+    if (env && *env) {
+      const long parsed = std::strtol(env, nullptr, 10);
+      if (parsed > 0) return static_cast<int64_t>(parsed);
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    return hw > 0 ? static_cast<int64_t>(hw) : 1;
+  }();
+  /* One worker per ~64 groups: a single-op call has only `degree` tiny prunes, and
+     spawning a pool for that costs more than the prunes (measured +1.3 ms per single). */
+  nthreads = std::min<int64_t>(nthreads, static_cast<int64_t>(groups.size()) / 64);
+  if (nthreads <= 1) {
+    for (size_t gi = 0; gi < groups.size(); ++gi) prune_group(gi);
+    return OVVS_STATUS_SUCCESS;
+  }
+  std::atomic<size_t> next{0};
+  std::atomic<bool> threw{false};
+  auto worker = [&]() {
+    try {
+      for (size_t gi = next.fetch_add(1); gi < groups.size(); gi = next.fetch_add(1)) {
+        if (threw.load(std::memory_order_relaxed)) return;
+        prune_group(gi);
+      }
+    } catch (...) {
+      threw.store(true);
+    }
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<size_t>(nthreads - 1));
+  for (int64_t t = 1; t < nthreads; ++t) pool.emplace_back(worker);
+  worker();
+  for (auto& th : pool) th.join();
+  /* A throwing prune leaves some targets un-pruned; their rows still hold valid (older)
+     edges, so the graph stays consistent -- edges are hints. Report it all the same. */
+  if (threw.load()) return OVVS_STATUS_OOM;
+  return OVVS_STATUS_SUCCESS;
+}
+
+static bool cagra_serial_mutate() {
+  const char* env = std::getenv("OVVS_CAGRA_SERIAL_MUTATE");
+  return env && *env && *env != '0';
+}
+
 ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const int64_t* ids,
                            const float* vectors, int64_t nids) {
   if (!res || !index || !ids || !vectors || nids < 0) return OVVS_STATUS_INVALID_ARGUMENT;
@@ -1521,23 +1660,60 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
   }
   const int64_t dim = ix->ds.dim;
   try {
-    for (int64_t i = 0; i < nids; ++i) {
-      const int64_t row = slots[static_cast<size_t>(i)];
-      /* Keep the old vector so a failed relink can be undone; the graph rows the relink rewrites
-         are repaired by the relink itself on the next successful call, and leaving a stale edge
-         is safe because edges are only hints. Losing the caller's vector would not be. */
-      std::vector<float> previous(ix->ds.x.begin() + row * dim, ix->ds.x.begin() + (row + 1) * dim);
-      std::copy(vectors + i * dim, vectors + (i + 1) * dim, ix->ds.x.begin() + row * dim);
-      const ovvsStatus status = cagra_relink_one(ix, *resources, row);
-      if (status != OVVS_STATUS_SUCCESS) {
-        std::copy(previous.begin(), previous.end(), ix->ds.x.begin() + row * dim);
-        return status;
+    if (cagra_serial_mutate()) {
+      for (int64_t i = 0; i < nids; ++i) {
+        const int64_t row = slots[static_cast<size_t>(i)];
+        /* Keep the old vector so a failed relink can be undone; the graph rows the relink rewrites
+           are repaired by the relink itself on the next successful call, and leaving a stale edge
+           is safe because edges are only hints. Losing the caller's vector would not be. */
+        std::vector<float> previous(ix->ds.x.begin() + row * dim,
+                                    ix->ds.x.begin() + (row + 1) * dim);
+        std::copy(vectors + i * dim, vectors + (i + 1) * dim, ix->ds.x.begin() + row * dim);
+        const ovvsStatus status = cagra_relink_one(ix, *resources, row);
+        if (status != OVVS_STATUS_SUCCESS) {
+          std::copy(previous.begin(), previous.end(), ix->ds.x.begin() + row * dim);
+          return status;
+        }
+        /* Updating a tombstoned row revives it: the caller supplied a live vector for that id. */
+        if (cagra_row_deleted(*ix, row)) {
+          ix->deleted[static_cast<size_t>(row) >> 3] &=
+              static_cast<uint8_t>(~(1u << (row & 7)));
+          --ix->deleted_count;
+        }
       }
-      /* Updating a tombstoned row revives it: the caller supplied a live vector for that id. */
-      if (cagra_row_deleted(*ix, row)) {
-        ix->deleted[static_cast<size_t>(row) >> 3] &=
-            static_cast<uint8_t>(~(1u << (row & 7)));
-        --ix->deleted_count;
+    } else {
+      /* Batched: write a chunk of vectors, repair every touched row from one threaded
+         search. Failure restores this chunk's vectors (earlier chunks stand, exactly as
+         the serial path leaves earlier updates standing); stale edges are safe. */
+      const int64_t chunk = cagra_mutate_chunk(ix->ds.n);
+      for (int64_t base = 0; base < nids; base += chunk) {
+        const int64_t cnt = std::min<int64_t>(chunk, nids - base);
+        std::vector<float> previous(static_cast<size_t>(cnt) * static_cast<size_t>(dim));
+        for (int64_t i = 0; i < cnt; ++i) {
+          const int64_t row = slots[static_cast<size_t>(base + i)];
+          std::copy(ix->ds.x.begin() + row * dim, ix->ds.x.begin() + (row + 1) * dim,
+                    previous.begin() + i * dim);
+          std::copy(vectors + (base + i) * dim, vectors + (base + i + 1) * dim,
+                    ix->ds.x.begin() + row * dim);
+        }
+        const ovvsStatus status =
+            cagra_relink_batch(ix, *resources, slots.data() + base, cnt, nullptr);
+        if (status != OVVS_STATUS_SUCCESS) {
+          for (int64_t i = 0; i < cnt; ++i) {
+            const int64_t row = slots[static_cast<size_t>(base + i)];
+            std::copy(previous.begin() + i * dim, previous.begin() + (i + 1) * dim,
+                      ix->ds.x.begin() + row * dim);
+          }
+          return status;
+        }
+        for (int64_t i = 0; i < cnt; ++i) {
+          const int64_t row = slots[static_cast<size_t>(base + i)];
+          if (cagra_row_deleted(*ix, row)) {
+            ix->deleted[static_cast<size_t>(row) >> 3] &=
+                static_cast<uint8_t>(~(1u << (row & 7)));
+            --ix->deleted_count;
+          }
+        }
       }
     }
     if (ix->pq_m > 0 && !ix->codes.empty()) {
@@ -1611,41 +1787,91 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
     bool failed = false;
     ovvsStatus failure = OVVS_STATUS_SUCCESS;
 
-    for (int64_t i = 0; i < nextra && !failed; ++i) {
-      /* Reuse is only offered when the caller can be told which rows it got. Without out_ids a
-         reused row would be invisible to them, so plain Extend keeps appending. */
-      int64_t reused = -1;
-      if (out_ids != nullptr && cagra_claim_free_slot(ix, &reused)) {
-        std::vector<float> previous(ix->ds.x.begin() + reused * dim,
-                                    ix->ds.x.begin() + (reused + 1) * dim);
-        std::copy(extra + i * dim, extra + (i + 1) * dim, ix->ds.x.begin() + reused * dim);
-        if (ix->generation.empty()) ix->generation.assign(static_cast<size_t>(ix->ds.n), 0u);
-        ++ix->generation[static_cast<size_t>(reused)];
-        ix->deleted[static_cast<size_t>(reused) >> 3] &=
-            static_cast<uint8_t>(~(1u << (reused & 7)));
-        --ix->deleted_count;
-        const ovvsStatus status = cagra_relink_one(ix, *resources, reused);
+    if (cagra_serial_mutate()) {
+      for (int64_t i = 0; i < nextra && !failed; ++i) {
+        /* Reuse is only offered when the caller can be told which rows it got. Without out_ids a
+           reused row would be invisible to them, so plain Extend keeps appending. */
+        int64_t reused = -1;
+        if (out_ids != nullptr && cagra_claim_free_slot(ix, &reused)) {
+          std::vector<float> previous(ix->ds.x.begin() + reused * dim,
+                                      ix->ds.x.begin() + (reused + 1) * dim);
+          std::copy(extra + i * dim, extra + (i + 1) * dim, ix->ds.x.begin() + reused * dim);
+          if (ix->generation.empty()) ix->generation.assign(static_cast<size_t>(ix->ds.n), 0u);
+          ++ix->generation[static_cast<size_t>(reused)];
+          ix->deleted[static_cast<size_t>(reused) >> 3] &=
+              static_cast<uint8_t>(~(1u << (reused & 7)));
+          --ix->deleted_count;
+          const ovvsStatus status = cagra_relink_one(ix, *resources, reused);
+          if (status != OVVS_STATUS_SUCCESS) {
+            std::copy(previous.begin(), previous.end(), ix->ds.x.begin() + reused * dim);
+            ix->deleted[static_cast<size_t>(reused) >> 3] |=
+                static_cast<uint8_t>(1u << (reused & 7));
+            ++ix->deleted_count;
+            ix->free_slots.push_back(static_cast<int32_t>(reused));
+            failed = true;
+            failure = status;
+            break;
+          }
+          out_ids[i] = cagra_pack_id(*ix, reused);
+          continue;
+        }
+        const int64_t appended = ix->ds.n;
+        const ovvsStatus status = cagra_insert_one(ix, *resources, extra + i * dim, &journal);
         if (status != OVVS_STATUS_SUCCESS) {
-          std::copy(previous.begin(), previous.end(), ix->ds.x.begin() + reused * dim);
-          ix->deleted[static_cast<size_t>(reused) >> 3] |=
-              static_cast<uint8_t>(1u << (reused & 7));
-          ++ix->deleted_count;
-          ix->free_slots.push_back(static_cast<int32_t>(reused));
           failed = true;
           failure = status;
           break;
         }
-        out_ids[i] = cagra_pack_id(*ix, reused);
-        continue;
+        if (out_ids != nullptr) out_ids[i] = appended;
       }
-      const int64_t appended = ix->ds.n;
-      const ovvsStatus status = cagra_insert_one(ix, *resources, extra + i * dim, &journal);
-      if (status != OVVS_STATUS_SUCCESS) {
-        failed = true;
-        failure = status;
-        break;
+    } else {
+      /* Batched: claim slots and write vectors for a whole chunk, then repair every new
+         row from one threaded search. Slot claiming stays serial (it is bookkeeping);
+         the searches and the back-link prunes are where the time was. */
+      const int64_t chunk = cagra_mutate_chunk(original_n);
+      for (int64_t base = 0; base < nextra && !failed; base += chunk) {
+        const int64_t cnt = std::min<int64_t>(chunk, nextra - base);
+        std::vector<int64_t> slots(static_cast<size_t>(cnt));
+        std::vector<std::pair<int64_t, std::vector<float>>> reused_prev;
+        for (int64_t i = 0; i < cnt; ++i) {
+          const float* vec = extra + (base + i) * dim;
+          int64_t reused = -1;
+          if (out_ids != nullptr && cagra_claim_free_slot(ix, &reused)) {
+            reused_prev.emplace_back(
+                reused, std::vector<float>(ix->ds.x.begin() + reused * dim,
+                                           ix->ds.x.begin() + (reused + 1) * dim));
+            std::copy(vec, vec + dim, ix->ds.x.begin() + reused * dim);
+            if (ix->generation.empty()) ix->generation.assign(static_cast<size_t>(ix->ds.n), 0u);
+            ++ix->generation[static_cast<size_t>(reused)];
+            ix->deleted[static_cast<size_t>(reused) >> 3] &=
+                static_cast<uint8_t>(~(1u << (reused & 7)));
+            --ix->deleted_count;
+            slots[static_cast<size_t>(i)] = reused;
+            out_ids[base + i] = cagra_pack_id(*ix, reused);
+          } else {
+            const int64_t appended = ix->ds.n;
+            ix->ds.x.insert(ix->ds.x.end(), vec, vec + dim);
+            ix->ds.n = appended + 1;
+            slots[static_cast<size_t>(i)] = appended;
+            if (out_ids != nullptr) out_ids[base + i] = appended;
+          }
+        }
+        ix->graph.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->degree), -1);
+        const ovvsStatus status = cagra_relink_batch(ix, *resources, slots.data(), cnt, &journal);
+        if (status != OVVS_STATUS_SUCCESS) {
+          /* Give back this chunk's reused slots; appended rows are truncated below with
+             the rest of the call, and the journal restore covers rewritten rows. */
+          for (const auto& rp : reused_prev) {
+            std::copy(rp.second.begin(), rp.second.end(), ix->ds.x.begin() + rp.first * dim);
+            ix->deleted[static_cast<size_t>(rp.first) >> 3] |=
+                static_cast<uint8_t>(1u << (rp.first & 7));
+            ++ix->deleted_count;
+            ix->free_slots.push_back(static_cast<int32_t>(rp.first));
+          }
+          failed = true;
+          failure = status;
+        }
       }
-      if (out_ids != nullptr) out_ids[i] = appended;
     }
 
     if (failed) {
