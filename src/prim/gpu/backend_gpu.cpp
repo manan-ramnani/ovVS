@@ -2864,6 +2864,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
        8-slot SLM footprint. Falls back to one query per work-group otherwise.
        TEMPORARY opt-in: OVVS_CAGRA_QPW=8; the default stays 1 until the sweep verdict. */
     size_t QPW = 1u;
+    size_t bh_capacity = 1u; /* beam-membership hash entries per query (sub-group path) */
     /* Companion to the beam dedup in the sub-group path: a small per-query direct-mapped
        cache of rejected or evicted ids, probed (one SLM read) alongside the beam scan at
        commit. Filtering on ANY subset of previously-scored ids is exact -- the same
@@ -2875,7 +2876,12 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
        TEMPORARY tuning knob: OVVS_CAGRA_SEEN_RING (entries, rounded down to a power of two;
        0 disables; default 256). */
     size_t seen_ring = 0u;
-    if (qpw_requested == 8 && subgroup_geometry && force_sub_group_16 && beam_dedup &&
+    /* beam_dedup is no longer required for the sub-group mapping: req_gate showed the
+       fabric has ~8x request headroom at the walk's rates and achieved residency at
+       practical batches is ~150-170 queries (~5 MiB of visited tables, not the feared
+       16 MiB), so the classic global hash -- which avoids the dedup's +43% revisit evals
+       entirely -- is a legitimate sgq companion, selected via OVVS_CAGRA_BEAM_DEDUP=0. */
+    if (qpw_requested == 8 && subgroup_geometry && force_sub_group_16 &&
         work_group_size == 128u) {
       seen_ring = [&]() -> size_t {
         const char* env = std::getenv("OVVS_CAGRA_SEEN_RING");
@@ -2889,13 +2895,16 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
         return s;
       }();
       /* The sub-group path's own SLM footprint: beam + picks + one shared tile (ids
-         compacted in place) + a keep byte per tile entry + the optional seen cache.
-         Everything else lives in registers. Residency per Xe-core is 128KiB / (8 slots),
-         and every byte here costs resident queries, which are the mapping's entire point. */
+         compacted in place) + a keep byte per tile entry + the beam-membership hash + the
+         optional seen cache. Everything else lives in registers. Residency per Xe-core is
+         128KiB / (8 slots), and every byte here costs resident queries -- but req_gate
+         showed achieved residency at b1024 is fill-limited (~170 sub-groups) well below
+         the SLM cap, so the hash's half-KiB is free at practical batch sizes. */
+      bh_capacity = next_power_of_two(2u * BEAM);
       const size_t sg_slot_bytes =
           BEAM * (sizeof(int32_t) + sizeof(float) + sizeof(uint8_t)) + SW * sizeof(int32_t) +
           kFrontierTileSize * (sizeof(int32_t) + sizeof(uint8_t)) +
-          seen_ring * sizeof(int32_t) + 64u;
+          bh_capacity * sizeof(int32_t) + seen_ring * sizeof(int32_t) + 64u;
       size_t slots_bytes = 0;
       if (kFrontierTileSize <= 64u &&
           checked_product(sg_slot_bytes, static_cast<size_t>(8u), slots_bytes) &&
@@ -3104,6 +3113,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
          sycl::local_accessor<uint32_t, 1> query_hash_state(sycl::range<1>(1), h);
          sycl::local_accessor<uint8_t, 1> tile_keep(
              sycl::range<1>(QPW > 1 ? kFrontierTileSize * QPW : 1u), h);
+         sycl::local_accessor<int32_t, 1> beam_hash(
+             sycl::range<1>(QPW > 1 ? bh_capacity * QPW : 1u), h);
          sycl::local_accessor<int32_t, 1> seen_ids(
              sycl::range<1>(std::max<size_t>(1u, seen_ring * QPW)), h);
          auto walk_body = [=](sycl::nd_item<1> item) {
@@ -3143,6 +3154,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                 Mutable, because a persistent sub-group serves many queries in turn; the
                 lambdas below capture by reference and always see the current query. */
              size_t sq = 0;        /* the query this sub-group is currently serving */
+             size_t vbase = 0;     /* this query's visited-table region (hash mode) */
              uint32_t qhash = 0;
              int32_t s_count = 0;  /* beam occupancy */
              int32_t s_worst = 0;  /* worst beam slot */
@@ -3153,6 +3165,95 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              int64_t e_queries = 0, e_iters_total = 0, e_iters_max = 0;
              auto seen_slot = [&](int32_t id) {
                return (static_cast<uint32_t>(id) * 2654435761u) & (seen_ring - 1u);
+             };
+
+             /* Exact SLM hash of CURRENT beam membership: open addressing, linear probe,
+                -1 empty, -2 tombstone. Inserted on admission, tombstoned on eviction, and
+                rebuilt from the beam when tombstones crowd it, so membership equals
+                candidate_ids[0..s_count) at every commit -- the commit-time probe then
+                replaces an O(beam) SLM scan per candidate with ~1 read. req_gate showed the
+                walk is bookkeeping-bound with the beam scan as the largest term. */
+             const size_t hb = qslot * bh_capacity;
+             const uint32_t bh_mask = static_cast<uint32_t>(bh_capacity - 1u);
+             int32_t bh_tombs = 0;
+             auto bh_probe0 = [&](int32_t id) {
+               return (static_cast<uint32_t>(id) * 2654435761u) & bh_mask;
+             };
+             auto bh_contains = [&](int32_t id) {
+               uint32_t s = bh_probe0(id);
+               for (;;) {
+                 const int32_t v = beam_hash[hb + s];
+                 if (v == id) return true;
+                 if (v == -1) return false;
+                 s = (s + 1u) & bh_mask;
+               }
+             };
+             auto bh_insert = [&](int32_t id) {
+               uint32_t s = bh_probe0(id);
+               for (;;) {
+                 const int32_t v = beam_hash[hb + s];
+                 if (v < 0) { /* empty or tombstone */
+                   if (lane == 0) beam_hash[hb + s] = id;
+                   if (v == -2) --bh_tombs;
+                   sycl::group_barrier(subgroup);
+                   return;
+                 }
+                 s = (s + 1u) & bh_mask;
+               }
+             };
+             auto bh_remove = [&](int32_t id) {
+               uint32_t s = bh_probe0(id);
+               for (;;) {
+                 if (beam_hash[hb + s] == id) {
+                   if (lane == 0) beam_hash[hb + s] = -2;
+                   ++bh_tombs;
+                   sycl::group_barrier(subgroup);
+                   return;
+                 }
+                 s = (s + 1u) & bh_mask;
+               }
+             };
+             /* Classic visited-hash membership for the sub-group path (beam_dedup off):
+                the same CAS probe-and-insert as the work-group path, against this query's
+                claimed region. Only this sub-group ever touches the region; lanes of one
+                tile insert concurrently, and every id reaching it is tile-distinct. */
+             auto sg_visit_once = [&](int32_t id) {
+               using Slot = sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                             sycl::memory_scope::work_group,
+                                             sycl::access::address_space::global_space>;
+               const size_t vmask = visited_capacity - 1u;
+               size_t slot = (static_cast<uint32_t>(id) * 2654435761u) & vmask;
+               for (size_t probe = 0; probe < visited_capacity; ++probe) {
+                 Slot entry(VISITED[vbase + slot]);
+                 int32_t current = entry.load();
+                 if (current == id) return false;
+                 if (current == -1) {
+                   int32_t expected = -1;
+                   if (entry.compare_exchange_strong(expected, id)) return true;
+                   if (expected == id) return false;
+                 }
+                 slot = (slot + 1u) & vmask;
+               }
+               return false;
+             };
+
+             auto bh_rebuild_if_crowded = [&]() {
+               if (static_cast<size_t>(s_count + bh_tombs) * 4u < bh_capacity * 3u) return;
+               for (size_t i = lane; i < bh_capacity; i += sgsz) beam_hash[hb + i] = -1;
+               bh_tombs = 0;
+               sycl::group_barrier(subgroup);
+               for (int32_t s = 0; s < s_count; ++s) {
+                 const int32_t id = candidate_ids[cb + static_cast<size_t>(s)];
+                 uint32_t p = bh_probe0(id);
+                 for (;;) {
+                   if (beam_hash[hb + p] == -1) {
+                     if (lane == 0) beam_hash[hb + p] = id;
+                     break;
+                   }
+                   p = (p + 1u) & bh_mask;
+                 }
+                 sycl::group_barrier(subgroup);
+               }
              };
 
              auto sg_allowed = [&](int32_t id) {
@@ -3319,9 +3420,9 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                    seen = frontier_ids[fb + prev] == id;
                  }
                  if (!seen) {
-                   for (int32_t s = 0; s < s_count && !seen; ++s) {
-                     seen = candidate_ids[cb + static_cast<size_t>(s)] == id;
-                   }
+                   /* dedup mode: beam membership (revisits re-scored, then pre-filtered);
+                      hash mode: full visited membership, no revisit evals at all. */
+                   seen = beam_dedup ? bh_contains(id) : !sg_visit_once(id);
                  }
                  if (!seen && seen_ring != 0u) {
                    seen = seen_ids[rb + seen_slot(id)] == id;
@@ -3388,16 +3489,22 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                    }
                    ++s_count;
                    s_admit = 1;
+                   if (beam_dedup) bh_insert(id);
                  } else {
                    const float worst_distance =
                        candidate_distances[cb + static_cast<size_t>(s_worst)];
                    if (distance < worst_distance) {
-                     /* The evicted id leaves the beam and would otherwise become invisible
-                        to the dedup; remember it before it is overwritten. */
+                     /* The evicted id leaves the beam: retire it from the membership hash
+                        (and optionally remember it in the seen cache) before the slot is
+                        overwritten. */
+                     const int32_t evicted_id =
+                         candidate_ids[cb + static_cast<size_t>(s_worst)];
                      if (seen_ring != 0u && lane == 0) {
-                       const int32_t evicted_id =
-                           candidate_ids[cb + static_cast<size_t>(s_worst)];
                        seen_ids[rb + seen_slot(evicted_id)] = evicted_id;
+                     }
+                     if (beam_dedup) {
+                       bh_remove(evicted_id);
+                       bh_insert(id);
                      }
                      if (lane == 0) {
                        candidate_ids[cb + static_cast<size_t>(s_worst)] = id;
@@ -3427,6 +3534,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                      const uint32_t worst =
                          sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
                      s_worst = static_cast<int32_t>(worst);
+                     if (beam_dedup) bh_rebuild_if_crowded();
                    }
                  }
                }
@@ -3574,6 +3682,15 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                if (lane == 0) qhash = cagra_query_hash(Q + sq * D, static_cast<int64_t>(D));
                qhash = sycl::group_broadcast(subgroup, qhash, 0);
                load_query_regs();
+               if (beam_dedup) {
+                 for (size_t i = lane; i < bh_capacity; i += sgsz) beam_hash[hb + i] = -1;
+                 bh_tombs = 0;
+               } else {
+                 vbase = static_cast<size_t>(claimed) * visited_capacity;
+                 for (size_t i = lane; i < visited_capacity; i += sgsz) {
+                   VISITED[vbase + i] = -1;
+                 }
+               }
                for (size_t i = lane; i < seen_ring; i += sgsz) seen_ids[rb + i] = -1;
                sycl::group_barrier(subgroup);
                serve_query();

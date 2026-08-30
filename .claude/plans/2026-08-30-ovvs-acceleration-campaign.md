@@ -1032,3 +1032,25 @@ Append newest last. One line per real event: what landed, what number it produce
   under self-inflicted SLM serialization. (b) locality reorder of the uint8 mirror +
   permuted adjacency. (c) VTune GUI session for the LSC grid stays optional — the gate
   answered the question CLI VTune could not.
+- **2026-08-30** — **Committed and pushed everything to origin/main** (`0adefa3` kernel,
+  `4c87eaf` gates incl. req_gate + sg_gate force-added under out/, `53e7386` docs).
+- **2026-08-30** — **BEAM-HASH DIET: NEUTRAL (median 1.017 of 3 noisy pairs, d32 32/2
+  b1024).** Exact SLM open-addressed hash of beam membership (insert on admit, tombstone
+  on evict, amortized rebuild) replacing the O(beam) commit scan — bit-identical counters,
+  9/9 CTest. Verdict: the beam scan was NOT the dominant bookkeeping term (pipelined SLM
+  reads are cheap); kept for its asymptotics at larger beams. Attribution lesson: "~73%
+  bookkeeping" was right in total but wrong about the largest single term.
+- **2026-08-30** — **QPW8 + GLOBAL VISITED HASH: THE CROSSOVER. 0.955 at b1024, 1.014 at
+  b4096 — the first configuration where the sub-group mapping beats the classic one.**
+  req_gate's data un-parked the idea: the fabric has ~8× request headroom and achieved
+  residency is ~150-170 queries (~5 MiB of tables, not the feared 16 MiB), so the sgq gate
+  no longer requires beam_dedup; hash mode (`OVVS_CAGRA_QPW=8 OVVS_CAGRA_BEAM_DEDUP=0`)
+  wires per-query claimed visited regions (cleared at claim time) into sg_commit.
+  **evals/q back to 1303.7 — bit-identical to the classic path; 9/9 CTest in all three
+  modes.** Interleaved pairs vs qpw1, d32 32/2: b1024 0.957/0.947/0.955/0.961/0.951 →
+  **median 0.955** (was 0.840 with dedup — the +43% eval tax was the dominant qpw8 loss,
+  not the scans); b4096 1.009/1.014/1.019 → **median 1.014, rising with batch** while qpw1
+  is flat. **Defaults unchanged (qpw1 remains the Bar-B champion); qpw8's preferred
+  companion is now the global hash, with dedup mode retained behind its knob as the
+  SLM-resident fallback.** The sgq mapping is the batch-scaling asset for R2/R3, where
+  practical batch sizes grow with the corpus.
