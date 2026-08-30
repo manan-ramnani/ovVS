@@ -1184,3 +1184,70 @@ Append newest last. One line per real event: what landed, what number it produce
   Open tuning: the 128 crossover and 0.55 fraction are R1-measured constants — make them
   n-aware for R2/R3 (per-query cost grows with corpus on both engines; re-measure at 1M
   before promoting HETERO to the recommended default in docs).
+- **2026-08-31** — **FULL MATRIX AT 10K/100K/1M LANDED (`tools/bench/matrix.py`) AND IT
+  FORCED THE ROUTING TO GO n-AWARE — WHICH FLIPPED THE 1M RUNG TO A 1.70× LEAD.**
+  New harness: both engines in one process, alternating timed rounds (ab_g1 discipline);
+  query at b1/b32/b1000 with p50/p95/p99; insert/update/delete alternating engines over
+  identical mutation streams; hnswlib ef auto-calibrated per scale to match ovVS recall;
+  memory in dedicated single-engine processes (`mem` phase, psapi working-set). Scales:
+  `10k` rung added to SCALES; `sift10k-d32.ovvs` (0.8 s) and `sift1m-d32.ovvs` (92.7 s,
+  640 MB) built. hnswlib indexes saved to `out/matrix/hnsw-*.bin` for the mem probes.
+  1. **The R1 constants were inverted at both ends of the ladder.** Probes (solo windows,
+     b1000 32/2): 10K rows — CPU-only 118.6K vs GPU-only 53.9K vs shipped split 77.5K
+     (the f=0.55 split DRAGGED the fast CPU behind the slow GPU leg). 1M rows — GPU-only
+     38.9K vs CPU-only 9.9K vs shipped split 15.3K; fraction sweep monotonic to f=0.95
+     (36.3K) and still under GPU-only: at 1M the CPU leg costs the GPU more bandwidth
+     than it contributes. Crossover probe at 1M: GPU wins from b32 already (17.0K vs
+     4.6K); CPU only wins singles (0.35 vs ~1.8 ms) → crossover ≈ 8.
+  2. **HETERO is now n-aware (mixer.cpp, landed, 9/9 CTest):** rows < 32K → CPU always
+     (GPU never wins there); 32K–320K → crossover nq=128, split f=0.55 (R1 optimum);
+     rows ≥ 320K → crossover nq=8, GPU takes the batch WHOLE (no CPU leg). Env overrides
+     unchanged; an explicit OVVS_HYBRID_WALK forces a split at any n.
+  3. **Matrix after the change (shared-window, matched recall; ovvs/hnsw):**
+     - 10K (0.9996/0.9997, ef=112): b1 12.4K vs 24.8K (0.50×); b32 19.4K vs 27.1K
+       (0.72×); b1000 120.3K vs 240.6K (0.50×, was 0.34× pre-change). hnswlib keeps the
+       tiny-corpus rung — L2-resident index, zero dispatch overhead to amortize.
+     - 100K (0.9962/0.9959, ef=96): b1 4.4K vs 6.6K (0.66×); b32 12.1K vs 6.3K
+       (**1.93×**); b1000 45.9K vs 48.3K (0.95× — the known statistical-tie zone on a
+       hot box; pooled-median standing remains ~+7% ovVS).
+     - 1M (0.9735/0.9728, ef=80): b1 2.7K vs 4.7K (0.58×); b32 16.1K vs 5.1K
+       (**3.18×**); b1000 **35.9K vs 21.2K (1.70×)** — first shared-window LEAD at the
+       R2 rung, and it is not a tie: p50 26.2 ms vs 46.5 ms.
+     - CRUD (batch ops/s, ovvs vs hnsw): insert 2.2K/1.3K/0.9K vs 90.5K/21.7K/8.8K
+       (0.02–0.11×); update 2.2K/1.4K/1.0K vs 27.8K/12.8K/5.9K (0.08–0.17×); delete
+       36M/135M/79M vs 1.8M/1.3M/1.1M (20–113×). Single-op p50: our UPDATE already beats
+       theirs at 100K+ (0.74 vs 0.92 ms; 1.13 vs 1.43 ms at 1M) — the batch deficit is
+       pure threading, not per-op cost.
+     - Memory (active working set, ovvs vs hnsw): 10K 91 vs 16 MB (SYCL runtime floor
+       dominates small corpora); 100K 194 vs 93 MB; 1M **885 vs 846 MB — idle 702 vs 810
+       PASSES G3, active exceeds by ~4.6%** (GPU workspace + JIT). hnsw 1M active 846 MB
+       reproduces the pinned 842.6 MB number.
+  4. **1M QPS-vs-recall frontier (`tools/bench/frontier_1m.py`, interleaved): ovVS
+     dominates the ENTIRE curve, and the lead grows as recall drops.** ovvs 16/2 0.9271 @
+     62.6K vs ef32 0.8927 @ 41.2K (higher recall AND 1.5×); 24/2 0.9585 @ 46.0K vs ef64
+     0.9604 @ 20.2K (**2.3×**); 32/2 0.9735 @ 38.4K vs ef80 0.9728 @ 20.3K (1.9×); 48/2
+     0.9866 @ 22.9K vs ef128 0.9883 @ 13.7K (~1.7×); 64/2 0.9918 @ 15.0K. Answer to the
+     user question "keep effort lower/dynamic to maximize throughput": yes — measured.
+  5. **Why insert/update are slow — read and attributed:** `ovvsCagraExtendEx` loops
+     `cagra_insert_one` serially; each is ~75-80% read-only graph_search + append +
+     back-link robust_prune of ≤degree rows. hnswlib inserts on 20 threads at EQUAL
+     per-core cost. Parallel design (queued, output-changing so it needs churn.py G4
+     re-validation): phase A — batch searches against the frozen pre-chunk graph on the
+     work-stealing pool (embarrassingly parallel); phase B — reserve slots serially,
+     write disjoint new rows in parallel, group back-links by target row (sort by u,
+     one prune per u with all its new candidates at once — fewer prunes than serial).
+     Chunk at ≤1-5% of n to bound staleness; optional intra-chunk knn via one C×C GEMM.
+     Projection at 20 cores: ~15-40K inserts/s → would beat hnswlib at every scale.
+  **User directives recorded:** this box is the optimization target, then other systems
+  at various scales; ovVS must scale smoothly (best recall + throughput the HW allows at
+  every load); dynamic/lower effort is wanted where we have margin; CRUD threading asked
+  for explicitly ("why are our insertion and updates not multi threaded?").
+  **Queue reprioritized:** (1) parallel batch insert/update per the design above — flips
+  the last losing row class; (2) b1/small-corpus lifts: persistent CPU pool (spawns 20
+  threads per call today), int8 CPU leg (4× bandwidth), patience port to the CPU walk —
+  these attack b1 0.5-0.66× and the 10K rung; (3) recall-target mode ("give me ≥τ"):
+  per-index frontier calibration table picks (engine, itopk, patience) — the productized
+  form of the dynamic-effort ask; (4) G3 at 1M: shave the ~40 MB active overage (workspace
+  reuse / JIT cache); (5) cold-box certification now covers TWO leads: 100K (tie→lead)
+  and 1M (1.70×, clear). JSONs: `out/matrix/perf-*.json` (+ `-pre-naware` snapshots),
+  `mem-*.json`, `frontier-1m.json`.

@@ -35,7 +35,7 @@ POLICY_FORCE_GPU = 5
 POLICY_FORCE_CPU = 6
 
 # Rungs of the scale ladder. Win at each before climbing.
-SCALES = {"100k": 100_000, "1m": 1_000_000}
+SCALES = {"10k": 10_000, "100k": 100_000, "1m": 1_000_000}
 
 # (itopk_size, search_width, query_batch_size)
 # Batch 256/1024 matter: hnswlib's binding collapses to ONE thread when

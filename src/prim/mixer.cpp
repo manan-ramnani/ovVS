@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <thread>
 
 namespace ovvs {
@@ -524,19 +525,33 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     if (!(parsed > 0.0) || parsed >= 1.0) return 0.0;
     return parsed;
   }();
-  /* OVVS_POLICY_HETERO is the adaptive "turbo hybrid": below the crossover the batch takes
-     the low-latency CPU path outright (a lone query answers in ~0.18 ms there against
-     ~1.9 ms spinning up the GPU); past it the GPU spools up alongside and the batch
-     splits at the measured optimum. Thresholds are R1-measured defaults, env-overridable
-     for sweeps (OVVS_HYBRID_MIN_NQ, OVVS_HYBRID_WALK) until they become n-aware. */
+  /* OVVS_POLICY_HETERO is the adaptive "turbo hybrid": below the nq crossover the batch
+     takes the low-latency CPU path outright (a lone query answers in ~0.18-0.33 ms there
+     against ~1.8 ms spinning up the GPU); past it the GPU spools up. The routing is
+     n-aware, because the engines scale oppositely with corpus size (measured on Arrow
+     Lake-S 265K + Xe-LPG, SIFT-128, b1000):
+       - small corpus (<32K rows): the threaded CPU walk wins at EVERY batch size
+         (10K rows: 118.6K vs 53.9K QPS) -> never spin up the GPU;
+       - mid corpus: R1 optimum, crossover nq=128, split f=0.55 (61.4K at 100K rows);
+       - large corpus (>=320K rows): the GPU walk keeps scaling while the CPU walk goes
+         bandwidth-bound (1M rows: 38.9K vs 9.9K), and past f=0.95 the CPU leg still
+         costs the GPU more bandwidth than it contributes -> above a small crossover
+         the batch goes to the GPU whole.
+     OVVS_HYBRID_MIN_NQ / OVVS_HYBRID_WALK override the crossover / fraction for sweeps;
+     an explicit fraction forces a split at any corpus size. */
   const bool hetero = r.policy == OVVS_POLICY_HETERO;
+  const bool hetero_small = hetero && n < 32000;
+  const bool hetero_large = hetero && n >= 320000;
   const int64_t hetero_min_nq = [&]() -> int64_t {
     const char* env = std::getenv("OVVS_HYBRID_MIN_NQ");
-    if (!env || !*env) return 128;
-    const long parsed = std::strtol(env, nullptr, 10);
-    return parsed > 0 ? static_cast<int64_t>(parsed) : 128;
+    if (env && *env) {
+      const long parsed = std::strtol(env, nullptr, 10);
+      if (parsed > 0) return static_cast<int64_t>(parsed);
+    }
+    if (hetero_small) return std::numeric_limits<int64_t>::max();
+    return hetero_large ? 8 : 128;
   }();
-  if (hetero && hybrid_frac == 0.0 && gpu_metric_supported) hybrid_frac = 0.55;
+  if (hetero && hybrid_frac == 0.0 && gpu_metric_supported && !hetero_large) hybrid_frac = 0.55;
   const bool hetero_cpu_only = hetero && nq < hetero_min_nq;
   const bool hybrid_ok = !hetero_cpu_only && hybrid_frac > 0.0 && gpu_metric_supported &&
                          nq >= 2 &&
