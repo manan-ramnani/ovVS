@@ -36,6 +36,14 @@ int main(int argc, char** argv) {
   const size_t row_bytes = arg(argc, argv, "--row-bytes", 128);
   const size_t steps = arg(argc, argv, "--steps", 20000);
   const size_t reps = arg(argc, argv, "--reps", 3);
+  // Burst-locality probe: each dependent step reads a CLUSTER of `cluster` rows -- the
+  // base row jumps uniformly (dependent, chase-style; deliberately NOT a bounded walk,
+  // whose 1-D recurrence manufactures L2 revisit hits the dedup'd graph walk never gets),
+  // and the cluster's other rows land within +/-window rows of the base (0 = uniform,
+  // i.e. no clustering). Models what a graph-locality reorder actually changes: the tile
+  // gather's rows arriving page-together, at unchanged footprint and zero revisits.
+  const size_t window = arg(argc, argv, "--window", 0);
+  const size_t cluster = arg(argc, argv, "--cluster", 1);
 
   const size_t rows = size_t{1} << rows_log2;
   const size_t dpr = row_bytes / 4;   // dwords per row
@@ -73,6 +81,8 @@ int main(int argc, char** argv) {
   const uint32_t mask = static_cast<uint32_t>(rows - 1);
   const int K = static_cast<int>(steps);
   const int B = static_cast<int>(burst);
+  const int G = static_cast<int>(cluster);
+  const uint32_t win = static_cast<uint32_t>(window);
 
   auto launch = [&]() {
     return q.submit([&](sycl::handler& h) {
@@ -88,12 +98,24 @@ int main(int argc, char** argv) {
               // Dependent chase: exactly one row outstanding per sub-group, the walk's
               // score-loop shape. Chain latency = elapsed / K.
               uint32_t row = (gsg * 2654435761u) & mask;
+              uint32_t lcg = gsg * 747796405u + 2891336453u;
               for (int k = 0; k < K; ++k) {
-                const size_t base = static_cast<size_t>(row) * dpr + lane * lpw;
-                const uint32_t v0 = buf[base];
-                acc += v0;
-                if (lpw > 1) acc += buf[base + 1];
-                row = sycl::group_broadcast(sg, v0, 0) & mask; // dword0 = next row
+                uint32_t v0first = 0;
+                for (int g = 0; g < G; ++g) {
+                  uint32_t r = row;
+                  if (g != 0) {
+                    lcg = lcg * 1664525u + 1013904223u;
+                    r = (win == 0u) ? (lcg & mask)
+                                    : ((row + (lcg % (2u * win + 1u)) - win) & mask);
+                  }
+                  const size_t base = static_cast<size_t>(r) * dpr + lane * lpw;
+                  const uint32_t v0 = buf[base];
+                  acc += v0;
+                  if (lpw > 1) acc += buf[base + 1];
+                  if (g == 0) v0first = v0;
+                }
+                /* the base always jumps uniformly: dependent, recurrence-free */
+                row = sycl::group_broadcast(sg, v0first, 0) & mask;
               }
             } else if (B == 2) {
               uint32_t x0 = gsg * 2654435761u + 1u, x1 = gsg * 2246822519u + 2u;
@@ -150,13 +172,15 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     launch().wait();
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    const double reads = static_cast<double>(sub_groups) * K * B;
+    const double reads =
+        static_cast<double>(sub_groups) * K * B * (B == 1 ? cluster : 1u);
     best_rate = std::max(best_rate, reads / s);
   }
   const double gbps = best_rate * static_cast<double>(row_bytes) / 1e9;
-  std::printf("wgs=%zu sgs=%zu fp=%zuMiB row=%zuB burst=%zu  rows/s=%.1fM  GB/s=%.2f  chain_ns=%.0f\n",
-              wgs, sub_groups, rows * row_bytes >> 20, row_bytes, burst, best_rate / 1e6, gbps,
-              burst == 1 ? 1e9 * sub_groups / best_rate : 0.0);
+  std::printf(
+      "wgs=%zu sgs=%zu fp=%zuMiB row=%zuB burst=%zu clu=%zu win=%zu  rows/s=%.1fM  GB/s=%.2f\n",
+      wgs, sub_groups, rows * row_bytes >> 20, row_bytes, burst, cluster, window,
+      best_rate / 1e6, gbps);
   sycl::free(buf, q);
   sycl::free(out, q);
   return 0;

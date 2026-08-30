@@ -1054,3 +1054,49 @@ Append newest last. One line per real event: what landed, what number it produce
   companion is now the global hash, with dedup mode retained behind its knob as the
   SLM-resident fallback.** The sgq mapping is the batch-scaling asset for R2/R3, where
   practical batch sizes grow with the corpus.
+- **2026-08-31** — **GRAPH-LOCALITY REORDER (tick-4 direction): REFUTED BY PROBE, PARKED
+  BEFORE IMPLEMENTATION.** req_gate gained `--window`/`--cluster` modes to bound the
+  reorder's ceiling at UNCHANGED footprint. Two traps and a verdict, all measured:
+  1. ⚠ A bounded ±W chase first showed "3.7×" (446M → 1,640M rows/s) — **artifact**: a
+     bounded 1-D walk is recurrent, so the gain was L2 revisit hits, which the dedup'd
+     walk can never have. Same lesson as sg_gate: make the probe's working set honest.
+  2. The honest probe — uniform-jumping dependent base + G−1 clustered reads per step
+     (burst locality, zero revisits): **clustering HURTS. cluster=8: uniform 513M vs
+     ±1024-row window 352M (−31%); cluster=32: 676M vs 313M (−54%).** Uniformly random
+     concurrent requests spread across DRAM channels/banks; clustered bursts serialize on
+     few of them. On this shared-DDR5 SoC, co-locating co-accessed rows is anti-optimal
+     at fixed footprint.
+  3. Bonus: cluster=32 uniform reached **676M rows/s** — more independent reads per
+     dependent hop beats the plain chase's 586M; the walk's batched gather shape is right.
+  **Do not revisit row reordering without a mechanism that SHRINKS the working set**
+  (that is what the 2-MiB 2.26B rows/s ceiling rewards — quantization/B20, not permutation).
+  **NEXT: d32 patience sweep** — never swept at d32 (tuned only at d16, flagged in §9 at
+  the time); pure env knob. p∈{1..4} at d32 `32/2`, recall/evals by counters first, then
+  matched-recall ab_g1 pairs vs hnswlib at the measured-ef curve. The fastest remaining
+  path to a G1 verdict with zero new code.
+- **2026-08-31** — **d32 PATIENCE FRONTIER SWEPT + G1 RE-SCORED AT MATCHED RECALL: gap
+  ≈ 1.11× at both practical recall points.** Frontier (counters, d32 `32/2`): p4 0.9922 @
+  1,064 evals / 25.5 iters; p5 0.9942 @ 1,131; p6 0.9953 @ 1,176; p0 0.9962 @ 1,304.
+  ab_g1 matched-recall pairs (b1024, 20t, in-process; judge lane spreads):
+  - `32/2 p4` (0.9922) vs `ef=80` (0.9923-0.9927 — equal/higher, fair): run 1 median 1.369
+    but ovVS lane unstable (39-51K, 30% spread) → discarded per the tick-5 rule; run 2 with
+    stable ovVS lane (44.8-51.2K): ratios 0.973/1.109/1.123/1.199/1.042 → **median 1.109**.
+  - `32/2 p6` (0.9953) vs `ef=96` (0.9957): **median 1.114** (both lanes wobbly ~30%).
+  Note both engines read HIGH tonight (ovVS p4 51-53K in ovVS-only pairs; hnswlib ef=80
+  49-57K) — box in a strong state; the shared-window ratios are the trustworthy quantity.
+  **G1 NOT passed; the honest gap is ~1.11×, down from 1.34-1.37× at yesterday's morning
+  baseline.** JSONs: `out/quick/g1-d32-p4-ef80{,-r2}.json`, `g1-d32-p6-ef96.json`.
+- **2026-08-31** — **NEGATIVE: width 4 at matched recall loses to width 2 (`d32`).**
+  Hypothesis: `32/4` pays per-iteration overhead 45% less often (14.5-17.5 iters vs
+  25.5-29.4) for +10-13% evals → should win if fixed-per-iteration cost dominates.
+  Measured (interleaved pairs, b1024): `32/4 p2` vs `32/2 p4` → 0.945/0.708/0.931, median
+  **0.931**; `32/4 p3` vs `32/2 p6` → 0.929/0.928/0.740, median **0.928**. Refuted — in the
+  classic mapping the per-iteration cost tracks work, not a fixed floor. `32/2` remains the
+  scored configuration (now with p4/p6 as the matched-recall points).
+  **NEXT CANDIDATE (design task, not a knob): a convergence stop rule.** The walk always
+  runs to beam exhaustion (~2·itopk/SW iterations); patience approximates convergence
+  crudely via zero-admission streaks. hnswlib's own termination — stop when the best
+  unexpanded candidate is worse than the current result set's worst — is sharper and is
+  the likely source of its evals-per-recall edge. Needs a cheap running top-k(=10) worst
+  tracker in the walk; output-changing (a trade like patience), so it must be judged on
+  the frontier, swept via env before any default flips.
