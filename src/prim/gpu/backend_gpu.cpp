@@ -2750,13 +2750,12 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,
                     float* distances, const uint16_t* dataset_f16, const uint8_t* dataset_u8) {
 #if defined(OVVS_WITH_SYCL)
-  (void)dataset_f16; /* reserved for the phase-2 fp16 kernel */
   if (!gpu_available()) return false;
   /* fp16 primary storage: no fp32 dataset. The walk can still run entirely on the
      caller-provided int8 mirror; prim_graph_walk only offers such batches after
      verifying every query qualifies for the int8 path, so the fp32 fallback branches
      are provably dead and DS stays null. */
-  if (!dataset && !dataset_u8) return false;
+  if (!dataset && !dataset_u8 && !dataset_f16) return false;
   if (!graph || !queries || !neighbors || !distances) return false;
   if (n <= 0 || nq <= 0 || k <= 0 || dim <= 0 || degree <= 0) return false;
   if (n > std::numeric_limits<int32_t>::max() || k > std::numeric_limits<int32_t>::max()) return false;
@@ -3014,6 +3013,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     if (visited_capacity == 0 || visited_capacity > kMaxVisitedBytesPerQuery / sizeof(int32_t)) return false;
 
     const bool ds_direct = dataset ? gpu_pointer_accessible(q, dataset) : true;
+    const bool ds16_direct = dataset_f16 ? gpu_pointer_accessible(q, dataset_f16) : true;
     const bool graph_direct = gpu_pointer_accessible(q, graph);
     const bool query_direct = gpu_pointer_accessible(q, queries);
     const bool out_i_direct = gpu_pointer_accessible(q, neighbors);
@@ -3035,6 +3035,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     /* The index copies stay scoped: they only exist when the caller's dataset/graph are not
        device-accessible, which is the exceptional path and is already reported as an upload. */
     ScopedDeviceUsm<float> ds_copy(q, ds_direct ? 0u : ds_count);
+    ScopedDeviceUsm<uint16_t> ds16_copy(q, (dataset_f16 && !ds16_direct) ? ds_count : 0u);
     ScopedDeviceUsm<int32_t> graph_copy(q, graph_direct ? 0u : graph_count);
 
     /* Built and cached once per dataset; nullptr whenever the corpus is not exactly
@@ -3042,7 +3043,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const uint8_t* DS8 = dataset_u8 ? dataset_u8
                          : (dataset && ds_direct ? gpu_int8_mirror(r, q, dataset, N, D, ds_count)
                                                  : nullptr);
-    if (!dataset && !DS8) return false;
+    if (!dataset && !DS8 && !dataset_f16) return false;
 
     const size_t visited_bytes_per_query = visited_capacity * sizeof(int32_t);
     size_t queries_per_launch = std::max<size_t>(1u, kVisitedAllocationTarget / visited_bytes_per_query);
@@ -3111,6 +3112,11 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     int64_t* COUNTERS = count_work ? reinterpret_cast<int64_t*>(ws + off_counters) : nullptr;
 
     const float* DS = ds_direct ? dataset : ds_copy.get();
+    /* fp16 primary storage: native half loads, converted to fp32 in-register (a single
+       hardware instruction on Xe). Priority inside every distance function is
+       int8 mirror (4x fewer bytes, exact) -> fp16 (2x) -> fp32, per query. */
+    const sycl::half* DS16 = reinterpret_cast<const sycl::half*>(
+        dataset_f16 ? (ds16_direct ? dataset_f16 : ds16_copy.get()) : nullptr);
     const int32_t* G = graph_direct ? graph : graph_copy.get();
     const float* Q = query_direct ? queries : query_stage;
     int64_t* OUTI = out_i_direct ? neighbors : out_i_stage;
@@ -3120,6 +3126,9 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     int32_t* QUEUE = QPW > 1 ? reinterpret_cast<int32_t*>(ws + off_queue) : nullptr;
 
     if (!ds_direct && dataset) q.memcpy(ds_copy.get(), dataset, dataset_bytes);
+    if (dataset_f16 && !ds16_direct) {
+      q.memcpy(ds16_copy.get(), dataset_f16, ds_count * sizeof(uint16_t));
+    }
     if (!graph_direct) q.memcpy(graph_copy.get(), graph, graph_bytes);
     if (QUEUE) q.memset(QUEUE, 0, sizeof(int32_t));
     sycl::event query_upload;
@@ -3437,6 +3446,57 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                  }
                  return finish_q(0.f, static_cast<float>(ip), static_cast<float>(nx),
                                  static_cast<float>(ny));
+               }
+               if (DS16) {
+                 /* Two halfs per dword load: naive 2-byte loads de-coalesce and ran 40%
+                    BEHIND the fp32 walk; packed dwords restore the fp32 access shape at
+                    half the bytes (same fix the int8 path uses, one level up). */
+                 float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
+                 if ((D & 1u) == 0u) {
+                   const uint32_t* row32 =
+                       reinterpret_cast<const uint32_t*>(DS16 + static_cast<size_t>(id) * D);
+                   for (size_t pr = lane; pr < D / 2u; pr += sgsz) {
+                     const uint32_t packed = row32[pr];
+                     const float b0 = static_cast<float>(
+                         sycl::bit_cast<sycl::half>(static_cast<uint16_t>(packed & 0xFFFFu)));
+                     const float b1 = static_cast<float>(
+                         sycl::bit_cast<sycl::half>(static_cast<uint16_t>(packed >> 16)));
+                     const float a0 = Q[sq * D + 2u * pr];
+                     const float a1 = Q[sq * D + 2u * pr + 1u];
+                     if (!needs_ip_q) {
+                       const float d0 = a0 - b0;
+                       const float d1 = a1 - b1;
+                       l2 += d0 * d0 + d1 * d1;
+                     }
+                     if (needs_ip_q) ip += a0 * b0 + a1 * b1;
+                     if (needs_norms_q) {
+                       nx += a0 * a0 + a1 * a1;
+                       ny += b0 * b0 + b1 * b1;
+                     }
+                   }
+                 } else {
+                   for (size_t d = lane; d < D; d += sgsz) {
+                     const float a = Q[sq * D + d];
+                     const float b = static_cast<float>(DS16[static_cast<size_t>(id) * D + d]);
+                     const float delta = a - b;
+                     if (!needs_ip_q) l2 += delta * delta;
+                     if (needs_ip_q) ip += a * b;
+                     if (needs_norms_q) {
+                       nx += a * a;
+                       ny += b * b;
+                     }
+                   }
+                 }
+                 if (!needs_ip_q) {
+                   l2 = sycl::reduce_over_group(subgroup, l2, sycl::plus<float>());
+                   return finish_q(l2, 0.f, 0.f, 0.f);
+                 }
+                 ip = sycl::reduce_over_group(subgroup, ip, sycl::plus<float>());
+                 if (needs_norms_q) {
+                   nx = sycl::reduce_over_group(subgroup, nx, sycl::plus<float>());
+                   ny = sycl::reduce_over_group(subgroup, ny, sycl::plus<float>());
+                 }
+                 return finish_q(0.f, ip, nx, ny);
                }
                float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
                if (reg_qf) {
@@ -3984,6 +4044,54 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                return finish_metric(0.f, static_cast<float>(ip), static_cast<float>(nx),
                                     static_cast<float>(ny));
              }
+             if (DS16) {
+               float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
+               if ((D & 1u) == 0u) {
+                 const uint32_t* row32 =
+                     reinterpret_cast<const uint32_t*>(DS16 + static_cast<size_t>(id) * D);
+                 for (size_t pr = lid; pr < D / 2u; pr += work_group_size) {
+                   const uint32_t packed = row32[pr];
+                   const float b0 = static_cast<float>(
+                       sycl::bit_cast<sycl::half>(static_cast<uint16_t>(packed & 0xFFFFu)));
+                   const float b1 = static_cast<float>(
+                       sycl::bit_cast<sycl::half>(static_cast<uint16_t>(packed >> 16)));
+                   const float a0 = Q[qi * D + 2u * pr];
+                   const float a1 = Q[qi * D + 2u * pr + 1u];
+                   if (!needs_ip) {
+                     const float d0 = a0 - b0;
+                     const float d1 = a1 - b1;
+                     l2 += d0 * d0 + d1 * d1;
+                   }
+                   if (needs_ip) ip += a0 * b0 + a1 * b1;
+                   if (needs_norms) {
+                     nx += a0 * a0 + a1 * a1;
+                     ny += b0 * b0 + b1 * b1;
+                   }
+                 }
+               } else {
+                 for (size_t d = lid; d < D; d += work_group_size) {
+                   const float a = Q[qi * D + d];
+                   const float b = static_cast<float>(DS16[static_cast<size_t>(id) * D + d]);
+                   const float delta = a - b;
+                   if (!needs_ip) l2 += delta * delta;
+                   if (needs_ip) ip += a * b;
+                   if (needs_norms) {
+                     nx += a * a;
+                     ny += b * b;
+                   }
+                 }
+               }
+               if (!needs_ip) {
+                 l2 = sycl::reduce_over_group(group, l2, sycl::plus<float>());
+                 return finish_metric(l2, 0.f, 0.f, 0.f);
+               }
+               ip = sycl::reduce_over_group(group, ip, sycl::plus<float>());
+               if (needs_norms) {
+                 nx = sycl::reduce_over_group(group, nx, sycl::plus<float>());
+                 ny = sycl::reduce_over_group(group, ny, sycl::plus<float>());
+               }
+               return finish_metric(0.f, ip, nx, ny);
+             }
              float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
              for (size_t d = lid; d < D; d += work_group_size) {
                const float a = Q[qi * D + d];
@@ -4078,6 +4186,54 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                }
                return finish_metric(0.f, static_cast<float>(ip), static_cast<float>(nx),
                                     static_cast<float>(ny));
+             }
+             if (DS16) {
+               float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
+               if ((D & 1u) == 0u) {
+                 const uint32_t* row32 =
+                     reinterpret_cast<const uint32_t*>(DS16 + static_cast<size_t>(id) * D);
+                 for (size_t pr = subgroup_lane; pr < D / 2u; pr += subgroup_size) {
+                   const uint32_t packed = row32[pr];
+                   const float b0 = static_cast<float>(
+                       sycl::bit_cast<sycl::half>(static_cast<uint16_t>(packed & 0xFFFFu)));
+                   const float b1 = static_cast<float>(
+                       sycl::bit_cast<sycl::half>(static_cast<uint16_t>(packed >> 16)));
+                   const float a0 = Q[qi * D + 2u * pr];
+                   const float a1 = Q[qi * D + 2u * pr + 1u];
+                   if (!needs_ip) {
+                     const float d0 = a0 - b0;
+                     const float d1 = a1 - b1;
+                     l2 += d0 * d0 + d1 * d1;
+                   }
+                   if (needs_ip) ip += a0 * b0 + a1 * b1;
+                   if (needs_norms) {
+                     nx += a0 * a0 + a1 * a1;
+                     ny += b0 * b0 + b1 * b1;
+                   }
+                 }
+               } else {
+                 for (size_t d = subgroup_lane; d < D; d += subgroup_size) {
+                   const float a = Q[qi * D + d];
+                   const float b = static_cast<float>(DS16[static_cast<size_t>(id) * D + d]);
+                   const float delta = a - b;
+                   if (!needs_ip) l2 += delta * delta;
+                   if (needs_ip) ip += a * b;
+                   if (needs_norms) {
+                     nx += a * a;
+                     ny += b * b;
+                   }
+                 }
+               }
+               if (!needs_ip) {
+                 l2 = sycl::reduce_over_group(subgroup, l2, sycl::plus<float>());
+                 return finish_metric(l2, 0.f, 0.f, 0.f);
+               }
+               ip = sycl::reduce_over_group(subgroup, ip, sycl::plus<float>());
+               if (needs_norms) {
+                 nx = sycl::reduce_over_group(subgroup, nx, sycl::plus<float>());
+                 ny = sycl::reduce_over_group(subgroup, ny, sycl::plus<float>());
+               }
+               return finish_metric(0.f, ip, nx, ny);
              }
              float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
              if (reg_qf) {

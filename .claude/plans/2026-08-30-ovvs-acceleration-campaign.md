@@ -1410,4 +1410,41 @@ Append newest last. One line per real event: what landed, what number it produce
   (auto-convert only when lossless, else require explicit opt-in — silent rounding of
   float corpora on load is the one footgun); (c) PQ-on-fp16. Then flip the default and
   the R2/R3 G3 story rides on it (10M×128 fp16 = 2.56 GB vectors — R3 stops needing SQ8
-  for G3, SQ8 becomes a pure speed lane).
+  for G3, SQ8 becomes a pure speed lane).- **2026-08-31** — **FP16 GPU KERNEL LANDED (phase 2): the GPU now walks fp16 storage
+  natively — FORCE_GPU semantics restored in fp16 mode, mirror-less corpora get the GPU
+  at scale, and a load-safety guard closed the one footgun.** (User: "lets do the fp16
+  GPU kernel then.")
+  1. **Kernel**: `DS16` (`sycl::half*`, zero-copy — x16 is already shared USM) added to
+     all three distance sites (classic per-workgroup, classic subgroup, sgq); per-query
+     priority int8 mirror → fp16 → fp32. First cut used naive 2-byte half loads and ran
+     40% BEHIND the fp32 walk; rewritten as packed two-halfs-per-dword loads (the int8
+     path trick one level up). The mixer's all-queries-integer host scan is deleted —
+     ineligible queries now fall to fp16 in-kernel instead of gating the whole batch.
+     One gate bug found by test (the phase-1 `!dataset && !DS8` inner check predated
+     DS16 and failed FORCE_GPU before the fp16 path could serve it).
+  2. **Measured (1M scaled corpus — non-integer, no mirror possible, ranking-invariant
+     truth, `tools/bench/f16_preview_1m.py`)**: ovVS f16 hetero (GPU-whole on DS16)
+     **24.5K vs hnswlib fp32 21.3K = 1.15× at matched recall (0.9732 vs 0.9722), at
+     half the vector memory**. Same-window fp32 discriminator: 39.8K — NOT thermal.
+     **Architecture finding worth keeping: on Xe-LPG (no XMX) the fp16 path is
+     ALU-bound, not bandwidth-bound** — per row the fp32 reg path is 8 loads + 8 FMAs
+     while packed fp16 is 4 loads + 8 converts + 8 unpacks + 8 Q-loads + 8 FMAs (~1.75×
+     ALU, matching the observed 1.62× gap), and the 1M walk was already
+     bookkeeping-bound (req_gate). fp16 on this iGPU buys MEMORY and coverage; int8
+     stays the speed path; fp16 COMPUTE wins require XMX-class hardware (note for other
+     SKUs in the portability pass).
+  3. **Regression checks all clean**: fp32 GPU 39.8K (unchanged); f16 SIFT mirror path
+     39.5K recall exact 0.9735; 100K DS16 GPU recall 0.9953 == CPU f16 path; churn
+     FORCE_GPU in f16 mode now runs through the round-1 mirror drop (21.9K on DS16,
+     recall 0.9698/0.9682) where it previously failed closed. 9/9 CTest at every step.
+  4. **Lossless-load guard**: `OVVS_CAGRA_F16=1` on an fp32 FILE converts only when the
+     round-trip is exact (SIFT converts, float corpora stay fp32 — no silent rounding of
+     pre-existing data); build-time conversion remains explicit opt-in by setting the
+     env for that build; `OVVS_CAGRA_F16=force` overrides. Verified: SIFT fp32 file
+     still converts (108.5K, recall exact).
+  **Default-flip verdict: the env default STAYS OFF — deliberately.** A precision
+  decision belongs in the ABI (a `storage=` build parameter), not a process-wide env
+  default; the mode is now safe and complete enough to enable per-corpus today
+  (lossless data: pure win; float data: −0.0006 recall for half the memory, CPU 1.5×
+  faster below 320K, GPU 1.15× over hnswlib at 1M). Remaining fp16 items: PQ-on-fp16,
+  the ABI storage parameter, and (hardware-gated) XMX fp16 compute on SKUs that have it.

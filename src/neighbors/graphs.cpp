@@ -206,10 +206,22 @@ static void cagra_build_mirror8(CagraIndex* ix) {
   ix->mirror8_ok = true;
 }
 
-/* Converts fp32 primary storage to fp16 and releases the fp32 copy. Called once at the
-   end of build and after loading an fp32 file with the mode enabled. */
-static void cagra_finalize_storage(CagraIndex* ix) {
+/* Converts fp32 primary storage to fp16 and releases the fp32 copy. Called at the end
+   of build (allow_lossy: the caller set the mode for THIS build, rounding is the
+   documented deal) and after loading an fp32 file (lossless conversions only -- the file
+   predates the env, and silently rounding stored float data on load is the one footgun;
+   OVVS_CAGRA_F16=force overrides). */
+static void cagra_finalize_storage(CagraIndex* ix, bool allow_lossy) {
   if (!cagra_f16_mode() || ix->ds.x.empty()) return;
+  if (!allow_lossy) {
+    const char* env = std::getenv("OVVS_CAGRA_F16");
+    const bool force = env && std::strcmp(env, "force") == 0;
+    if (!force) {
+      for (const float v : ix->ds.x) {
+        if (f16_bits_to_f32(f32_to_f16_bits(v)) != v) return; /* stay fp32 */
+      }
+    }
+  }
   const size_t count = ix->ds.x.size();
   ix->ds.x16.resize(count);
   for (size_t i = 0; i < count; ++i) ix->ds.x16[i] = f32_to_f16_bits(ix->ds.x[i]);
@@ -1293,7 +1305,7 @@ ovvsStatus ovvsCagraBuildEx(ovvsResources_t res, const float* dataset, int64_t n
        Telemetry merge, handle publication, and serialization are outside it. */
     call_stats.total_wall_ns = elapsed_ns(total_begin);
     publish_cagra_build_stats(*resources, call_stats);
-    cagra_finalize_storage(ix.get());
+    cagra_finalize_storage(ix.get(), /*allow_lossy=*/true);
     *index = reinterpret_cast<ovvsCagraIndex_t>(ix.release());
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
@@ -1572,7 +1584,7 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
     delete ix;
     return OVVS_STATUS_IO;
   }
-  cagra_finalize_storage(ix); /* fp32 file + OVVS_CAGRA_F16=1: convert on load */
+  cagra_finalize_storage(ix, /*allow_lossy=*/false); /* fp32 file: lossless-only */
   *index = reinterpret_cast<ovvsCagraIndex_t>(ix);
   return OVVS_STATUS_SUCCESS;
 }

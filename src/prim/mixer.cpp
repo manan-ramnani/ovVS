@@ -508,18 +508,9 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
                                metric == OVVS_METRIC_L2_SQRT_EXPANDED ||
                                metric == OVVS_METRIC_INNER_PRODUCT ||
                                metric == OVVS_METRIC_COSINE_EXPANDED;
-  /* fp16 primary storage (dataset == null): the GPU kernel has no fp16 path yet, so it
-     may run ONLY when the whole batch can live on the int8 mirror -- mirror present and
-     every query integer-valued in [0,255]. The kernel then never touches the fp32
-     pointer. Anything else walks on the CPU, which reads fp16 directly. */
-  const bool gpu_dataset_ok = dataset != nullptr || [&]() -> bool {
-    if (!dataset_u8 || metric != OVVS_METRIC_L2_EXPANDED) return false;
-    for (int64_t i = 0; i < nq * dim; ++i) {
-      const float v = queries[i];
-      if (!(v >= 0.f && v <= 255.f && v == std::floor(v))) return false;
-    }
-    return true;
-  }();
+  /* The GPU kernel reads fp32 or fp16 storage natively (and prefers the int8 mirror
+     per query when present), so any real storage form is offerable. */
+  const bool gpu_dataset_ok = dataset != nullptr || dataset_f16 != nullptr;
   const bool gpu_metric_supported = metric_walkable && gpu_dataset_ok;
   const bool gpu_policy = r.policy == OVVS_POLICY_AUTO ||
                           r.policy == OVVS_POLICY_GPU_IF_FASTER ||
