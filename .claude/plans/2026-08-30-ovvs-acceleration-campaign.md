@@ -1100,3 +1100,24 @@ Append newest last. One line per real event: what landed, what number it produce
   the likely source of its evals-per-recall edge. Needs a cheap running top-k(=10) worst
   tracker in the walk; output-changing (a trade like patience), so it must be judged on
   the frontier, swept via env before any default flips.
+- **2026-08-31** — **CONVERGENCE STOP RULE: BUILT, SWEPT, AND REFUTED — patience dominates
+  at every matched recall.** Implemented hnswlib's termination adapted to the merged beam
+  (`OVVS_CAGRA_STOP_EF`, both mappings: stop when ≥ stop_ef beam entries are strictly
+  better than the best unexpanded entry; one strided count fused after the pick argmin).
+  Default off; default path bit-identical (1303.7/35.36/317.9 re-certified); 9/9 CTest.
+  Frontier at d32 `32/2` (counters): ef=12→0.9096@508 … ef=32→0.9794@837 … ef=48→
+  0.9917@1081, ef=56→0.9943@1197, ef=60→0.9955@1254. Versus patience: p4 0.9922@1064,
+  p5 0.9942@1131, p6 0.9953@1176 — **patience wins by 2-7% evals at equal recall,
+  everywhere.** Reading: the beam IS the ef-set; a zero-admission streak detects "top set
+  stable" earlier than the one-hop distance test, which only fires once the tail stops
+  churning. Knob kept solely to ride along in the R2 patience re-sweep, then both get a
+  single winner and the loser's knob is removed.
+  **R1 kernel campaign state after this: every remaining single-change idea on the list
+  has now been landed or refuted with a number. G1 stands at ~1.11× at matched recall
+  (p4/p6 configs). The honest options on the table: (a) accept 1.11× at R1 and climb to
+  R2 measurement anyway is FORBIDDEN by §3 — so rather: (b) grind compound micro-gains
+  (each ruled-out term was 1-5%; none dominant), or (c) attack evals-per-recall at the
+  GRAPH level (better construction: more build effort at fixed degree buys recall per
+  eval — build is our strong side, 22% faster at 1M with GPU idle headroom), or (d) the
+  B20 float-corpus + SQ8 lane, which changes the byte economics 4× and is required for
+  the product claim anyway. (c) and (d) are the two with headroom left.**

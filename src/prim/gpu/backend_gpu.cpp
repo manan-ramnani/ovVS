@@ -2813,6 +2813,21 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
       if (parsed <= 0) return 0;
       return static_cast<int>(std::min<long>(parsed, 1 << 20));
     }();
+    /* Convergence stop rule, hnswlib's termination semantics adapted to the merged beam:
+       stop expanding once at least stop_ef beam entries are strictly better than the best
+       unexpanded entry -- nothing expandable can then enter the top-stop_ef directly, which
+       is the same one-hop approximation hnswlib's `candidate worse than result worst` test
+       makes. stop_ef plays the role of ef: smaller stops earlier. Costs one strided count
+       over beam distances per iteration, fused after the pick argmin. Output-changing (a
+       recall/throughput trade like patience), so it is off by default and judged on the
+       frontier. TEMPORARY sweep knob: OVVS_CAGRA_STOP_EF (0 = off). */
+    const int32_t stop_ef = [&]() -> int32_t {
+      const char* env = std::getenv("OVVS_CAGRA_STOP_EF");
+      if (!env || !*env) return 0;
+      const long parsed = std::strtol(env, nullptr, 10);
+      if (parsed <= 0) return 0;
+      return static_cast<int32_t>(std::min<long>(parsed, static_cast<long>(BEAM)));
+    }();
 
     /* Shared with the CPU walk (mixer.cpp) and the build-path walk (graphs.cpp) so the two
        can never drift; CPU/GPU ID parity depends on an identical seed stream. */
@@ -3585,6 +3600,18 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                  const uint32_t best_slot =
                      sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
                  if (best_slot == std::numeric_limits<uint32_t>::max()) break;
+                 if (stop_ef != 0 && s == 0) {
+                   /* Convergence stop: if stop_ef beam entries already beat the best
+                      unexpanded entry, expanding cannot improve the top-stop_ef directly. */
+                   int32_t lane_better = 0;
+                   for (uint32_t i = static_cast<uint32_t>(lane); i < candidate_count;
+                        i += static_cast<uint32_t>(sgsz)) {
+                     if (candidate_distances[cb + i] < best_distance) ++lane_better;
+                   }
+                   const int32_t better =
+                       sycl::reduce_over_group(subgroup, lane_better, sycl::plus<int32_t>());
+                   if (better >= stop_ef) break; /* npicks stays 0: the walk ends */
+                 }
                  if (lane == static_cast<size_t>(best_slot) % sgsz) {
                    candidate_expanded[cb + best_slot] = 1;
                  }
@@ -4207,6 +4234,20 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                  const uint32_t best_slot =
                      sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
                  if (best_slot == std::numeric_limits<uint32_t>::max()) break;
+                 if (stop_ef != 0 && s == 0) {
+                   /* Convergence stop: if stop_ef beam entries already beat the best
+                      unexpanded entry, expanding cannot improve the top-stop_ef directly. */
+                   int32_t lane_better = 0;
+                   for (uint32_t i = static_cast<uint32_t>(subgroup_lane); i < candidate_count;
+                        i += static_cast<uint32_t>(subgroup_size)) {
+                     if (candidate_distances[static_cast<size_t>(i)] < best_distance) {
+                       ++lane_better;
+                     }
+                   }
+                   const int32_t better =
+                       sycl::reduce_over_group(subgroup, lane_better, sycl::plus<int32_t>());
+                   if (better >= stop_ef) break; /* npicks stays 0: the walk ends */
+                 }
 
                  if (subgroup_lane == static_cast<size_t>(best_slot) % subgroup_size) {
                    candidate_expanded[static_cast<size_t>(best_slot)] = 1;
