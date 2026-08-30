@@ -218,6 +218,22 @@ else:
     _cagra_build_ex2.restype = c_int32
 
 _CAGRA_STORAGE = {"auto": 0, "fp32": 1, "fp16": 2, "fp16_if_lossless": 3}
+
+try:
+    _cagra_calibrate = _lib.ovvsCagraCalibrate
+except AttributeError:
+    _cagra_calibrate = None
+else:
+    _cagra_calibrate.argtypes = [
+        c_void_p,
+        c_void_p,
+        ctypes.c_float,
+        c_int64,
+        POINTER(c_int32),
+        POINTER(c_int32),
+        POINTER(ctypes.c_float),
+    ]
+    _cagra_calibrate.restype = c_int32
 _lib.ovvsCagraSearch.argtypes = [
     c_void_p,
     c_void_p,
@@ -792,6 +808,23 @@ class CagraIndex(_Index):
         live, deleted = self.counts()
         self.n = live + deleted
         return list(out)
+
+    def calibrate(self, target_recall, k=10):
+        """Pick the cheapest (itopk, search_width) meeting target_recall at this k.
+
+        Returns (itopk, search_width, achieved_recall_estimate). When the target is out
+        of reach the best available config is returned; check the estimate.
+        """
+        if _cagra_calibrate is None:
+            raise RuntimeError("calibrate requires ovvsCagraCalibrate")
+        it = c_int32()
+        w = c_int32()
+        got = ctypes.c_float()
+        rc = _cagra_calibrate(self._res._h, self._h, ctypes.c_float(target_recall),
+                              c_int64(k), ctypes.byref(it), ctypes.byref(w),
+                              ctypes.byref(got))
+        _check_status(rc, "CAGRA calibrate")
+        return int(it.value), int(w.value), float(got.value)
 
     def delete(self, ids):
         _require_mutation()

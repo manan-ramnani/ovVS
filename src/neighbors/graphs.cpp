@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <queue>
 #include <fstream>
 #include <thread>
 
@@ -2270,6 +2271,218 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
     cagra_pq_encode_all(&staged);
     *ix = std::move(staged);
     resources->last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+}
+
+/* Recall-target mode: pick the cheapest (itopk, search_width) whose measured recall@k
+   on a self-sample meets the target. The sample is up to 256 live rows read back as
+   queries; exact truth is a threaded brute-force scan (the one place a full scan is the
+   right tool); the ladder runs through the PUBLIC search path so it inherits every
+   semantic the caller will see -- tombstone post-filtering, PQ ADC, packed ids, the
+   caller's engine policy. Self-hits are excluded from both sides (truth and search run
+   at k+1 and the query's own id is dropped) so the estimate predicts recall for queries
+   that are NOT stored rows. Among configs meeting the target the one with the smallest
+   measured wall time wins; if none reach it, the highest-recall config is returned and
+   `achieved` says how close it got. */
+ovvsStatus ovvsCagraCalibrate(ovvsResources_t res, ovvsCagraIndex_t index, float target_recall,
+                              int64_t k, int32_t* itopk, int32_t* width, float* achieved) {
+  if (!res || !index || !itopk || !width) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (!(target_recall > 0.f) || target_recall > 1.f || k <= 0 || k > 1024) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  auto* resources = rd(res);
+  if (!cagra_dataset_present(*ix)) return OVVS_STATUS_INVALID_ARGUMENT;
+  const int64_t n = ix->ds.n;
+  const int64_t dim = ix->ds.dim;
+  const int64_t live = n - ix->deleted_count;
+  if (live <= k + 1) return OVVS_STATUS_INVALID_ARGUMENT;
+  try {
+    const int64_t want = std::min<int64_t>(256, live);
+    std::vector<int64_t> sample;
+    sample.reserve(static_cast<size_t>(want));
+    const int64_t step = std::max<int64_t>(1, n / want);
+    for (int64_t at = 0; at < n && static_cast<int64_t>(sample.size()) < want; at += step) {
+      int64_t row = at;
+      while (row < n && cagra_row_deleted(*ix, row)) ++row;
+      if (row < n) sample.push_back(row);
+    }
+    const int64_t nq = static_cast<int64_t>(sample.size());
+    if (nq == 0) return OVVS_STATUS_INVALID_ARGUMENT;
+
+    std::vector<float> queries(static_cast<size_t>(nq) * static_cast<size_t>(dim));
+    std::vector<int64_t> self_id(static_cast<size_t>(nq));
+    for (int64_t i = 0; i < nq; ++i) {
+      cagra_row_f32(*ix, sample[static_cast<size_t>(i)], queries.data() + i * dim);
+      self_id[static_cast<size_t>(i)] = cagra_pack_id(*ix, sample[static_cast<size_t>(i)]);
+    }
+
+    const int64_t kk = k + 1;
+    std::vector<int64_t> truth(static_cast<size_t>(nq) * static_cast<size_t>(kk));
+    const CagraStorage st = cagra_storage(*ix);
+    const bool f16_l2_fast = st.f16 != nullptr && ix->ds.metric == OVVS_METRIC_L2_EXPANDED;
+    const bool l2_family = ix->ds.metric == OVVS_METRIC_L2_EXPANDED ||
+                           ix->ds.metric == OVVS_METRIC_L2_SQRT_EXPANDED;
+    std::atomic<bool> threw{false};
+    const auto row_distance = [&](const float* qv, int64_t row, float* scratch) -> float {
+      if (st.f32) return distance_one(ix->ds.metric, qv, st.f32 + row * dim, dim, 2.f);
+      if (f16_l2_fast) return l2sq_f16_dispatch(qv, st.f16 + row * dim, dim);
+      f16_row_to_f32(st.f16 + row * dim, scratch, dim);
+      return distance_one(ix->ds.metric, qv, scratch, dim, 2.f);
+    };
+    const unsigned hw = std::thread::hardware_concurrency();
+
+    /* An unperturbed stored row is too EASY a query -- its own out-edges point at its
+       neighbours, so the walk finds them at effort levels that under-serve real queries
+       (measured +0.018 recall optimism at 1M; a half-distance displacement still left
+       +0.017). For L2-family metrics, displace each sample by its FULL nearest-other
+       distance: the query then sits about as far from the stored set as a genuine query
+       does from its own nearest neighbour, the ladder differentiates instead of
+       saturating, and the measured optimism drops to +0.002 at 100K and +0.006..+0.016
+       at 1M (low effort is the worst case). The residual is structural -- a real query
+       set can be harder than anything derived from stored rows -- so `achieved` is an
+       ESTIMATE with that documented sign: callers with a hard floor should aim slightly
+       above it. Pass 1 finds the nearest-other distance; non-L2 metrics keep the raw
+       sample (larger documented bias). */
+    if (l2_family) {
+      std::vector<float> d1(static_cast<size_t>(nq));
+      const std::function<void(int64_t)> near1 = [&](int64_t qi) {
+        if (threw.load(std::memory_order_relaxed)) return;
+        try {
+          const float* qv = queries.data() + qi * dim;
+          std::vector<float> scratch(f16_l2_fast || st.f32 ? 0u : static_cast<size_t>(dim));
+          float best = kInf;
+          for (int64_t row = 0; row < n; ++row) {
+            if (row == sample[static_cast<size_t>(qi)] || cagra_row_deleted(*ix, row)) continue;
+            best = std::min(best, row_distance(qv, row, scratch.data()));
+          }
+          d1[static_cast<size_t>(qi)] = best;
+        } catch (...) {
+          threw.store(true);
+        }
+      };
+      resources->pool(static_cast<int>(hw > 0 ? hw : 1)).run(0, nq, near1);
+      if (threw.load()) return OVVS_STATUS_OOM;
+      for (int64_t qi = 0; qi < nq; ++qi) {
+        float dist = d1[static_cast<size_t>(qi)];
+        if (!(dist > 0.f) || dist == kInf) continue;
+        if (ix->ds.metric == OVVS_METRIC_L2_EXPANDED) dist = std::sqrt(dist);
+        uint64_t s = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(qi + 1);
+        std::vector<float> dir(static_cast<size_t>(dim));
+        float norm_sq = 0.f;
+        for (int64_t j = 0; j < dim; ++j) {
+          s ^= s >> 12;
+          s ^= s << 25;
+          s ^= s >> 27;
+          const float u = static_cast<float>((s * 0x2545F4914F6CDD1Dull) >> 40) /
+                              static_cast<float>(1 << 24) -
+                          0.5f;
+          dir[static_cast<size_t>(j)] = u;
+          norm_sq += u * u;
+        }
+        const float scale = dist / std::sqrt(std::max(norm_sq, 1e-12f));
+        float* qv = queries.data() + qi * dim;
+        for (int64_t j = 0; j < dim; ++j) qv[j] += dir[static_cast<size_t>(j)] * scale;
+      }
+    }
+
+    const std::function<void(int64_t)> scan = [&](int64_t qi) {
+      if (threw.load(std::memory_order_relaxed)) return;
+      try {
+        const float* qv = queries.data() + qi * dim;
+        /* max-heap of the kk best (dist, row): top() is the current worst keeper. */
+        std::priority_queue<std::pair<float, int64_t>> heap;
+        std::vector<float> scratch(f16_l2_fast || st.f32 ? 0u : static_cast<size_t>(dim));
+        for (int64_t row = 0; row < n; ++row) {
+          if (cagra_row_deleted(*ix, row)) continue;
+          const float d = row_distance(qv, row, scratch.data());
+          if (static_cast<int64_t>(heap.size()) < kk) {
+            heap.emplace(d, row);
+          } else if (d < heap.top().first) {
+            heap.pop();
+            heap.emplace(d, row);
+          }
+        }
+        int64_t at = static_cast<int64_t>(heap.size());
+        while (!heap.empty()) {
+          truth[static_cast<size_t>(qi * kk + --at)] = cagra_pack_id(*ix, heap.top().second);
+          heap.pop();
+        }
+      } catch (...) {
+        threw.store(true);
+      }
+    };
+    resources->pool(static_cast<int>(hw > 0 ? hw : 1)).run(0, nq, scan);
+    if (threw.load()) return OVVS_STATUS_OOM;
+
+    struct Cfg {
+      int32_t it;
+      int32_t w;
+    };
+    static const Cfg kLadder[] = {{32, 1},  {48, 1},  {64, 1},  {32, 2},  {48, 2},  {64, 2},
+                                  {96, 2},  {128, 2}, {96, 4},  {128, 4}, {192, 4}, {256, 4}};
+    std::vector<int64_t> ids(static_cast<size_t>(nq) * static_cast<size_t>(kk));
+    std::vector<float> dv(static_cast<size_t>(nq) * static_cast<size_t>(kk));
+    float best_meet_recall = -1.f, best_any_recall = -1.f;
+    double best_meet_time = 0.0;
+    Cfg best_meet{0, 0}, best_any{0, 0};
+    int32_t prev_it = -1;
+    for (const Cfg& cfg : kLadder) {
+      const int32_t it = std::max<int32_t>(cfg.it, static_cast<int32_t>(kk));
+      if (cfg.w == 1 && it == prev_it) continue; /* clamp collapsed this rung */
+      if (cfg.w == 1) prev_it = it;
+      const auto t0 = std::chrono::steady_clock::now();
+      const ovvsStatus status = ovvsCagraSearch(res, index, queries.data(), nq, kk, it, cfg.w,
+                                                nullptr, ids.data(), dv.data());
+      if (status != OVVS_STATUS_SUCCESS) return status;
+      const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      int64_t hits = 0;
+      for (int64_t qi = 0; qi < nq; ++qi) {
+        int64_t tset[1025];
+        int64_t tn = 0;
+        for (int64_t j = 0; j < kk && tn < k; ++j) {
+          const int64_t v = truth[static_cast<size_t>(qi * kk + j)];
+          if (v != self_id[static_cast<size_t>(qi)]) tset[tn++] = v;
+        }
+        int64_t got = 0;
+        for (int64_t j = 0; j < kk && got < k; ++j) {
+          const int64_t v = ids[static_cast<size_t>(qi * kk + j)];
+          if (v < 0 || v == self_id[static_cast<size_t>(qi)]) continue;
+          ++got;
+          for (int64_t u = 0; u < tn; ++u) {
+            if (tset[u] == v) {
+              ++hits;
+              break;
+            }
+          }
+        }
+      }
+      const float recall = static_cast<float>(hits) / static_cast<float>(nq * k);
+      if (recall > best_any_recall) {
+        best_any_recall = recall;
+        best_any = {it, cfg.w};
+      }
+      if (recall >= target_recall &&
+          (best_meet_recall < 0.f || dt < best_meet_time)) {
+        best_meet_recall = recall;
+        best_meet_time = dt;
+        best_meet = {it, cfg.w};
+      }
+    }
+    if (best_meet_recall >= 0.f) {
+      *itopk = best_meet.it;
+      *width = best_meet.w;
+      if (achieved) *achieved = best_meet_recall;
+    } else {
+      *itopk = best_any.it;
+      *width = best_any.w;
+      if (achieved) *achieved = best_any_recall;
+    }
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;

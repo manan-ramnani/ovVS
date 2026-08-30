@@ -321,6 +321,15 @@ OVVS_API ovvsStatus ovvsCagraBuildEx2(ovvsResources_t res, const float* dataset,
 OVVS_API ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const float* queries,
                                     int64_t nq, int64_t k, int32_t itopk_size, int32_t search_width,
                                     const uint8_t* bitset, int64_t* neighbors, float* distances);
+/* Recall-target mode: measures recall@k on a displaced self-sample against exact
+   brute-force truth across an effort ladder, and returns the cheapest
+   (itopk, search_width) meeting target_recall -- or the best available config when the
+   target is out of reach. `achieved` (nullable) is an ESTIMATE with a small optimistic
+   bias (+0.002 at 100K, up to +0.016 at 1M low effort on SIFT): a caller with a hard
+   recall floor should target slightly above it. */
+OVVS_API ovvsStatus ovvsCagraCalibrate(ovvsResources_t res, ovvsCagraIndex_t index,
+                                       float target_recall, int64_t k, int32_t* itopk,
+                                       int32_t* width, float* achieved);
 OVVS_API ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_t pq_m,
                                       int32_t pq_nbits);
 OVVS_API ovvsStatus ovvsCagraDetachDataset(ovvsCagraIndex_t index);
