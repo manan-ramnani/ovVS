@@ -1633,18 +1633,42 @@ ovvsStatus ovvsCagraCounts(ovvsCagraIndex_t index, int64_t* live, int64_t* delet
 /* Rebuilds one row's out-edges from a fresh search and re-prunes the in-neighbours it names, which
    is the same repair `cagra_insert_one` performs for a newly appended row. Used by update, where
    the vector at `row` has changed and its old neighbourhood no longer describes it. */
+/* Search effort for mutation repair. Swept at degree 32 (relink_sweep.py /
+   relink_quality.py): itopk = degree, width = 1 mutates 1.53x faster than the old
+   2*degree/2, and the graph it leaves behind is not worse -- paired same-window
+   queries on identically-churned indexes read 1.06x/+0.0000 at 100K (10% cumulative
+   churn) and 0.98x/-0.0006 at 1M, both inside noise. graph_search clamps itopk to at
+   least k, so this is the minimum beam that can still return `degree` out-edges.
+   OVVS_CAGRA_RELINK_ITOPK / OVVS_CAGRA_RELINK_WIDTH override for sweeps. */
+static void cagra_relink_effort(int32_t degree, int32_t* itopk, int32_t* width) {
+  *itopk = degree;
+  *width = 1;
+  const char* env = std::getenv("OVVS_CAGRA_RELINK_ITOPK");
+  if (env && *env) {
+    const long parsed = std::strtol(env, nullptr, 10);
+    if (parsed > 0) *itopk = static_cast<int32_t>(parsed);
+  }
+  env = std::getenv("OVVS_CAGRA_RELINK_WIDTH");
+  if (env && *env) {
+    const long parsed = std::strtol(env, nullptr, 10);
+    if (parsed > 0) *width = static_cast<int32_t>(parsed);
+  }
+}
+
 static ovvsStatus cagra_relink_one(CagraIndex* ix, ResourcesData& r, int64_t row) {
   /* The vector at `row` was just rewritten in place; the int8 mirror fingerprint only
      samples 64 strided values and can miss it. Force a rebuild on the next walk. */
   ovvs_gpu_mirror_invalidate();
   const int64_t dim = ix->ds.dim;
   const int32_t degree = ix->degree;
+  int32_t relink_itopk = 0, relink_width = 0;
+  cagra_relink_effort(degree, &relink_itopk, &relink_width);
   std::vector<int64_t> nb(static_cast<size_t>(degree));
   std::vector<float> nd(static_cast<size_t>(degree));
   const ovvsStatus status =
       graph_search(r, ix->ds.x.data(), ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
-                   ix->ds.x.data() + row * dim, 1, degree, degree * 2, 2, nullptr, nb.data(),
-                   nd.data());
+                   ix->ds.x.data() + row * dim, 1, degree, relink_itopk, relink_width, nullptr,
+                   nb.data(), nd.data());
   if (status != OVVS_STATUS_SUCCESS) return status;
   for (int32_t t = 0; t < degree; ++t) {
     int32_t found = t < static_cast<int32_t>(nb.size()) ? static_cast<int32_t>(nb[static_cast<size_t>(t)]) : -1;
@@ -1735,12 +1759,14 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
   std::vector<int64_t> nb(static_cast<size_t>(count) * static_cast<size_t>(degree));
   std::vector<float> nd(static_cast<size_t>(count) * static_cast<size_t>(degree));
   const CagraStorage st = cagra_storage(*ix);
+  int32_t relink_itopk = 0, relink_width = 0;
+  cagra_relink_effort(degree, &relink_itopk, &relink_width);
   const ovvsPolicy caller_policy = r.policy;
   r.policy = OVVS_POLICY_FORCE_CPU;
   const ovvsStatus status =
       graph_search(r, st.f32, ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
-                   qbuf.data(), count, degree, degree * 2, 2, nullptr, nb.data(), nd.data(),
-                   st.f16, st.u8);
+                   qbuf.data(), count, degree, relink_itopk, relink_width, nullptr, nb.data(),
+                   nd.data(), st.f16, st.u8);
   r.policy = caller_policy;
   if (status != OVVS_STATUS_SUCCESS) return status;
 
