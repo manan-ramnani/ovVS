@@ -670,6 +670,7 @@ ovvsStatus gpu_ivfpq_scan_select(ResourcesData& r, const IvfPqScanTask* tasks,
                                  int32_t* packed_positions, int32_t* counts,
                                  GpuWorkStats* stats = nullptr);
 int32_t sycl_enabled();
+int32_t gpu_has_xmx();
 bool sycl_gpu_available();
 bool mkl_gesvd_components(const float* centered, int64_t n, int64_t dim, int32_t ncomp, float* components);
 bool mkl_syev_smallest(float* a, int64_t n, int32_t ncomp, float* embed);

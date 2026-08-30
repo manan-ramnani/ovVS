@@ -1144,6 +1144,33 @@ bool sycl_gpu_available() {
 #endif
 }
 
+/* XMX (systolic matrix engine) capability probe. fp16 COMPUTE on the GPU only pays
+   where matrix hardware exists: on Xe-LPG the packed-half walk measured ALU-bound at
+   0.62x of the fp32 walk (fp16 there is a memory/coverage feature; int8 is the speed
+   path). This is the routing hook for the portability pass -- XMX-class SKUs
+   (Arc/Xe-HPG, Lunar Lake/Battlemage Xe2) are where a joint-matrix fp16 distance
+   kernel becomes worth building. Returns 1 (XMX), 0 (none), -1 (no usable GPU). */
+int32_t gpu_has_xmx() {
+#if defined(OVVS_WITH_SYCL)
+  try {
+    if (!sycl_gpu_available()) return -1;
+    const auto device = gpu_queue().get_device();
+#if defined(SYCL_EXT_ONEAPI_MATRIX_VERSION) || defined(SYCL_EXT_ONEAPI_MATRIX)
+    const auto combos = device.get_info<
+        sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+    return combos.empty() ? 0 : 1;
+#else
+    (void)device;
+    return 0; /* toolchain cannot ask; report no-XMX rather than guess */
+#endif
+  } catch (...) {
+    return 0; /* the query itself failing means no usable matrix path */
+  }
+#else
+  return -1;
+#endif
+}
+
 ovvsStatus gpu_nndescent_build(ResourcesData& r, const float* dataset, int64_t n,
                                int64_t dim, ovvsMetric metric, int32_t degree,
                                int32_t iters, int32_t* graph,

@@ -165,6 +165,8 @@ ovvsStatus ovvsResourcesSetNpuBusy(ovvsResources_t res, int32_t busy) {
 
 int32_t ovvsSyclEnabled(void) { return ovvs::impl::sycl_enabled(); }
 
+int32_t ovvsGpuHasXmx(void) { return ovvs::impl::gpu_has_xmx(); }
+
 ovvsStatus ovvsProbeJson(char* buf, int32_t len) {
   if (!buf || len <= 0) return OVVS_STATUS_INVALID_ARGUMENT;
   const std::string s = ovvs::impl::probe_json();

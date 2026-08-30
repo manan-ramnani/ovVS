@@ -216,6 +216,9 @@ OVVS_API ovvsStatus ovvsResourcesCagraBuildStatsV1(ovvsResources_t res,
                                                    ovvsCagraBuildStatsV1* stats);
 OVVS_API ovvsStatus ovvsResourcesSetNpuBusy(ovvsResources_t res, int32_t busy);
 OVVS_API int32_t ovvsSyclEnabled(void);
+/* 1: the GPU has XMX-class matrix engines (fp16 compute candidate); 0: it does not
+   (Xe-LPG: fp16 is memory/coverage only, int8 stays the speed path); -1: no GPU. */
+OVVS_API int32_t ovvsGpuHasXmx(void);
 /* Package energy in microjoules from Linux RAPL sysfs, Windows EMI (intelppm RAPL),
    Energy Meter PDH, or Intel Power Gadget. Else UNSUPPORTED. `res` may be null. */
 OVVS_API ovvsStatus ovvsResourcesEnergyUj(ovvsResources_t res, int64_t* uj);
