@@ -120,7 +120,20 @@ struct CagraIndex {
   int32_t dsub = 0;
   std::vector<float> codebooks;
   std::vector<uint8_t> codes;
+  /* Tombstones, one bit per row. A deleted row keeps its edges and still routes traffic --
+     dropping it from traversal would fragment the graph, since every node is a routing hop for
+     its neighbours -- it is merely never returned by a search. Left empty while nothing has been
+     deleted, so an unmutated index allocates nothing for this. */
+  std::vector<uint8_t> deleted;
+  int64_t deleted_count = 0;
 };
+
+inline bool cagra_row_deleted(const CagraIndex& ix, int64_t row) {
+  if (ix.deleted.empty() || row < 0) return false;
+  const size_t byte = static_cast<size_t>(row) >> 3;
+  if (byte >= ix.deleted.size()) return false;
+  return ((ix.deleted[byte] >> (row & 7)) & 1u) != 0;
+}
 
 struct HnswIndex {
   Dataset ds;
@@ -490,7 +503,15 @@ ovvsStatus cagra_init_iterative(ResourcesData& r, const float* x, int64_t n, int
 void robust_prune(const float* x, int64_t dim, ovvsMetric metric, int64_t p, std::vector<int32_t>& cand,
                   int32_t degree, float alpha, int32_t* out_row);
 
-ovvsStatus cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec) {
+/* Records a graph row exactly as it was before `robust_prune` overwrote it, so an insert that
+   fails partway can be undone without having copied the whole index first. */
+struct CagraGraphRowBackup {
+  int64_t row;
+  std::vector<int32_t> edges;
+};
+
+ovvsStatus cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec,
+                            std::vector<CagraGraphRowBackup>* journal) {
   const int64_t old_n = ix->ds.n;
   const int64_t dim = ix->ds.dim;
   std::vector<int64_t> nb(static_cast<size_t>(ix->degree));
@@ -510,6 +531,11 @@ ovvsStatus cagra_insert_one(CagraIndex* ix, ResourcesData& r, const float* vec) 
   for (int32_t t = 0; t < ix->degree; ++t) {
     const int32_t u = ix->graph[static_cast<size_t>(old_n * ix->degree + t)];
     if (u < 0) continue;
+    if (journal) {
+      const auto row_begin = ix->graph.begin() + static_cast<int64_t>(u) * ix->degree;
+      journal->push_back({static_cast<int64_t>(u),
+                          std::vector<int32_t>(row_begin, row_begin + ix->degree)});
+    }
     std::vector<int32_t> cand;
     for (int32_t e = 0; e < ix->degree; ++e) {
       const int32_t v = ix->graph[static_cast<size_t>(static_cast<int64_t>(u) * ix->degree + e)];
@@ -1148,7 +1174,10 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
         std::vector<int64_t> cand(static_cast<size_t>(k));
         int64_t nc = 0;
         for (int64_t t = 0; t < k; ++t) {
-          if (neighbors[q * k + t] >= 0) cand[static_cast<size_t>(nc++)] = neighbors[q * k + t];
+          const int64_t candidate = neighbors[q * k + t];
+          if (candidate >= 0 && !cagra_row_deleted(*ix, candidate)) {
+            cand[static_cast<size_t>(nc++)] = candidate;
+          }
         }
         if (nc == 0) continue;
         std::vector<float> gathered(static_cast<size_t>(nc) * static_cast<size_t>(dim));
@@ -1182,6 +1211,38 @@ ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const fl
       return OVVS_STATUS_SUCCESS;
     }
     if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+    if (ix->deleted_count > 0) {
+      /* Tombstoned rows are traversed like any other -- they are routing hops for their
+         neighbours, and dropping them from the walk would fragment the graph -- so they are
+         removed here instead, after the search. Over-fetch first so a result set thinned by
+         deletions still yields k live rows; the extra depth is capped at itopk_size so the walk
+         does not silently do more work than the caller asked for. */
+      const int64_t widened = std::max<int64_t>(k * 2, k + 16);
+      const int64_t k_internal = std::min<int64_t>(widened, std::max<int64_t>(itopk_size, k));
+      if (k_internal > std::numeric_limits<int64_t>::max() / nq) return OVVS_STATUS_SHAPE_MISMATCH;
+      std::vector<int64_t> wide_ids(static_cast<size_t>(nq * k_internal));
+      std::vector<float> wide_distances(static_cast<size_t>(nq * k_internal));
+      const ovvsStatus status = prim_graph_walk(
+          *rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim, ix->ds.metric, ix->graph.data(),
+          ix->degree, queries, nq, k_internal, itopk_size, search_width, bitset, wide_ids.data(),
+          wide_distances.data());
+      if (status != OVVS_STATUS_SUCCESS) return status;
+      for (int64_t q = 0; q < nq; ++q) {
+        int64_t kept = 0;
+        for (int64_t t = 0; t < k_internal && kept < k; ++t) {
+          const int64_t candidate = wide_ids[static_cast<size_t>(q * k_internal + t)];
+          if (candidate < 0 || cagra_row_deleted(*ix, candidate)) continue;
+          neighbors[q * k + kept] = candidate;
+          distances[q * k + kept] = wide_distances[static_cast<size_t>(q * k_internal + t)];
+          ++kept;
+        }
+        for (int64_t t = kept; t < k; ++t) {
+          neighbors[q * k + t] = -1;
+          distances[q * k + t] = kInf;
+        }
+      }
+      return OVVS_STATUS_SUCCESS;
+    }
     return prim_graph_walk(*rd(res), ix->ds.x.data(), ix->ds.n, ix->ds.dim,
                            ix->ds.metric, ix->graph.data(), ix->degree, queries, nq, k,
                            itopk_size, search_width, bitset, neighbors, distances);
@@ -1198,11 +1259,17 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
   std::ofstream f(path, std::ios::binary);
   if (!f) return OVVS_STATUS_IO;
   f.write(reinterpret_cast<const char*>(&kCagraMagic), 4);
-  int32_t ver = 2;
+  /* The version only moves when tombstones are actually present. An index that has never been
+     deleted from still writes v2 and stays readable by existing builds; one that HAS been deleted
+     from writes v3, so an older build rejects the file outright instead of silently ignoring the
+     tombstone section and resurrecting deleted rows. Failing closed is the point. */
+  const bool has_tombstones = ix->deleted_count > 0 && !ix->deleted.empty();
+  int32_t ver = has_tombstones ? 3 : 2;
   f.write(reinterpret_cast<const char*>(&ver), 4);
   int32_t flags = 0;
   if (include_dataset && ix->has_dataset && !ix->ds.x.empty()) flags |= 1;
   if (ix->pq_m > 0 && !ix->codes.empty()) flags |= 2;
+  if (has_tombstones) flags |= 4;
   f.write(reinterpret_cast<const char*>(&flags), 4);
   f.write(reinterpret_cast<const char*>(&ix->ds.n), 8);
   f.write(reinterpret_cast<const char*>(&ix->ds.dim), 8);
@@ -1224,6 +1291,11 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
     f.write(reinterpret_cast<const char*>(ix->codes.data()),
             static_cast<std::streamsize>(ix->codes.size()));
   }
+  if (flags & 4) {
+    f.write(reinterpret_cast<const char*>(&ix->deleted_count), 8);
+    f.write(reinterpret_cast<const char*>(ix->deleted.data()),
+            static_cast<std::streamsize>(ix->deleted.size()));
+  }
   return f.good() ? OVVS_STATUS_SUCCESS : OVVS_STATUS_IO;
 }
 
@@ -1240,6 +1312,7 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
   if (magic != kCagraMagic) return OVVS_STATUS_IO;
   int32_t ver = 0;
   f.read(reinterpret_cast<char*>(&ver), 4);
+  if (ver > 3) return OVVS_STATUS_IO;
   auto* ix = new CagraIndex();
   int32_t flags = 1;
   if (ver >= 2) f.read(reinterpret_cast<char*>(&flags), 4);
@@ -1270,12 +1343,140 @@ ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagra
            static_cast<std::streamsize>(ix->codebooks.size() * sizeof(float)));
     f.read(reinterpret_cast<char*>(ix->codes.data()), static_cast<std::streamsize>(ix->codes.size()));
   }
+  if (flags & 4) {
+    f.read(reinterpret_cast<char*>(&ix->deleted_count), 8);
+    ix->deleted.resize(static_cast<size_t>((ix->ds.n + 7) / 8));
+    f.read(reinterpret_cast<char*>(ix->deleted.data()),
+           static_cast<std::streamsize>(ix->deleted.size()));
+    if (ix->deleted_count < 0 || ix->deleted_count > ix->ds.n) {
+      delete ix;
+      return OVVS_STATUS_IO;
+    }
+  }
   if (!f) {
     delete ix;
     return OVVS_STATUS_IO;
   }
   *index = reinterpret_cast<ovvsCagraIndex_t>(ix);
   return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const int64_t* ids,
+                           int64_t nids) {
+  if (!res || !index || !ids || nids < 0) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (nids == 0) return OVVS_STATUS_SUCCESS;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  for (int64_t i = 0; i < nids; ++i) {
+    if (ids[i] < 0 || ids[i] >= ix->ds.n) return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  try {
+    if (ix->deleted.empty()) {
+      ix->deleted.assign(static_cast<size_t>((ix->ds.n + 7) / 8), 0u);
+    }
+    for (int64_t i = 0; i < nids; ++i) {
+      const size_t byte = static_cast<size_t>(ids[i]) >> 3;
+      const uint8_t mask = static_cast<uint8_t>(1u << (ids[i] & 7));
+      if ((ix->deleted[byte] & mask) != 0) continue;  /* idempotent */
+      ix->deleted[byte] |= mask;
+      ++ix->deleted_count;
+    }
+    rd(res)->last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
+}
+
+ovvsStatus ovvsCagraCounts(ovvsCagraIndex_t index, int64_t* live, int64_t* deleted) {
+  if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  if (live) *live = ix->ds.n - ix->deleted_count;
+  if (deleted) *deleted = ix->deleted_count;
+  return OVVS_STATUS_SUCCESS;
+}
+
+/* Rebuilds one row's out-edges from a fresh search and re-prunes the in-neighbours it names, which
+   is the same repair `cagra_insert_one` performs for a newly appended row. Used by update, where
+   the vector at `row` has changed and its old neighbourhood no longer describes it. */
+static ovvsStatus cagra_relink_one(CagraIndex* ix, ResourcesData& r, int64_t row) {
+  const int64_t dim = ix->ds.dim;
+  const int32_t degree = ix->degree;
+  std::vector<int64_t> nb(static_cast<size_t>(degree));
+  std::vector<float> nd(static_cast<size_t>(degree));
+  const ovvsStatus status =
+      graph_search(r, ix->ds.x.data(), ix->ds.n, dim, ix->ds.metric, ix->graph.data(), degree,
+                   ix->ds.x.data() + row * dim, 1, degree, degree * 2, 2, nullptr, nb.data(),
+                   nd.data());
+  if (status != OVVS_STATUS_SUCCESS) return status;
+  for (int32_t t = 0; t < degree; ++t) {
+    int32_t found = t < static_cast<int32_t>(nb.size()) ? static_cast<int32_t>(nb[static_cast<size_t>(t)]) : -1;
+    if (found == static_cast<int32_t>(row)) found = -1;  /* never self-loop */
+    ix->graph[static_cast<size_t>(row * degree + t)] = found;
+  }
+  for (int32_t t = 0; t < degree; ++t) {
+    const int32_t u = ix->graph[static_cast<size_t>(row * degree + t)];
+    if (u < 0) continue;
+    std::vector<int32_t> cand;
+    for (int32_t e = 0; e < degree; ++e) {
+      const int32_t v = ix->graph[static_cast<size_t>(static_cast<int64_t>(u) * degree + e)];
+      if (v >= 0) cand.push_back(v);
+    }
+    cand.push_back(static_cast<int32_t>(row));
+    robust_prune(ix->ds.x.data(), dim, ix->ds.metric, u, cand, degree, 1.2f,
+                 ix->graph.data() + static_cast<int64_t>(u) * degree);
+  }
+  return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const int64_t* ids,
+                           const float* vectors, int64_t nids) {
+  if (!res || !index || !ids || !vectors || nids < 0) return OVVS_STATUS_INVALID_ARGUMENT;
+  if (nids == 0) return OVVS_STATUS_SUCCESS;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  if (!ix->has_dataset || ix->ds.x.empty()) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* resources = rd(res);
+  if (resources->policy == OVVS_POLICY_FORCE_NPU) {
+    ++resources->npu_fallbacks;
+    return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
+  for (int64_t i = 0; i < nids; ++i) {
+    if (ids[i] < 0 || ids[i] >= ix->ds.n) return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  const int64_t dim = ix->ds.dim;
+  try {
+    for (int64_t i = 0; i < nids; ++i) {
+      const int64_t row = ids[i];
+      /* Keep the old vector so a failed relink can be undone; the graph rows the relink rewrites
+         are repaired by the relink itself on the next successful call, and leaving a stale edge
+         is safe because edges are only hints. Losing the caller's vector would not be. */
+      std::vector<float> previous(ix->ds.x.begin() + row * dim, ix->ds.x.begin() + (row + 1) * dim);
+      std::copy(vectors + i * dim, vectors + (i + 1) * dim, ix->ds.x.begin() + row * dim);
+      const ovvsStatus status = cagra_relink_one(ix, *resources, row);
+      if (status != OVVS_STATUS_SUCCESS) {
+        std::copy(previous.begin(), previous.end(), ix->ds.x.begin() + row * dim);
+        return status;
+      }
+      /* Updating a tombstoned row revives it: the caller supplied a live vector for that id. */
+      if (cagra_row_deleted(*ix, row)) {
+        ix->deleted[static_cast<size_t>(row) >> 3] &=
+            static_cast<uint8_t>(~(1u << (row & 7)));
+        --ix->deleted_count;
+      }
+    }
+    if (ix->pq_m > 0 && !ix->codes.empty()) {
+      pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub,
+                     ix->codebooks.data(), ix->codes.data());
+    }
+    resources->last_device = OVVS_DEVICE_CPU;
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    return OVVS_STATUS_ERROR;
+  }
 }
 
 ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const float* extra,
@@ -1295,19 +1496,62 @@ ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const fl
     return OVVS_STATUS_SHAPE_MISMATCH;
   }
   try {
-    CagraIndex staged = *ix;
-    for (int64_t i = 0; i < nextra; ++i) {
-      const ovvsStatus status =
-          cagra_insert_one(&staged, *rd(res), extra + i * dim);
-      if (status != OVVS_STATUS_SUCCESS) return status;
+    /* This used to be `CagraIndex staged = *ix;` -- a deep copy of the dataset and the graph, so
+       inserting ONE vector into a SIFT1M index peaked around 1.8 GB. The copy bought all-or-nothing
+       semantics, which are worth keeping; the cost is not. Insert in place instead and journal the
+       only thing that is destructively overwritten: the <= degree neighbour rows `robust_prune`
+       rewrites per insert. That is degree*degree*4 bytes, about 1 KB at degree 16.
+       Everything else is append-only and unwound by truncating. */
+    const int64_t original_n = ix->ds.n;
+    /* Grow both buffers at most once for the whole batch. Two things are being balanced here.
+       Reserving the exact final size would make every single-vector Extend reallocate and copy
+       the whole dataset, i.e. O(n) per insert -- and inserting one vector at a time is precisely
+       the on-device-memory workload this library exists for. Letting the vectors grow themselves
+       instead reallocates repeatedly *within* a batch. So: grow only when short, and when growing,
+       take at least half again, which keeps incremental insert amortised O(1) while a batch pays
+       a single reallocation. */
+    const auto grow = [](auto& buffer, size_t needed) {
+      if (buffer.capacity() >= needed) return;
+      buffer.reserve(std::max(needed, buffer.capacity() + buffer.capacity() / 2));
+    };
+    grow(ix->ds.x, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(dim));
+    grow(ix->graph, static_cast<size_t>(original_n + nextra) * static_cast<size_t>(ix->degree));
+    std::vector<CagraGraphRowBackup> journal;
+    bool failed = false;
+    ovvsStatus failure = OVVS_STATUS_SUCCESS;
+
+    for (int64_t i = 0; i < nextra && !failed; ++i) {
+      const ovvsStatus status = cagra_insert_one(ix, *resources, extra + i * dim, &journal);
+      if (status != OVVS_STATUS_SUCCESS) {
+        failed = true;
+        failure = status;
+      }
     }
-    if (staged.pq_m > 0) {
-      staged.codes.resize(static_cast<size_t>(staged.ds.n) *
-                          static_cast<size_t>(staged.pq_m));
-      pq_encode_rows(staged.ds.x.data(), staged.ds.n, dim, staged.pq_m, staged.pq_ks,
-                     staged.dsub, staged.codebooks.data(), staged.codes.data());
+
+    if (failed) {
+      /* Unwound newest first, so a row rewritten by several inserts lands back on its oldest
+         snapshot -- the state it had before this call started. */
+      for (size_t j = journal.size(); j-- > 0;) {
+        const CagraGraphRowBackup& backup = journal[j];
+        if (backup.row < original_n) {
+          std::copy(backup.edges.begin(), backup.edges.end(),
+                    ix->graph.begin() + backup.row * ix->degree);
+        }
+      }
+      ix->ds.x.resize(static_cast<size_t>(original_n) * static_cast<size_t>(dim));
+      ix->ds.n = original_n;
+      ix->graph.resize(static_cast<size_t>(original_n) * static_cast<size_t>(ix->degree));
+      return failure;
     }
-    *ix = std::move(staged);
+
+    if (!ix->deleted.empty()) {
+      ix->deleted.resize(static_cast<size_t>((ix->ds.n + 7) / 8), 0u);
+    }
+    if (ix->pq_m > 0) {
+      ix->codes.resize(static_cast<size_t>(ix->ds.n) * static_cast<size_t>(ix->pq_m));
+      pq_encode_rows(ix->ds.x.data(), ix->ds.n, dim, ix->pq_m, ix->pq_ks, ix->dsub,
+                     ix->codebooks.data(), ix->codes.data());
+    }
     resources->last_device = OVVS_DEVICE_CPU;
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {

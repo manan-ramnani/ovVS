@@ -723,3 +723,58 @@ Append newest last. One line per real event: what landed, what number it produce
     staged = *ix;`, graphs.cpp:1298) which is a live G3 violation on the insert path.
   ⚠ **Nothing from this entire session is committed.** Working tree carries the whole kernel
   rewrite, the counters, `ab_g1.py`, and the harness changes.
+- **2026-08-30** — **G2/G4 PHASE 1 LANDED. The mutation surface exists for the first time.**
+  Design in `.claude/plans/2026-08-30-ovvs-cagra-mutation.md`. New ABI: `ovvsCagraDelete`,
+  `ovvsCagraUpdate`, `ovvsCagraCounts`, plus Python bindings and `tools/bench/churn.py`.
+  All 9 CTest lanes pass.
+  - **Delete is a tombstone**, forced by the audit finding that ids ARE row offsets with no
+    indirection: compaction would renumber and invalidate every caller-held id.
+  - **A deleted row stays traversable but is not returnable.** This is the decision the gate turns
+    on. Excluding deleted nodes from traversal fragments the graph -- every node is a routing hop
+    for its neighbours -- so recall would collapse in proportion to the deletion rate, which is
+    exactly hnswlib's `markDelete` weakness. Instead they are scored and expanded as normal and
+    dropped only at k-selection, with the walk over-fetching (capped at `itopk_size`, so the
+    caller's search effort is not silently raised) so a thinned result still yields k live rows.
+  - **Update keeps the id**: overwrite the row, re-search its out-edges, re-prune its
+    in-neighbours. Delete+insert would hand back a different id, which is not an update.
+  - **Serialization fails closed**: the tombstone section bumps `ver` to 3 *only when tombstones
+    exist*, so an un-deleted index still writes v2 and stays readable by existing builds, while a
+    deleted one is refused by an old build rather than silently resurrecting deleted rows.
+
+  **G4 measured -- recall against the LIVE set, recomputed every round** (comparing against the
+  original truth would be meaningless once rows are deleted or overwritten). 5 rounds of
+  20,000 deletes (20% of the corpus), 10,000 updates, 10,000 inserts:
+  recall **0.9733 -> 0.968 -> 0.964 -> 0.9637 -> 0.9663 -> 0.968**. It dips ~1% and then
+  **recovers and stabilises rather than decaying**, and `returned_frac` stays 1.0 throughout.
+  **G4 passes at 20% deletion.**
+
+  **G2 measured (per operation):** delete **0.01-0.03 us** (a bit set), update **150-212 us**,
+  insert **151-216 us**. No operation is a stall.
+- **2026-08-30** — **`ovvsCagraExtend`'s 1.8 GB-per-insert defect is FIXED, and measured against
+  the old binary.** The whole-index copy (`CagraIndex staged = *ix;`) existed for all-or-nothing
+  semantics; those are kept, via an in-place insert plus a rollback journal of only the <= degree
+  neighbour rows `robust_prune` overwrites -- about 1 KB at degree 16.
+  Then a second bug behind it: growth. Reserving the *exact* final size makes every single-vector
+  Extend reallocate and copy the whole dataset, O(n) per insert, and one vector at a time is the
+  on-device-memory workload. Growing by at least half again keeps incremental insert amortised
+  O(1) while a batch still pays one reallocation.
+
+  | metric, SIFT100K | old | new | |
+  |---|---:|---:|---:|
+  | peak working-set delta, 1-vector extend | +99.6 MB | **+13.2 MB** | 7.5x |
+  | single-vector insert, median of 200 | 10,622 us | **187 us** | **56.7x** |
+  | same, p90 | 12,482 us | **230 us** | 54x |
+
+  The 99.6 - 41.9 = 57.7 MB removed by dropping the copy matches the dataset + graph size
+  (51.2 + 6.4 MB) almost exactly, which is the check that the fix did what it claimed.
+- **2026-08-30** — **G2 wrinkle worth recording: mutation is refused under `FORCE_GPU`.**
+  Delete/update/extend all have no GPU path and return `DEVICE_UNAVAILABLE` under
+  `OVVS_POLICY_FORCE_GPU`, so a caller that pins the GPU for search cannot mutate at all without
+  flipping policy. `churn.py` flips it around every mutating call. Defensible, but it is a real
+  usability edge for a "living store" and should either be documented or made to fall back.
+- **2026-08-30** — **NOT done in phase 1, stated so it is not mistaken for done:** no slot reuse,
+  so deleted rows do not return their storage and sustained churn grows the footprint (a G3 risk).
+  The fix is `(slot, generation)` packed into the `int64_t` the ABI already returns, so a stale id
+  is *detectably* stale; a freshly built index has all generations 0 and behaves identically.
+  Also no graph repair on delete: tombstoned nodes keep their edges, and the quality curve is
+  measured rather than prevented.

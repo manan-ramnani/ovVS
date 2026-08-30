@@ -311,6 +311,18 @@ OVVS_API ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* pat
 OVVS_API ovvsStatus ovvsCagraDeserialize(ovvsResources_t res, const char* path, ovvsCagraIndex_t* index);
 OVVS_API ovvsStatus ovvsCagraExtend(ovvsResources_t res, ovvsCagraIndex_t index, const float* extra,
                                     int64_t nextra);
+/* Tombstone rows by id. Deleted rows keep their graph edges and still route search traffic, so
+   recall degrades gradually instead of the graph fragmenting, but they are never returned as
+   results. Idempotent: deleting an already-deleted id succeeds. Ids are row offsets, as returned
+   by a search. Phase 1 does not reclaim the storage -- see .claude/plans/2026-08-30-ovvs-cagra-mutation.md */
+OVVS_API ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const int64_t* ids,
+                                    int64_t nids);
+/* Overwrite the vectors stored at `ids` and repair their graph neighbourhoods. Ids are unchanged,
+   which is what distinguishes this from delete-then-insert. Updating a deleted row revives it. */
+OVVS_API ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const int64_t* ids,
+                                    const float* vectors, int64_t nids);
+/* Rows currently live and rows tombstoned. Either output pointer may be NULL. */
+OVVS_API ovvsStatus ovvsCagraCounts(ovvsCagraIndex_t index, int64_t* live, int64_t* deleted);
 OVVS_API ovvsStatus ovvsCagraDestroy(ovvsCagraIndex_t index);
 
 /* Base-layer hnswlib-compatible export from L2-expanded CAGRA. */

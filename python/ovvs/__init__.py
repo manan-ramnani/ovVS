@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-from ctypes import POINTER, c_char_p, c_float, c_int32, c_int64, c_uint32, c_uint8, c_void_p
+from ctypes import POINTER, byref, c_char_p, c_float, c_int32, c_int64, c_uint32, c_uint8, c_void_p
 from pathlib import Path
 
 
@@ -210,6 +210,17 @@ _lib.ovvsCagraSearch.argtypes = [
     POINTER(c_int64),
     POINTER(c_float),
 ]
+_lib.ovvsCagraExtend.argtypes = [c_void_p, c_void_p, POINTER(c_float), c_int64]
+# The mutation entry points post-date some already-built libraries. Binding them optionally keeps
+# this module loadable against an older ovvs.dll, which is also what makes an A/B against one
+# possible -- that is how the Extend memory fix below was measured.
+try:
+    _lib.ovvsCagraDelete.argtypes = [c_void_p, c_void_p, POINTER(c_int64), c_int64]
+    _lib.ovvsCagraUpdate.argtypes = [c_void_p, c_void_p, POINTER(c_int64), POINTER(c_float), c_int64]
+    _lib.ovvsCagraCounts.argtypes = [c_void_p, POINTER(c_int64), POINTER(c_int64)]
+    _HAS_CAGRA_MUTATION = True
+except AttributeError:  # pragma: no cover - older library
+    _HAS_CAGRA_MUTATION = False
 _lib.ovvsCagraDestroy.argtypes = [c_void_p]
 _lib.ovvsIvfFlatBuild.argtypes = [
     c_void_p,
@@ -742,6 +753,56 @@ class CagraIndex(_Index):
         )
         _check_status(rc, "CAGRA search")
         return _maybe_np(nb, nq, k), _maybe_np_f(ds, nq, k)
+
+    def extend(self, extra):
+        keep, ptr, n, _d = _dataset_ptr(extra, self.dim)
+        rc = _lib.ovvsCagraExtend(self._res._h, self._h, ptr, c_int64(n))
+        _check_status(rc, "CAGRA extend")
+        self.n += n
+        return keep
+
+    def delete(self, ids):
+        _require_mutation()
+        buf, count = _id_array(ids)
+        rc = _lib.ovvsCagraDelete(self._res._h, self._h, buf, c_int64(count))
+        _check_status(rc, "CAGRA delete")
+
+    def update(self, ids, vectors):
+        _require_mutation()
+        buf, count = _id_array(ids)
+        keep, ptr, n, _d = _dataset_ptr(vectors, self.dim)
+        if n != count:
+            raise ValueError(f"update needs one vector per id, got {n} vectors for {count} ids")
+        rc = _lib.ovvsCagraUpdate(self._res._h, self._h, buf, ptr, c_int64(count))
+        _check_status(rc, "CAGRA update")
+        return keep
+
+    def counts(self):
+        _require_mutation()
+        live = c_int64()
+        deleted = c_int64()
+        rc = _lib.ovvsCagraCounts(self._h, byref(live), byref(deleted))
+        _check_status(rc, "CAGRA counts")
+        return live.value, deleted.value
+
+
+def _require_mutation():
+    if not _HAS_CAGRA_MUTATION:
+        raise RuntimeError("this ovvs library predates CAGRA delete/update/counts")
+
+
+def _id_array(ids):
+    try:
+        import numpy as np
+
+        if isinstance(ids, np.ndarray):
+            flat = np.ascontiguousarray(ids, dtype=np.int64).ravel()
+            return flat.ctypes.data_as(POINTER(c_int64)), int(flat.size)
+    except ImportError:
+        pass
+    values = [int(v) for v in ids]
+    buf = (c_int64 * len(values))(*values)
+    return buf, len(values)
 
 
 class IvfFlatIndex(_Index):
