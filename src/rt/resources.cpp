@@ -20,6 +20,19 @@ ovvsStatus ovvsResourcesCreate(ovvsResources_t* res) {
   return OVVS_STATUS_SUCCESS;
 }
 
+ResourcesData::~ResourcesData() {
+  if (gpu_walk_workspace) {
+    ovvs_gpu_workspace_free(gpu_walk_workspace);
+    gpu_walk_workspace = nullptr;
+    gpu_walk_workspace_bytes = 0;
+  }
+  if (gpu_int8_data) {
+    ovvs_gpu_workspace_free(gpu_int8_data);
+    gpu_int8_data = nullptr;
+    gpu_int8_usable = false;
+  }
+}
+
 ovvsStatus ovvsResourcesDestroy(ovvsResources_t res) {
   delete rd(res);
   return OVVS_STATUS_SUCCESS;
@@ -76,6 +89,34 @@ ovvsStatus ovvsResourcesLastDevice(ovvsResources_t res, ovvsDevice* device) {
 ovvsStatus ovvsResourcesLastComputeDtype(ovvsResources_t res, ovvsDType* dtype) {
   if (!res || !dtype) return OVVS_STATUS_INVALID_ARGUMENT;
   *dtype = rd(res)->last_compute_dtype;
+  return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus ovvsResourcesSetCagraWalkCounters(ovvsResources_t res, int32_t enable) {
+  if (!res) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* resources = rd(res);
+  std::lock_guard<std::mutex> lock(resources->cagra_walk_counter_mutex);
+  resources->cagra_walk_counters_enabled = enable != 0;
+  return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus ovvsResourcesCagraWalkCounters(ovvsResources_t res, int64_t* out, int32_t count) {
+  if (!res || !out || count < 0 || count > OVVS_CAGRA_WALK_COUNTER_COUNT) {
+    return OVVS_STATUS_INVALID_ARGUMENT;
+  }
+  auto* resources = rd(res);
+  std::lock_guard<std::mutex> lock(resources->cagra_walk_counter_mutex);
+  for (int32_t i = 0; i < count; ++i) out[i] = resources->cagra_walk_counters[i];
+  return OVVS_STATUS_SUCCESS;
+}
+
+ovvsStatus ovvsResourcesResetCagraWalkCounters(ovvsResources_t res) {
+  if (!res) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* resources = rd(res);
+  std::lock_guard<std::mutex> lock(resources->cagra_walk_counter_mutex);
+  for (int32_t i = 0; i < OVVS_CAGRA_WALK_COUNTER_COUNT; ++i) {
+    resources->cagra_walk_counters[i] = 0;
+  }
   return OVVS_STATUS_SUCCESS;
 }
 

@@ -222,6 +222,12 @@ struct ResourcesData {
   int64_t cagra_direct_index_calls = 0;
   int64_t cagra_index_upload_calls = 0;
   int64_t cagra_index_upload_bytes = 0;
+  // Opt-in graph-walk work counters. Off by default so the production kernel is
+  // byte-identical and pays nothing; the walk branches on a uniform null pointer.
+  // Index order must match OVVS_CAGRA_WALK_COUNTER_* in ovvs.h.
+  std::mutex cagra_walk_counter_mutex;
+  bool cagra_walk_counters_enabled = false;
+  int64_t cagra_walk_counters[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   std::mutex cagra_build_stats_mutex;
   ovvsCagraBuildStatsV1 cagra_build_stats{};
   std::mutex nndescent_stats_mutex;
@@ -260,6 +266,29 @@ struct ResourcesData {
     if (scratch.size() < n) scratch.resize(n);
     return scratch.data();
   }
+
+  /* Device-local scratch reused across graph-walk calls. Allocating and freeing the visited
+     table and the query/output staging on every search cost four device allocations, four
+     frees and four queue drains per call -- a fixed tax that dominates batch-one latency.
+     Owned per Resources because the documented concurrency model is one Resources per worker. */
+  void* gpu_walk_workspace = nullptr;
+  size_t gpu_walk_workspace_bytes = 0;
+
+  /* Device-side uint8 mirror of a graph-walk dataset. Only built when every element is an
+     integer in [0,255] and the dimension is small enough that the exact integer distance
+     still fits a float mantissa, in which case the int8 walk is BITWISE identical to the
+     fp32 walk while touching a quarter of the cache lines per candidate. Keyed on the
+     source pointer plus a sampled fingerprint so a freed-and-reallocated dataset landing
+     on the same address cannot be mistaken for a cache hit. */
+  std::mutex gpu_int8_mutex;
+  const void* gpu_int8_source = nullptr;
+  size_t gpu_int8_rows = 0;
+  size_t gpu_int8_dim = 0;
+  uint64_t gpu_int8_fingerprint = 0;
+  void* gpu_int8_data = nullptr;
+  bool gpu_int8_usable = false;
+
+  ~ResourcesData();
 };
 
 inline ResourcesData* rd(ovvsResources_t r) { return reinterpret_cast<ResourcesData*>(r); }
@@ -275,6 +304,10 @@ bool npu_shave_profile_adc(int* shave_tasks, int* dpu_tasks, std::vector<uint8_t
 void* ovvs_usm_malloc(size_t bytes);
 void ovvs_usm_free(void* p);
 bool ovvs_usm_is_shared(const void* p);
+
+/* Device-local (not shared) allocations for reusable GPU scratch. No-ops without SYCL. */
+void* ovvs_gpu_workspace_alloc(size_t bytes);
+void ovvs_gpu_workspace_free(void* p);
 
 template <typename T>
 struct UsmAllocator {
@@ -431,13 +464,40 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
                            int64_t nq, int64_t k, int32_t itopk, int32_t search_width,
                            const uint8_t* bitset, int64_t* neighbors, float* distances);
 
+/* Temporary sweep instrument: OVVS_CAGRA_SEEDS pins the seed count so the recall-vs-QPS
+   curve can be measured in one process instead of one rebuild per point. Read once.
+   Remove this override once the seed budget is fixed. */
+inline int64_t cagra_seed_override() {
+  static const int64_t value = []() -> int64_t {
+    const char* env = std::getenv("OVVS_CAGRA_SEEDS");
+    if (!env || !*env) return -1;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(env, &end, 10);
+    if (end == env || *end != '\0' || parsed < 1) return -1;
+    return static_cast<int64_t>(parsed);
+  }();
+  return value;
+}
+
 /* CAGRA is single-layer: random itopk seeds land too far in high-d for greedy routing
-   on graph_degree=16. Score a larger sample, then keep itopk. */
+   on graph_degree=16. Score a larger sample, then keep itopk.
+   Measured on SIFT100K: this phase is 43-50% of ALL candidate distance evaluations, so the
+   count is a first-order performance knob and must stay identical on the CPU and GPU paths.
+   Both call this function; do not re-derive it at a call site. */
 inline int64_t cagra_seed_count(int64_t n, int32_t itopk, int32_t search_width) {
-  int64_t seeds = static_cast<int64_t>(std::max(1, itopk)) * 16;
-  const int64_t from_sw = static_cast<int64_t>(std::max(1, search_width)) * 32;
-  if (from_sw > seeds) seeds = from_sw;
-  if (seeds < 512) seeds = 512;
+  const int64_t override_seeds = cagra_seed_override();
+  int64_t seeds;
+  if (override_seeds >= 1) {
+    seeds = override_seeds;
+  } else {
+    /* Measured on SIFT100K, batch 1024, sweeping this count over 512..16 with everything
+       else fixed: recall@10 is flat to four decimals (itopk=32/w1: 0.9718 -> 0.9721;
+       itopk=64/w2: 0.9947 -> 0.9946) while throughput rises 36-46%. The old
+       "score a larger sample" budget of 16*itopk (512-2048 seeds) was 43-50% of ALL
+       candidate distance evaluations and bought no measurable recall. Keep enough to give
+       the first iteration search_width distinct candidates to expand. */
+    seeds = std::max<int64_t>(32, static_cast<int64_t>(std::max(1, search_width)));
+  }
   if (n > 0 && seeds > n) seeds = n;
   if (seeds < 1) seeds = n > 0 ? 1 : 0;
   return seeds;

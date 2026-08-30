@@ -173,6 +173,26 @@ OVVS_API ovvsStatus ovvsResourcesLastComputeDtype(ovvsResources_t res, ovvsDType
    query batch. A direct call requires both index buffers to be GPU-accessible. Upload calls count
    invocations that upload either the dataset or graph; upload bytes sum only those index buffers,
    excluding query, output, and bitset transfers. Counters saturate at INT64_MAX. */
+/* Opt-in graph-walk work counters. Off by default; enabling them costs one uniform
+   branch in the walk and one atomic per work-group, so production timing is unaffected.
+   Counters are cumulative on the Resources object; Reset zeroes them. */
+#define OVVS_CAGRA_WALK_COUNTER_QUERIES 0
+#define OVVS_CAGRA_WALK_COUNTER_EVALS 1
+#define OVVS_CAGRA_WALK_COUNTER_SEED_EVALS 2
+#define OVVS_CAGRA_WALK_COUNTER_ITERATIONS 3
+#define OVVS_CAGRA_WALK_COUNTER_MAX_ITERATIONS 4
+#define OVVS_CAGRA_WALK_COUNTER_TABLE_FULL 5
+#define OVVS_CAGRA_WALK_COUNTER_ADMITS 6
+/* Candidates that survived the beam-worst pre-filter, i.e. the ones the serial admit
+   loop actually pays for. ADMITS counts every scored candidate; the difference is what
+   the filter removes. */
+#define OVVS_CAGRA_WALK_COUNTER_SURVIVORS 7
+#define OVVS_CAGRA_WALK_COUNTER_COUNT 8
+OVVS_API ovvsStatus ovvsResourcesSetCagraWalkCounters(ovvsResources_t res, int32_t enable);
+OVVS_API ovvsStatus ovvsResourcesCagraWalkCounters(ovvsResources_t res, int64_t* out,
+                                                   int32_t count);
+OVVS_API ovvsStatus ovvsResourcesResetCagraWalkCounters(ovvsResources_t res);
+
 OVVS_API ovvsStatus ovvsResourcesCagraTransferStats(ovvsResources_t res, int64_t* walks,
                                                     int64_t* direct_walks,
                                                     int64_t* upload_calls,

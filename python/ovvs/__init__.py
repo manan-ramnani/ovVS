@@ -301,6 +301,28 @@ else:
         POINTER(c_int64),
         POINTER(c_int64),
     ]
+_CAGRA_WALK_COUNTER_NAMES = (
+    "queries",
+    "evals",
+    "seed_evals",
+    "iterations",
+    "max_iterations",
+    "table_full",
+    "admits",
+    "survivors",
+)
+try:
+    _resources_set_cagra_walk_counters = _lib.ovvsResourcesSetCagraWalkCounters
+    _resources_cagra_walk_counters = _lib.ovvsResourcesCagraWalkCounters
+    _resources_reset_cagra_walk_counters = _lib.ovvsResourcesResetCagraWalkCounters
+except AttributeError:
+    _resources_set_cagra_walk_counters = None
+    _resources_cagra_walk_counters = None
+    _resources_reset_cagra_walk_counters = None
+else:
+    _resources_set_cagra_walk_counters.argtypes = [c_void_p, c_int32]
+    _resources_cagra_walk_counters.argtypes = [c_void_p, POINTER(c_int64), c_int32]
+    _resources_reset_cagra_walk_counters.argtypes = [c_void_p]
 try:
     _resources_ivfpq_search_stats_v1 = _lib.ovvsResourcesIvfPqSearchStatsV1
 except AttributeError:
@@ -491,6 +513,28 @@ class Resources:
         if _lib.ovvsResourcesLastDevice(self._h, ctypes.byref(d)) != 0:
             raise RuntimeError("last_device failed")
         return int(d.value)
+
+    def set_cagra_walk_counters(self, enable: bool) -> bool:
+        """Enable opt-in graph-walk work counters. Returns False if unsupported."""
+        if _resources_set_cagra_walk_counters is None:
+            return False
+        if _resources_set_cagra_walk_counters(self._h, c_int32(1 if enable else 0)) != 0:
+            raise RuntimeError("set_cagra_walk_counters failed")
+        return True
+
+    def reset_cagra_walk_counters(self) -> None:
+        if _resources_reset_cagra_walk_counters is not None:
+            _resources_reset_cagra_walk_counters(self._h)
+
+    def cagra_walk_counters(self):
+        """Cumulative graph-walk work counters, or None when unsupported."""
+        if _resources_cagra_walk_counters is None:
+            return None
+        n = len(_CAGRA_WALK_COUNTER_NAMES)
+        buf = (c_int64 * n)()
+        if _resources_cagra_walk_counters(self._h, buf, c_int32(n)) != 0:
+            raise RuntimeError("cagra_walk_counters failed")
+        return {name: int(buf[i]) for i, name in enumerate(_CAGRA_WALK_COUNTER_NAMES)}
 
     def last_compute_dtype(self) -> int:
         d = c_int32()
