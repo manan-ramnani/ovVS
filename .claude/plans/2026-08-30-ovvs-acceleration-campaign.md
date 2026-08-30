@@ -1169,3 +1169,18 @@ Append newest last. One line per real event: what landed, what number it produce
   (3) persistent CPU worker pool (thread spawn per call ≈ 6-10% at b1024);
   (4) adaptive split fraction. Then a COLD-BOX certified G1 session with lane-stability
   discipline. Known-good pieces, each measured-adjacent, all additive.
+- **2026-08-31** — **`OVVS_POLICY_HETERO` IS NOW THE ADAPTIVE "TURBO HYBRID" (user's F1
+  framing): CPU-only below the nq crossover, CPU+GPU split above it.** The enum existed
+  unused-in-meaning; it now routes: `nq < 128` (env `OVVS_HYBRID_MIN_NQ`) → threaded CPU
+  walk outright (a lone query answers in 0.18 ms instead of paying 1.9 ms of GPU spin-up);
+  `nq ≥ 128` → hybrid split at f=0.55 default. AUTO/GPU_IF_FASTER keep their exact prior
+  behaviour unless OVVS_HYBRID_WALK is set. `quick_cagra --search-policy hetero`. 9/9 CTest.
+  **One policy, whole load curve (d32 32/2 p0, recall 0.9962 at every point):**
+  nq=1 → 5.4K QPS @ 0.180 ms p50; nq=32 → 14.9K; nq=128 → 33.4K; nq=256 → 43.2K;
+  nq=1024 → 58.2K. Versus hnswlib at matched recall: ahead at b1 (0.180 vs ~0.20-0.22 ms),
+  **3-5× ahead at b32** (their binding is single-core below ~80 rows — long documented),
+  competitive-to-ahead from b128 up. The b1024 point ties the hybrid's shared-window
+  standing (~+7% pooled median, certification pending a cold box).
+  Open tuning: the 128 crossover and 0.55 fraction are R1-measured constants — make them
+  n-aware for R2/R3 (per-query cost grows with corpus on both engines; re-measure at 1M
+  before promoting HETERO to the recommended default in docs).

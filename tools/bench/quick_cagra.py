@@ -30,6 +30,7 @@ import ovvs  # noqa: E402
 
 DATASET = Path(__file__).resolve().parents[2] / "data" / "sift-128-euclidean.hdf5"
 POLICY_AUTO = 0
+POLICY_HETERO = 3
 POLICY_FORCE_GPU = 5
 POLICY_FORCE_CPU = 6
 
@@ -190,7 +191,7 @@ def main() -> int:
     ap.add_argument("--passes", type=int, default=5)
     ap.add_argument("--graph-degree", type=int, default=16)
     ap.add_argument("--intermediate-degree", type=int, default=32)
-    ap.add_argument("--search-policy", choices=("gpu", "cpu", "auto"), default="gpu")
+    ap.add_argument("--search-policy", choices=("gpu", "cpu", "auto", "hetero"), default="gpu")
     ap.add_argument(
         "--counters",
         action="store_true",
@@ -269,6 +270,7 @@ def main() -> int:
             "gpu": POLICY_FORCE_GPU,
             "cpu": POLICY_FORCE_CPU,
             "auto": POLICY_AUTO,  # both engines permitted; OVVS_HYBRID_WALK splits them
+            "hetero": POLICY_HETERO,  # adaptive: CPU below the nq crossover, split above
         }[args.search_policy]
         resource.set_policy(policy)
         results = []

@@ -517,14 +517,29 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
      TEMPORARY knob until OVVS_POLICY_HETERO adopts it as default behaviour:
      OVVS_HYBRID_WALK = fraction of queries sent to the GPU, 0 < f < 1 (0/unset = off;
      measured contended engine rates put the optimum near 0.5). */
-  const double hybrid_frac = [&]() -> double {
+  double hybrid_frac = [&]() -> double {
     const char* env = std::getenv("OVVS_HYBRID_WALK");
     if (!env || !*env) return 0.0;
     const double parsed = std::strtod(env, nullptr);
     if (!(parsed > 0.0) || parsed >= 1.0) return 0.0;
     return parsed;
   }();
-  const bool hybrid_ok = hybrid_frac > 0.0 && gpu_metric_supported && nq >= 2 &&
+  /* OVVS_POLICY_HETERO is the adaptive "turbo hybrid": below the crossover the batch takes
+     the low-latency CPU path outright (a lone query answers in ~0.18 ms there against
+     ~1.9 ms spinning up the GPU); past it the GPU spools up alongside and the batch
+     splits at the measured optimum. Thresholds are R1-measured defaults, env-overridable
+     for sweeps (OVVS_HYBRID_MIN_NQ, OVVS_HYBRID_WALK) until they become n-aware. */
+  const bool hetero = r.policy == OVVS_POLICY_HETERO;
+  const int64_t hetero_min_nq = [&]() -> int64_t {
+    const char* env = std::getenv("OVVS_HYBRID_MIN_NQ");
+    if (!env || !*env) return 128;
+    const long parsed = std::strtol(env, nullptr, 10);
+    return parsed > 0 ? static_cast<int64_t>(parsed) : 128;
+  }();
+  if (hetero && hybrid_frac == 0.0 && gpu_metric_supported) hybrid_frac = 0.55;
+  const bool hetero_cpu_only = hetero && nq < hetero_min_nq;
+  const bool hybrid_ok = !hetero_cpu_only && hybrid_frac > 0.0 && gpu_metric_supported &&
+                         nq >= 2 &&
                          (r.policy == OVVS_POLICY_AUTO || r.policy == OVVS_POLICY_GPU_IF_FASTER ||
                           r.policy == OVVS_POLICY_HETERO);
   int64_t cpu_begin = 0;
@@ -532,7 +547,7 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
   bool gpu_leg_ok = false;
   std::thread gpu_worker;
 
-  if (gpu_policy && gpu_metric_supported && !hybrid_ok) {
+  if (gpu_policy && gpu_metric_supported && !hybrid_ok && !hetero_cpu_only) {
     if (gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width,
                        bitset, neighbors, distances)) {
       r.last_device = OVVS_DEVICE_GPU;
