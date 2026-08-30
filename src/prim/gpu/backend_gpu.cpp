@@ -2821,12 +2821,10 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t max_wg = device.get_info<sycl::info::device::max_work_group_size>();
     size_t work_group_size = 1;
     while (work_group_size <= max_wg / 2 && work_group_size < 128) work_group_size <<= 1;
-    /* TEMPORARY: isolates the sub-group-per-candidate rewrite (old plan step 2) from the int8
-       mirror it was landed alongside. Remove once the number is recorded. */
-    const bool subgroup_geometry = []() {
-      const char* env = std::getenv("OVVS_GPU_SUBGROUP_GEOM");
-      return !(env && env[0] == '0');
-    }();
+    /* The sub-group-per-candidate geometry is the recorded winner (the 2.4-5.7x walk
+       rewrite); its A/B isolation knob is retired. Devices without sub-group 16 still
+       fall back through force_sub_group_16 below. */
+    constexpr bool subgroup_geometry = true;
     bool force_sub_group_16 = false;
     {
       const auto widths = device.get_info<sycl::info::device::sub_group_sizes>();
@@ -2866,22 +2864,6 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
       if (parsed <= 0) return 0;
       return static_cast<int>(std::min<long>(parsed, 1 << 20));
     }();
-    /* Convergence stop rule, hnswlib's termination semantics adapted to the merged beam:
-       stop expanding once at least stop_ef beam entries are strictly better than the best
-       unexpanded entry -- nothing expandable can then enter the top-stop_ef directly, which
-       is the same one-hop approximation hnswlib's `candidate worse than result worst` test
-       makes. stop_ef plays the role of ef: smaller stops earlier. Costs one strided count
-       over beam distances per iteration, fused after the pick argmin. Output-changing (a
-       recall/throughput trade like patience), so it is off by default and judged on the
-       frontier. TEMPORARY sweep knob: OVVS_CAGRA_STOP_EF (0 = off). */
-    const int32_t stop_ef = [&]() -> int32_t {
-      const char* env = std::getenv("OVVS_CAGRA_STOP_EF");
-      if (!env || !*env) return 0;
-      const long parsed = std::strtol(env, nullptr, 10);
-      if (parsed <= 0) return 0;
-      return static_cast<int32_t>(std::min<long>(parsed, static_cast<long>(BEAM)));
-    }();
-
     /* Shared with the CPU walk (mixer.cpp) and the build-path walk (graphs.cpp) so the two
        can never drift; CPU/GPU ID parity depends on an identical seed stream. */
     const size_t nseeds =
@@ -2906,10 +2888,13 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
        the probes saved while only 64 queries are in flight), so the hash stays the default
        there. The dedup exists for the sub-group-per-query mapping, whose per-query state must
        fit SLM; it is enabled alongside it below, or forced for A/B via OVVS_CAGRA_BEAM_DEDUP=1
-       (=0 forces the hash and thereby one-work-group-per-query). TEMPORARY knob. */
+       (=0 forces the hash and thereby one-work-group-per-query). Experiment-lane knob. */
     const int qpw_requested = [&]() -> int {
       const char* env = std::getenv("OVVS_CAGRA_QPW");
-      if (!env || !*env) return 1; /* TEMPORARY default until the sweep verdict lands */
+      /* VERDICT (Xe-LPG): the sub-group-per-query mapping loses at practical batches
+         (0.82x at b1024 vs the classic path) -- 1 stays the default. The lane is kept
+         for SKUs with more thread slots / SLM per Xe-core; see docs/env.md. */
+      if (!env || !*env) return 1;
       const long parsed = std::strtol(env, nullptr, 10);
       return parsed == 8 ? 8 : 1;
     }();
@@ -2930,7 +2915,7 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
        sub-group 16 (so sub-groups == queries == 8), the beam dedup (per-query state must be
        SLM-resident; the visited hash is neither needed nor wired in that path), and the
        8-slot SLM footprint. Falls back to one query per work-group otherwise.
-       TEMPORARY opt-in: OVVS_CAGRA_QPW=8; the default stays 1 until the sweep verdict. */
+       Experiment lane: OVVS_CAGRA_QPW=8 opts in; on Xe-LPG the classic path won. */
     size_t QPW = 1u;
     size_t bh_capacity = 1u; /* beam-membership hash entries per query (sub-group path) */
     /* Companion to the beam dedup in the sub-group path: a small per-query direct-mapped
@@ -2941,8 +2926,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
        temporally local (64 entries caught 16% of revisit evals, 256 caught 47% while paying
        an O(ring) scan); the hashed cache reaches arbitrary history at O(1). Without either,
        the dedup's extra evals (+43% at d32) ate the mapping's entire concurrency win.
-       TEMPORARY tuning knob: OVVS_CAGRA_SEEN_RING (entries, rounded down to a power of two;
-       0 disables; default 256). */
+       Experiment-lane knob: OVVS_CAGRA_SEEN_RING (entries, rounded down to a power of
+       two; 0 disables; measured default 0 -- any cache loses residency on Xe-LPG). */
     size_t seen_ring = 0u;
     /* beam_dedup is no longer required for the sub-group mapping: req_gate showed the
        fabric has ~8x request headroom at the walk's rates and achieved residency at
@@ -3717,18 +3702,6 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                  const uint32_t best_slot =
                      sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
                  if (best_slot == std::numeric_limits<uint32_t>::max()) break;
-                 if (stop_ef != 0 && s == 0) {
-                   /* Convergence stop: if stop_ef beam entries already beat the best
-                      unexpanded entry, expanding cannot improve the top-stop_ef directly. */
-                   int32_t lane_better = 0;
-                   for (uint32_t i = static_cast<uint32_t>(lane); i < candidate_count;
-                        i += static_cast<uint32_t>(sgsz)) {
-                     if (candidate_distances[cb + i] < best_distance) ++lane_better;
-                   }
-                   const int32_t better =
-                       sycl::reduce_over_group(subgroup, lane_better, sycl::plus<int32_t>());
-                   if (better >= stop_ef) break; /* npicks stays 0: the walk ends */
-                 }
                  if (lane == static_cast<size_t>(best_slot) % sgsz) {
                    candidate_expanded[cb + best_slot] = 1;
                  }
@@ -4447,21 +4420,6 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                  const uint32_t best_slot =
                      sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
                  if (best_slot == std::numeric_limits<uint32_t>::max()) break;
-                 if (stop_ef != 0 && s == 0) {
-                   /* Convergence stop: if stop_ef beam entries already beat the best
-                      unexpanded entry, expanding cannot improve the top-stop_ef directly. */
-                   int32_t lane_better = 0;
-                   for (uint32_t i = static_cast<uint32_t>(subgroup_lane); i < candidate_count;
-                        i += static_cast<uint32_t>(subgroup_size)) {
-                     if (candidate_distances[static_cast<size_t>(i)] < best_distance) {
-                       ++lane_better;
-                     }
-                   }
-                   const int32_t better =
-                       sycl::reduce_over_group(subgroup, lane_better, sycl::plus<int32_t>());
-                   if (better >= stop_ef) break; /* npicks stays 0: the walk ends */
-                 }
-
                  if (subgroup_lane == static_cast<size_t>(best_slot) % subgroup_size) {
                    candidate_expanded[static_cast<size_t>(best_slot)] = 1;
                  }
