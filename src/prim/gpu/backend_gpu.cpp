@@ -2740,13 +2740,14 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const int met = static_cast<int>(metric);
     /* The walk marks SW beam slots expanded per iteration and only re-opens a slot when an
        eviction lands on an already-expanded one, so it terminates near BEAM/SW. Measured maxima
-       are 69-79 where BEAM/SW is 64. A cap of BEAM/SW + 32 therefore never binds in practice -
-       traversal, and so the output, is unchanged - while giving visited_capacity below a true
-       upper bound on visits instead of one derived from a 3*SW-times-oversized budget. That
-       shrinks the visited table 2-8x, which is what lets it stay resident in the 4 MiB L2 as the
-       query batch grows. If it ever did bind, the walk stops early: MAX_ITERATIONS in the walk
-       counters is the canary. */
-    const size_t iteration_bound = (SW > 0 ? BEAM / SW : BEAM) + 32u;
+       (32-seed era) are 71-76 where BEAM/SW is 64 and 38-40 where it is 32 - the excess over
+       BEAM/SW does not grow with the ratio, so an additive slack of 24 clears every observed
+       maximum by >= 12 while keeping visited_capacity a true upper bound on visits. Against the
+       previous +32 this is what moves the degree-32 configs (and d16 itopk=64/width=4) back
+       across a power-of-two boundary: their visited tables halve, 64 KiB -> 32 KiB per query.
+       The cap never binding means traversal, and so the output, is unchanged. If it ever did
+       bind, the walk stops early: MAX_ITERATIONS in the walk counters is the canary. */
+    const size_t iteration_bound = (SW > 0 ? BEAM / SW : BEAM) + 24u;
     const int max_iters =
         static_cast<int>(std::max<size_t>(24u, std::min<size_t>(iteration_bound, 1u << 20)));
     if (BEAM < IT || SW > std::numeric_limits<int32_t>::max()) return false;
@@ -2767,6 +2768,12 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     const size_t max_wg = device.get_info<sycl::info::device::max_work_group_size>();
     size_t work_group_size = 1;
     while (work_group_size <= max_wg / 2 && work_group_size < 128) work_group_size <<= 1;
+    /* TEMPORARY: isolates the sub-group-per-candidate rewrite (old plan step 2) from the int8
+       mirror it was landed alongside. Remove once the number is recorded. */
+    const bool subgroup_geometry = []() {
+      const char* env = std::getenv("OVVS_GPU_SUBGROUP_GEOM");
+      return !(env && env[0] == '0');
+    }();
     bool force_sub_group_16 = false;
     {
       const auto widths = device.get_info<sycl::info::device::sub_group_sizes>();
@@ -2813,6 +2820,93 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
         static_cast<size_t>(cagra_seed_count(n, itopk, search_width));
     if (nseeds == 0) return false;
 
+    /* Beam-membership dedup: replaces the global visited hash whenever the seed phase can
+       never overfill the beam (nseeds <= itopk). Under that condition every previously-scored
+       id is either still in the beam -- caught by an SLM membership scan at commit -- or was
+       evicted or rejected while the beam was full, at which point its distance was >= the
+       beam's max; the max is non-increasing once the beam is full and distances are
+       deterministic, so the existing >=-worst pre-filter rejects it at every later encounter.
+       Before the beam first fills nothing is ever rejected, so every scored id IS in the beam.
+       Output is therefore bit-identical; only evals/query rises (revisited candidates are
+       re-scored, then rejected), which the work counters price. In exchange the walk sheds its
+       only per-query global state: the CAS probe chain (~2,300 probes/query), the table init,
+       and 16-64 KiB/query of footprint that thrashes L2 as the batch grows. The nseeds > itopk
+       case keeps the hash: a seed evicted at capacity itopk could otherwise be readmitted
+       while the beam grows toward 2*itopk.
+
+       MEASURED at one-work-group-per-query: a 14% REGRESSION (the extra evals cost more than
+       the probes saved while only 64 queries are in flight), so the hash stays the default
+       there. The dedup exists for the sub-group-per-query mapping, whose per-query state must
+       fit SLM; it is enabled alongside it below, or forced for A/B via OVVS_CAGRA_BEAM_DEDUP=1
+       (=0 forces the hash and thereby one-work-group-per-query). TEMPORARY knob. */
+    const int qpw_requested = [&]() -> int {
+      const char* env = std::getenv("OVVS_CAGRA_QPW");
+      if (!env || !*env) return 1; /* TEMPORARY default until the sweep verdict lands */
+      const long parsed = std::strtol(env, nullptr, 10);
+      return parsed == 8 ? 8 : 1;
+    }();
+    const bool beam_dedup = [&]() {
+      const char* env = std::getenv("OVVS_CAGRA_BEAM_DEDUP");
+      if (env && env[0] == '0') return false;
+      if (env && env[0] == '1') return nseeds <= IT;
+      return qpw_requested > 1 && nseeds <= IT;
+    }();
+
+    /* Sub-group-per-query mapping: one 128-item work-group hosts eight independent queries,
+       one per sub-group, and that walk path uses no work-group barriers at all -- every
+       collective is sub-group scoped, so queries advance and finish independently and the
+       device holds 8x more queries in flight. That concurrency is what the latency-bound walk
+       is starved of: the b1-vs-b1024 accounting shows per-query latency is the same alone or
+       co-resident, i.e. QPS = resident queries / latency, and residency is capped by thread
+       slots, 1/8 of which each query occupies today. Requires the sub-group geometry at
+       sub-group 16 (so sub-groups == queries == 8), the beam dedup (per-query state must be
+       SLM-resident; the visited hash is neither needed nor wired in that path), and the
+       8-slot SLM footprint. Falls back to one query per work-group otherwise.
+       TEMPORARY opt-in: OVVS_CAGRA_QPW=8; the default stays 1 until the sweep verdict. */
+    size_t QPW = 1u;
+    /* Companion to the beam dedup in the sub-group path: a small per-query direct-mapped
+       cache of rejected or evicted ids, probed (one SLM read) alongside the beam scan at
+       commit. Filtering on ANY subset of previously-scored ids is exact -- the same
+       eviction-monotonicity proof -- and a collision merely forgets history, so entries are
+       overwritten freely. A recency RING was tried first and parked: revisits are NOT
+       temporally local (64 entries caught 16% of revisit evals, 256 caught 47% while paying
+       an O(ring) scan); the hashed cache reaches arbitrary history at O(1). Without either,
+       the dedup's extra evals (+43% at d32) ate the mapping's entire concurrency win.
+       TEMPORARY tuning knob: OVVS_CAGRA_SEEN_RING (entries, rounded down to a power of two;
+       0 disables; default 256). */
+    size_t seen_ring = 0u;
+    if (qpw_requested == 8 && subgroup_geometry && force_sub_group_16 && beam_dedup &&
+        work_group_size == 128u) {
+      seen_ring = [&]() -> size_t {
+        const char* env = std::getenv("OVVS_CAGRA_SEEN_RING");
+        long parsed = 0; /* MEASURED default: any cache loses -- SLM per query caps resident
+                            queries, and residency is worth more than the evals recovered
+                            (cache 256 = 0.46x, 512 = 0.50x vs no cache 0.82x at b1024). */
+        if (env && *env) parsed = std::strtol(env, nullptr, 10);
+        if (parsed <= 0) return 0u;
+        size_t s = static_cast<size_t>(std::min<long>(parsed, 4096));
+        while ((s & (s - 1u)) != 0u) s &= s - 1u; /* round down to a power of two */
+        return s;
+      }();
+      /* The sub-group path's own SLM footprint: beam + picks + one shared tile (ids
+         compacted in place) + a keep byte per tile entry + the optional seen cache.
+         Everything else lives in registers. Residency per Xe-core is 128KiB / (8 slots),
+         and every byte here costs resident queries, which are the mapping's entire point. */
+      const size_t sg_slot_bytes =
+          BEAM * (sizeof(int32_t) + sizeof(float) + sizeof(uint8_t)) + SW * sizeof(int32_t) +
+          kFrontierTileSize * (sizeof(int32_t) + sizeof(uint8_t)) +
+          seen_ring * sizeof(int32_t) + 64u;
+      size_t slots_bytes = 0;
+      if (kFrontierTileSize <= 64u &&
+          checked_product(sg_slot_bytes, static_cast<size_t>(8u), slots_bytes) &&
+          slots_bytes <= local_mem) {
+        QPW = 8u;
+        local_bytes = slots_bytes;
+      } else {
+        seen_ring = 0u;
+      }
+    }
+
     if (SW > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(max_iters)) return false;
     const uint64_t expansion_budget = static_cast<uint64_t>(max_iters) * static_cast<uint64_t>(SW);
     if (DEG != 0 && expansion_budget > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(DEG)) {
@@ -2833,8 +2927,12 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
       }
       return 2u;
     }();
-    const size_t visited_capacity = next_power_of_two(
-        std::max<size_t>(2u, static_cast<size_t>(visit_budget) * visited_headroom));
+    /* Beam dedup needs no table at all; 2 entries keep the pointer arithmetic and the
+       power-of-two mask valid while costing 8 bytes per query. */
+    const size_t visited_capacity =
+        beam_dedup ? 2u
+                   : next_power_of_two(
+                         std::max<size_t>(2u, static_cast<size_t>(visit_budget) * visited_headroom));
     if (visited_capacity == 0 || visited_capacity > kMaxVisitedBytesPerQuery / sizeof(int32_t)) return false;
 
     const bool ds_direct = gpu_pointer_accessible(q, dataset);
@@ -2901,6 +2999,14 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
        qualified, so a float corpus pays nothing for it. */
     const size_t off_query8 = ws_bytes;
     if (DS8) ws_bytes = align_up(ws_bytes + query_count + sizeof(int32_t));
+    /* Query queue for the sub-group-per-query mapping: persistent sub-groups claim query
+       indices from this counter, so a finished query's thread immediately starts the next
+       one instead of idling until its whole work-group drains. VTune measured the
+       fixed-assignment version at 29% occupancy against the classic mapping's 84% -- the
+       coarse work-groups, each held open by its slowest of eight queries, were starving the
+       device of the very concurrency the mapping exists to provide. */
+    const size_t off_queue = ws_bytes;
+    if (QPW > 1) ws_bytes = align_up(ws_bytes + sizeof(int32_t));
 
     if (r.gpu_walk_workspace_bytes < ws_bytes) {
       if (r.gpu_walk_workspace) {
@@ -2930,8 +3036,11 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
     float* OUTD = out_d_direct ? distances : out_d_stage;
     const uint8_t* BS = !bitset ? nullptr : (bitset_direct ? bitset : bitset_stage);
 
+    int32_t* QUEUE = QPW > 1 ? reinterpret_cast<int32_t*>(ws + off_queue) : nullptr;
+
     if (!ds_direct) q.memcpy(ds_copy.get(), dataset, dataset_bytes);
     if (!graph_direct) q.memcpy(graph_copy.get(), graph, graph_bytes);
+    if (QUEUE) q.memset(QUEUE, 0, sizeof(int32_t));
     sycl::event query_upload;
     if (!query_direct) query_upload = q.memcpy(query_stage, queries, query_count * sizeof(float));
     if (bitset && !bitset_direct) q.memcpy(bitset_stage, bitset, bitset_bytes);
@@ -2970,17 +3079,33 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
 
     for (size_t query_offset = 0; query_offset < NQ; query_offset += queries_per_launch) {
       const size_t launch_queries = std::min(queries_per_launch, NQ - query_offset);
+      /* qpw > 1 implies beam_dedup implies a single launch in practice; reset the claim
+         counter anyway if a second launch ever happens (each launch ends in a wait). */
+      if (QUEUE && query_offset != 0) {
+        q.memset(QUEUE, 0, sizeof(int32_t));
+        q.wait_and_throw();
+      }
       q.submit([&](sycl::handler& h) {
-         sycl::local_accessor<int32_t, 1> candidate_ids(sycl::range<1>(BEAM), h);
-         sycl::local_accessor<float, 1> candidate_distances(sycl::range<1>(BEAM), h);
-         sycl::local_accessor<uint8_t, 1> candidate_expanded(sycl::range<1>(BEAM), h);
-         sycl::local_accessor<int32_t, 1> picks(sycl::range<1>(SW), h);
-         sycl::local_accessor<int32_t, 1> frontier_ids(sycl::range<1>(kFrontierTileSize), h);
-         sycl::local_accessor<float, 1> frontier_scores(sycl::range<1>(kFrontierTileSize), h);
-         sycl::local_accessor<int32_t, 1> raw_ids(sycl::range<1>(kFrontierTileSize), h);
-         sycl::local_accessor<int32_t, 1> keep_flags(sycl::range<1>(kFrontierTileSize), h);
+         /* One slot per query hosted by the work-group: slot 0 for the classic mapping,
+            eight independent slots for the sub-group-per-query mapping. SLM per query caps
+            resident queries per Xe-core, so the sub-group path uses only the beam, the
+            picks, one shared tile (raw ids compacted in place) and a keep byte per tile
+            entry; the classic-mapping-only arrays shrink to a token element there. */
+         const size_t wg_tile = QPW > 1 ? 1u : kFrontierTileSize;
+         sycl::local_accessor<int32_t, 1> candidate_ids(sycl::range<1>(BEAM * QPW), h);
+         sycl::local_accessor<float, 1> candidate_distances(sycl::range<1>(BEAM * QPW), h);
+         sycl::local_accessor<uint8_t, 1> candidate_expanded(sycl::range<1>(BEAM * QPW), h);
+         sycl::local_accessor<int32_t, 1> picks(sycl::range<1>(SW * QPW), h);
+         sycl::local_accessor<int32_t, 1> frontier_ids(sycl::range<1>(kFrontierTileSize * QPW), h);
+         sycl::local_accessor<float, 1> frontier_scores(sycl::range<1>(wg_tile), h);
+         sycl::local_accessor<int32_t, 1> raw_ids(sycl::range<1>(wg_tile), h);
+         sycl::local_accessor<int32_t, 1> keep_flags(sycl::range<1>(wg_tile), h);
          sycl::local_accessor<int32_t, 1> state(sycl::range<1>(8), h);
          sycl::local_accessor<uint32_t, 1> query_hash_state(sycl::range<1>(1), h);
+         sycl::local_accessor<uint8_t, 1> tile_keep(
+             sycl::range<1>(QPW > 1 ? kFrontierTileSize * QPW : 1u), h);
+         sycl::local_accessor<int32_t, 1> seen_ids(
+             sycl::range<1>(std::max<size_t>(1u, seen_ring * QPW)), h);
          auto walk_body = [=](sycl::nd_item<1> item) {
            const size_t lid = item.get_local_linear_id();
            const size_t qi = query_offset + item.get_group_linear_id();
@@ -2994,8 +3119,485 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
               quantizer left behind, instead of a host round trip before the launch. */
            const bool use_int8 = DS8 != nullptr && Q8_OK[0] == 0;
 
-           for (size_t i = lid; i < visited_capacity; i += work_group_size) {
-             VISITED[visited_base + i] = -1;
+           if (QPW > 1) {
+             /* ---- Sub-group-per-query walk: one sub-group owns one query end to end. ----
+                No work-group barriers exist on this path (the tail guard below returns early,
+                which only a barrier-free path permits): every collective is sub-group scoped,
+                so queries advance and finish independently, a serial phase idles 16 lanes
+                instead of 128, and the device holds QPW times more queries in flight. The
+                traversal is the SAME algorithm as the one-work-group path under beam_dedup --
+                same tile order, same frozen per-tile threshold, same admission sequence --
+                so recall and every work counter must be bit-identical to that path.
+                Requires beam_dedup (guaranteed by the host gate): there is no visited hash
+                here, and the walk's whole per-query state lives in its SLM slot. */
+             const size_t lane = subgroup_lane;
+             const size_t sgsz = subgroup_size;
+             const size_t qslot = subgroup_id;
+             const size_t cb = qslot * BEAM;                 /* beam slice */
+             const size_t fb = qslot * kFrontierTileSize;    /* frontier slice */
+             const size_t pb = qslot * SW;                   /* picks slice */
+             const size_t rb = qslot * seen_ring;            /* seen-cache slice */
+
+             /* Per-query control state lives in uniform registers, not SLM: a single
+                sub-group owns it and every update below happens in uniform control flow.
+                Mutable, because a persistent sub-group serves many queries in turn; the
+                lambdas below capture by reference and always see the current query. */
+             size_t sq = 0;        /* the query this sub-group is currently serving */
+             uint32_t qhash = 0;
+             int32_t s_count = 0;  /* beam occupancy */
+             int32_t s_worst = 0;  /* worst beam slot */
+             int32_t s_admit = 0;  /* admitted-anything-this-iteration flag */
+             int32_t s_stall = 0;  /* patience counter */
+             int64_t q_iters = 0;  /* iterations of the current query */
+             int64_t e_evals = 0, e_seed_evals = 0, e_admits = 0, e_survivors = 0;
+             int64_t e_queries = 0, e_iters_total = 0, e_iters_max = 0;
+             auto seen_slot = [&](int32_t id) {
+               return (static_cast<uint32_t>(id) * 2654435761u) & (seen_ring - 1u);
+             };
+
+             auto sg_allowed = [&](int32_t id) {
+               return BS == nullptr || ((BS[static_cast<size_t>(id) >> 3] >> (id & 7)) & 1u) != 0;
+             };
+
+             const bool needs_ip_q = met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT) ||
+                                     met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED);
+             const bool needs_norms_q = met == static_cast<int>(OVVS_METRIC_COSINE_EXPANDED);
+             auto finish_q = [&](float l2, float ip, float nx, float ny) {
+               if (!needs_ip_q) {
+                 if (met == static_cast<int>(OVVS_METRIC_L2_SQRT_EXPANDED)) return sycl::sqrt(l2);
+                 return l2;
+               }
+               if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) return -ip;
+               if (needs_norms_q) {
+                 const float safe_nx = nx > 1e-12f ? nx : 1e-12f;
+                 const float safe_ny = ny > 1e-12f ? ny : 1e-12f;
+                 return 1.f - ip / (sycl::sqrt(safe_nx) * sycl::sqrt(safe_ny));
+               }
+               return 0.f;
+             };
+
+             /* Query-row hoist, exactly as in the one-work-group path but bound to sq and
+                reloaded whenever this sub-group claims a new query. */
+             const bool packed_q8 = use_int8 && D == 8u * sgsz;
+             const bool reg_qf = !use_int8 && D == 8u * sgsz;
+             uint32_t q_w0 = 0u, q_w1 = 0u;
+             int32_t q_sq = 0;
+             float q_f[8];
+             auto load_query_regs = [&]() {
+               q_sq = 0;
+               if (packed_q8) {
+                 const uint32_t* qp =
+                     reinterpret_cast<const uint32_t*>(Q8 + sq * D + lane * 8u);
+                 q_w0 = qp[0];
+                 q_w1 = qp[1];
+                 for (int j = 0; j < 4; ++j) {
+                   const int32_t a0 = static_cast<int32_t>((q_w0 >> (8 * j)) & 0xFFu);
+                   const int32_t a1 = static_cast<int32_t>((q_w1 >> (8 * j)) & 0xFFu);
+                   q_sq += a0 * a0 + a1 * a1;
+                 }
+               }
+               if (reg_qf) {
+                 for (int k = 0; k < 8; ++k) {
+                   q_f[k] = Q[sq * D + lane + static_cast<size_t>(k) * sgsz];
+                 }
+               }
+             };
+
+             auto sg_distance = [&](int32_t id) -> float {
+               if (use_int8) {
+                 if (packed_q8) {
+                   const uint32_t* dp = reinterpret_cast<const uint32_t*>(
+                       DS8 + static_cast<size_t>(id) * D + lane * 8u);
+                   const uint32_t b_w0 = dp[0];
+                   const uint32_t b_w1 = dp[1];
+                   int32_t qd = 0, dd = 0;
+                   for (int j = 0; j < 4; ++j) {
+                     const int32_t b0 = static_cast<int32_t>((b_w0 >> (8 * j)) & 0xFFu);
+                     const int32_t b1 = static_cast<int32_t>((b_w1 >> (8 * j)) & 0xFFu);
+                     const int32_t a0 = static_cast<int32_t>((q_w0 >> (8 * j)) & 0xFFu);
+                     const int32_t a1 = static_cast<int32_t>((q_w1 >> (8 * j)) & 0xFFu);
+                     qd += a0 * b0 + a1 * b1;
+                     dd += b0 * b0 + b1 * b1;
+                   }
+                   if (!needs_ip_q) {
+                     const int32_t l2 = sycl::reduce_over_group(subgroup, q_sq + dd - 2 * qd,
+                                                                sycl::plus<int32_t>());
+                     return finish_q(static_cast<float>(l2), 0.f, 0.f, 0.f);
+                   }
+                   const int32_t ip = sycl::reduce_over_group(subgroup, qd, sycl::plus<int32_t>());
+                   if (!needs_norms_q) return finish_q(0.f, static_cast<float>(ip), 0.f, 0.f);
+                   const int32_t nx = sycl::reduce_over_group(subgroup, q_sq, sycl::plus<int32_t>());
+                   const int32_t ny = sycl::reduce_over_group(subgroup, dd, sycl::plus<int32_t>());
+                   return finish_q(0.f, static_cast<float>(ip), static_cast<float>(nx),
+                                   static_cast<float>(ny));
+                 }
+                 const uint8_t* qrow = Q8 + sq * D;
+                 const uint8_t* drow = DS8 + static_cast<size_t>(id) * D;
+                 int32_t l2 = 0, ip = 0, nx = 0, ny = 0;
+                 const size_t chunks = (D + 7u) / 8u;
+                 for (size_t c = lane; c < chunks; c += sgsz) {
+                   const size_t off = c * 8u;
+                   const size_t lim = (D - off) < 8u ? (D - off) : 8u;
+                   for (size_t j = 0; j < lim; ++j) {
+                     const int32_t a = static_cast<int32_t>(qrow[off + j]);
+                     const int32_t b = static_cast<int32_t>(drow[off + j]);
+                     if (!needs_ip_q) {
+                       const int32_t delta = a - b;
+                       l2 += delta * delta;
+                     } else {
+                       ip += a * b;
+                       if (needs_norms_q) {
+                         nx += a * a;
+                         ny += b * b;
+                       }
+                     }
+                   }
+                 }
+                 if (!needs_ip_q) {
+                   l2 = sycl::reduce_over_group(subgroup, l2, sycl::plus<int32_t>());
+                   return finish_q(static_cast<float>(l2), 0.f, 0.f, 0.f);
+                 }
+                 ip = sycl::reduce_over_group(subgroup, ip, sycl::plus<int32_t>());
+                 if (needs_norms_q) {
+                   nx = sycl::reduce_over_group(subgroup, nx, sycl::plus<int32_t>());
+                   ny = sycl::reduce_over_group(subgroup, ny, sycl::plus<int32_t>());
+                 }
+                 return finish_q(0.f, static_cast<float>(ip), static_cast<float>(nx),
+                                 static_cast<float>(ny));
+               }
+               float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
+               if (reg_qf) {
+                 for (int k = 0; k < 8; ++k) {
+                   const size_t d = lane + static_cast<size_t>(k) * sgsz;
+                   const float a = q_f[k];
+                   const float b = DS[static_cast<size_t>(id) * D + d];
+                   const float delta = a - b;
+                   if (!needs_ip_q) l2 += delta * delta;
+                   if (needs_ip_q) ip += a * b;
+                   if (needs_norms_q) {
+                     nx += a * a;
+                     ny += b * b;
+                   }
+                 }
+               } else {
+                 for (size_t d = lane; d < D; d += sgsz) {
+                   const float a = Q[sq * D + d];
+                   const float b = DS[static_cast<size_t>(id) * D + d];
+                   const float delta = a - b;
+                   if (!needs_ip_q) l2 += delta * delta;
+                   if (needs_ip_q) ip += a * b;
+                   if (needs_norms_q) {
+                     nx += a * a;
+                     ny += b * b;
+                   }
+                 }
+               }
+               if (!needs_ip_q) {
+                 l2 = sycl::reduce_over_group(subgroup, l2, sycl::plus<float>());
+                 return finish_q(l2, 0.f, 0.f, 0.f);
+               }
+               ip = sycl::reduce_over_group(subgroup, ip, sycl::plus<float>());
+               if (needs_norms_q) {
+                 nx = sycl::reduce_over_group(subgroup, nx, sycl::plus<float>());
+                 ny = sycl::reduce_over_group(subgroup, ny, sycl::plus<float>());
+               }
+               return finish_q(0.f, ip, nx, ny);
+             };
+
+             /* Commit the raw tile IN PLACE: frontier_ids[fb..] holds the raw ids (or -1)
+                on entry and the kept ids, compacted and order-preserved, on exit -- the
+                verdict and position of every entry come from tile_keep, and each lane pulls
+                its own kept ids into registers before the compaction barrier, so the
+                left-moving writes cannot clobber anything unread. Same keep rule and same
+                order as the one-work-group beam_dedup path, so the walk is bit-identical.
+                Requires kFrontierTileSize/sgsz <= 4 (host gates the tile at 64). */
+             auto sg_commit = [&](size_t raw_count) -> int32_t {
+               for (size_t r = lane; r < raw_count; r += sgsz) {
+                 const int32_t id = frontier_ids[fb + r];
+                 bool seen = id < 0;
+                 for (size_t prev = 0; prev < r && !seen; ++prev) {
+                   seen = frontier_ids[fb + prev] == id;
+                 }
+                 if (!seen) {
+                   for (int32_t s = 0; s < s_count && !seen; ++s) {
+                     seen = candidate_ids[cb + static_cast<size_t>(s)] == id;
+                   }
+                 }
+                 if (!seen && seen_ring != 0u) {
+                   seen = seen_ids[rb + seen_slot(id)] == id;
+                 }
+                 tile_keep[fb + r] = seen ? uint8_t{0} : uint8_t{1};
+               }
+               sycl::group_barrier(subgroup);
+               int32_t held_ids[4];
+               int32_t held_pos[4];
+               size_t held = 0;
+               for (size_t r = lane; r < raw_count; r += sgsz) {
+                 if (tile_keep[fb + r] == 0) continue;
+                 int32_t position = 0;
+                 for (size_t prev = 0; prev < r; ++prev) position += tile_keep[fb + prev];
+                 held_ids[held] = frontier_ids[fb + r];
+                 held_pos[held] = position;
+                 ++held;
+               }
+               sycl::group_barrier(subgroup); /* every read is done; in-place writes begin */
+               for (size_t hslot = 0; hslot < held; ++hslot) {
+                 frontier_ids[fb + static_cast<size_t>(held_pos[hslot])] = held_ids[hslot];
+               }
+               int32_t total = 0;
+               for (size_t r = 0; r < raw_count; ++r) total += tile_keep[fb + r];
+               sycl::group_barrier(subgroup);
+               return total;
+             };
+
+             /* Score and admit FUSED, per candidate, against a threshold frozen at tile
+                entry. The one-work-group path stages scores and admits in a second pass
+                because eight sub-groups score in parallel there; here the same sub-group
+                does both, and with the threshold frozen the admission predicate, order and
+                every counter are identical to the staged form -- while the score staging,
+                the keep verdicts and one barrier disappear. The score is a reduction, so
+                every lane already holds it in a register. */
+             auto sg_score_admit = [&](int32_t fcount, size_t capacity, bool seeds) {
+               const bool beam_full = s_count >= static_cast<int32_t>(capacity);
+               const float admit_threshold =
+                   beam_full ? candidate_distances[cb + static_cast<size_t>(s_worst)]
+                             : std::numeric_limits<float>::max();
+               for (int32_t f = 0; f < fcount; ++f) {
+                 const int32_t id = frontier_ids[fb + static_cast<size_t>(f)];
+                 const float distance = sg_distance(id);
+                 ++e_evals;
+                 if (seeds) ++e_seed_evals;
+                 ++e_admits;
+                 if (!(distance < admit_threshold)) {
+                   /* Scored and rejected: remember it so a revisit is dropped pre-score. */
+                   if (seen_ring != 0u && lane == 0) {
+                     seen_ids[rb + seen_slot(id)] = id;
+                   }
+                   continue;
+                 }
+                 ++e_survivors;
+                 if (s_count < static_cast<int32_t>(capacity)) {
+                   if (lane == 0) {
+                     candidate_ids[cb + static_cast<size_t>(s_count)] = id;
+                     candidate_distances[cb + static_cast<size_t>(s_count)] = distance;
+                     candidate_expanded[cb + static_cast<size_t>(s_count)] = 0;
+                   }
+                   if (s_count == 0 ||
+                       distance > candidate_distances[cb + static_cast<size_t>(s_worst)]) {
+                     s_worst = s_count;
+                   }
+                   ++s_count;
+                   s_admit = 1;
+                 } else {
+                   const float worst_distance =
+                       candidate_distances[cb + static_cast<size_t>(s_worst)];
+                   if (distance < worst_distance) {
+                     /* The evicted id leaves the beam and would otherwise become invisible
+                        to the dedup; remember it before it is overwritten. */
+                     if (seen_ring != 0u && lane == 0) {
+                       const int32_t evicted_id =
+                           candidate_ids[cb + static_cast<size_t>(s_worst)];
+                       seen_ids[rb + seen_slot(evicted_id)] = evicted_id;
+                     }
+                     if (lane == 0) {
+                       candidate_ids[cb + static_cast<size_t>(s_worst)] = id;
+                       candidate_distances[cb + static_cast<size_t>(s_worst)] = distance;
+                       candidate_expanded[cb + static_cast<size_t>(s_worst)] = 0;
+                     }
+                     s_admit = 1;
+                     sycl::group_barrier(subgroup);
+                     const uint32_t bcount = static_cast<uint32_t>(s_count);
+                     float lane_distance = -std::numeric_limits<float>::max();
+                     uint32_t lane_slot = std::numeric_limits<uint32_t>::max();
+                     for (uint32_t i = static_cast<uint32_t>(lane); i < bcount;
+                          i += static_cast<uint32_t>(sgsz)) {
+                       const float d2 = candidate_distances[cb + i];
+                       if (d2 > lane_distance) {
+                         lane_distance = d2;
+                         lane_slot = i;
+                       }
+                     }
+                     const float worst_far =
+                         sycl::reduce_over_group(subgroup, lane_distance, sycl::maximum<float>());
+                     const uint32_t proposal =
+                         lane_slot != std::numeric_limits<uint32_t>::max() &&
+                                 lane_distance == worst_far
+                             ? lane_slot
+                             : std::numeric_limits<uint32_t>::max();
+                     const uint32_t worst =
+                         sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
+                     s_worst = static_cast<int32_t>(worst);
+                   }
+                 }
+               }
+               sycl::group_barrier(subgroup); /* beam writes visible before the next phase */
+             };
+
+             /* The complete walk for the query in `sq` -- unchanged from the fixed
+                assignment; only who runs it changed. */
+             auto serve_query = [&]() {
+             for (size_t seed_base = 0; seed_base < nseeds; seed_base += kFrontierTileSize) {
+               const size_t seed_raw_count = std::min(kFrontierTileSize, nseeds - seed_base);
+               for (size_t raw = lane; raw < seed_raw_count; raw += sgsz) {
+                 const uint64_t mixed = static_cast<uint64_t>(seed_base + raw) * 9973u +
+                                        static_cast<uint64_t>(qhash) * 13u;
+                 const int32_t id = static_cast<int32_t>(mixed % N);
+                 frontier_ids[fb + raw] = sg_allowed(id) ? id : -1;
+               }
+               sycl::group_barrier(subgroup);
+               const int32_t kept = sg_commit(seed_raw_count);
+               sg_score_admit(kept, IT, true);
+             }
+
+             for (int iter = 0; iter < max_iters; ++iter) {
+               ++q_iters;
+               int32_t npicks = 0;
+               for (size_t s = 0; s < SW; ++s) {
+                 float lane_distance = std::numeric_limits<float>::max();
+                 uint32_t lane_slot = std::numeric_limits<uint32_t>::max();
+                 const uint32_t candidate_count = static_cast<uint32_t>(s_count);
+                 for (uint32_t i = static_cast<uint32_t>(lane); i < candidate_count;
+                      i += static_cast<uint32_t>(sgsz)) {
+                   const float distance = candidate_distances[cb + i];
+                   if (!candidate_expanded[cb + i] &&
+                       distance < std::numeric_limits<float>::max() &&
+                       (distance < lane_distance ||
+                        (distance == lane_distance && i < lane_slot))) {
+                     lane_distance = distance;
+                     lane_slot = i;
+                   }
+                 }
+                 const float best_distance =
+                     sycl::reduce_over_group(subgroup, lane_distance, sycl::minimum<float>());
+                 const uint32_t proposal =
+                     lane_slot != std::numeric_limits<uint32_t>::max() &&
+                             lane_distance == best_distance
+                         ? lane_slot
+                         : std::numeric_limits<uint32_t>::max();
+                 const uint32_t best_slot =
+                     sycl::reduce_over_group(subgroup, proposal, sycl::minimum<uint32_t>());
+                 if (best_slot == std::numeric_limits<uint32_t>::max()) break;
+                 if (lane == static_cast<size_t>(best_slot) % sgsz) {
+                   candidate_expanded[cb + best_slot] = 1;
+                 }
+                 if (lane == 0) {
+                   picks[pb + static_cast<size_t>(npicks)] = candidate_ids[cb + best_slot];
+                 }
+                 ++npicks;
+               }
+               sycl::group_barrier(subgroup); /* picks visible to every lane */
+               if (npicks == 0) break;
+
+               s_admit = 0;
+               const size_t frontier_total = static_cast<size_t>(npicks) * DEG;
+               for (size_t frontier_base = 0; frontier_base < frontier_total;
+                    frontier_base += kFrontierTileSize) {
+                 const size_t frontier_raw_count =
+                     std::min(kFrontierTileSize, frontier_total - frontier_base);
+                 for (size_t raw = lane; raw < frontier_raw_count; raw += sgsz) {
+                   const size_t edge = frontier_base + raw;
+                   const int32_t picked = picks[pb + edge / DEG];
+                   const int32_t neighbor = G[static_cast<size_t>(picked) * DEG + edge % DEG];
+                   const bool ok = neighbor >= 0 && static_cast<size_t>(neighbor) < N &&
+                                   sg_allowed(neighbor);
+                   frontier_ids[fb + raw] = ok ? neighbor : -1;
+                 }
+                 sycl::group_barrier(subgroup);
+                 const int32_t kept = sg_commit(frontier_raw_count);
+                 sg_score_admit(kept, BEAM, false);
+               }
+               if (stall_patience > 0) {
+                 s_stall = s_admit != 0 ? 0 : s_stall + 1;
+                 if (s_stall >= stall_patience) break;
+               }
+             }
+
+             sycl::group_barrier(subgroup);
+             if (lane == 0) {
+               const int32_t count = s_count;
+               const int32_t selected_count = std::min(count, static_cast<int32_t>(KK));
+               for (int32_t a = 0; a < selected_count; ++a) {
+                 int32_t best = a;
+                 for (int32_t b = a + 1; b < count; ++b) {
+                   if (candidate_distances[cb + static_cast<size_t>(b)] <
+                       candidate_distances[cb + static_cast<size_t>(best)]) {
+                     best = b;
+                   }
+                 }
+                 const float saved_distance = candidate_distances[cb + static_cast<size_t>(a)];
+                 const int32_t saved_id = candidate_ids[cb + static_cast<size_t>(a)];
+                 candidate_distances[cb + static_cast<size_t>(a)] =
+                     candidate_distances[cb + static_cast<size_t>(best)];
+                 candidate_ids[cb + static_cast<size_t>(a)] =
+                     candidate_ids[cb + static_cast<size_t>(best)];
+                 candidate_distances[cb + static_cast<size_t>(best)] = saved_distance;
+                 candidate_ids[cb + static_cast<size_t>(best)] = saved_id;
+               }
+               for (size_t t = 0; t < KK; ++t) {
+                 if (t < static_cast<size_t>(count)) {
+                   OUTI[sq * KK + t] = candidate_ids[cb + t];
+                   float distance = candidate_distances[cb + t];
+                   if (met == static_cast<int>(OVVS_METRIC_INNER_PRODUCT)) distance = -distance;
+                   OUTD[sq * KK + t] = distance;
+                 } else {
+                   OUTI[sq * KK + t] = -1;
+                   OUTD[sq * KK + t] = std::numeric_limits<float>::max();
+                 }
+               }
+             }
+             e_iters_total += q_iters;
+             if (q_iters > e_iters_max) e_iters_max = q_iters;
+             ++e_queries;
+             };
+
+             /* Claim loop: each sub-group independently pulls the next unserved query.
+                Assignment does not affect any query's result, so output and every counter
+                are identical to a fixed assignment -- but a finished sub-group starts new
+                work immediately instead of idling until its work-group's slowest resident
+                query finishes, which is what held measured occupancy to 29% of peak. */
+             for (;;) {
+               int32_t claimed = 0;
+               if (lane == 0) {
+                 claimed = sycl::atomic_ref<int32_t, sycl::memory_order::relaxed,
+                                            sycl::memory_scope::device,
+                                            sycl::access::address_space::global_space>(*QUEUE)
+                               .fetch_add(1);
+               }
+               claimed = sycl::group_broadcast(subgroup, claimed, 0);
+               if (static_cast<size_t>(claimed) >= launch_queries) break;
+               sq = query_offset + static_cast<size_t>(claimed);
+               s_count = 0;
+               s_worst = 0;
+               s_admit = 0;
+               s_stall = 0;
+               q_iters = 0;
+               if (lane == 0) qhash = cagra_query_hash(Q + sq * D, static_cast<int64_t>(D));
+               qhash = sycl::group_broadcast(subgroup, qhash, 0);
+               load_query_regs();
+               for (size_t i = lane; i < seen_ring; i += sgsz) seen_ids[rb + i] = -1;
+               sycl::group_barrier(subgroup);
+               serve_query();
+             }
+
+             if (COUNTERS != nullptr && lane == 0 && e_queries != 0) {
+               using Counter = sycl::atomic_ref<int64_t, sycl::memory_order::relaxed,
+                                                sycl::memory_scope::device,
+                                                sycl::access::address_space::global_space>;
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_QUERIES]).fetch_add(e_queries);
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_EVALS]).fetch_add(e_evals);
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_SEED_EVALS]).fetch_add(e_seed_evals);
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_ITERATIONS]).fetch_add(e_iters_total);
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_MAX_ITERATIONS]).fetch_max(e_iters_max);
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_ADMITS]).fetch_add(e_admits);
+               Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_SURVIVORS]).fetch_add(e_survivors);
+             }
+             return;
+           }
+
+           if (!beam_dedup) {
+             for (size_t i = lid; i < visited_capacity; i += work_group_size) {
+               VISITED[visited_base + i] = -1;
+             }
            }
            if (lid == 0) {
              state[0] = 0;
@@ -3043,6 +3645,18 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              return false;
            };
 
+           /* Membership scan for the beam-dedup path. The beam was last written before the
+              barrier that precedes every commit, so candidate_ids[0..count) is stable here;
+              the scan is per-work-item over SLM and pipelines at ~1 probe/cycle, against the
+              global CAS round trip it replaces. */
+           auto in_beam = [&](int32_t id) {
+             const int32_t count = state[0];
+             for (int32_t s = 0; s < count; ++s) {
+               if (candidate_ids[static_cast<size_t>(s)] == id) return true;
+             }
+             return false;
+           };
+
            /* Turns raw_ids[0..raw_count) -- ids or -1 -- into frontier_ids, keeping exactly
               the entries the serial gather kept and in the same relative order, and marking
               them visited. Replaces a chain of up to 64 dependent global probes per tile,
@@ -3057,7 +3671,8 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                for (size_t prev = 0; prev < r && !duplicate; ++prev) {
                  duplicate = raw_ids[prev] == id;
                }
-               keep_flags[r] = (!duplicate && visit_once(id)) ? 1 : 0;
+               keep_flags[r] =
+                   (!duplicate && (beam_dedup ? !in_beam(id) : visit_once(id))) ? 1 : 0;
              }
              item.barrier(sycl::access::fence_space::local_space);
              for (size_t r = lid; r < raw_count; r += work_group_size) {
@@ -3095,15 +3710,140 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              return 0.f;
            };
 
+           /* The query row is immutable for the whole walk, yet it was re-read from global
+              memory for every candidate -- ~1,300 redundant row fetches per query that the
+              compiler cannot hoist on its own, because it cannot prove the row does not
+              alias the visited-table writes. Each lane owns a fixed slice of the dimensions
+              (the chunk/element maps in subgroup_distance are deterministic in the lane id),
+              so the slice is loaded into registers once here. Specialised to the exact-fit
+              shape D == 8*subgroup_size (e.g. 128 dims at sub-group 16) so the buffers are
+              statically indexed and cannot be demoted to scratch; any other shape keeps the
+              original loads untouched. */
+           const bool packed_q8 = use_int8 && D == 8u * subgroup_size;
+           uint32_t q_w0 = 0u, q_w1 = 0u; /* this lane's 8 query bytes, packed */
+           int32_t q_sq = 0;              /* sum of their squares (norm contribution) */
+           if (packed_q8) {
+             const uint32_t* qp =
+                 reinterpret_cast<const uint32_t*>(Q8 + qi * D + subgroup_lane * 8u);
+             q_w0 = qp[0];
+             q_w1 = qp[1];
+             for (int j = 0; j < 4; ++j) {
+               const int32_t a0 = static_cast<int32_t>((q_w0 >> (8 * j)) & 0xFFu);
+               const int32_t a1 = static_cast<int32_t>((q_w1 >> (8 * j)) & 0xFFu);
+               q_sq += a0 * a0 + a1 * a1;
+             }
+           }
+           const bool reg_qf = !use_int8 && D == 8u * subgroup_size;
+           float q_f[8];
+           if (reg_qf) {
+             for (int k = 0; k < 8; ++k) {
+               q_f[k] = Q[qi * D + subgroup_lane + static_cast<size_t>(k) * subgroup_size];
+             }
+           }
+
            /* One sub-group owns a whole candidate, so the work-group has as many candidates
               in flight as it has sub-groups and the per-candidate reduction costs a sub-group
               butterfly instead of a work-group barrier. The old shape gave each of the 128
               work-items a single dimension and could never have more than one row outstanding,
               which is why it ran at a fraction of a percent of peak on a latency-bound gather. */
+           /* TEMPORARY A/B: the pre-rewrite geometry, where the whole work-group cooperates on
+              ONE candidate at a time and each work-item owns a single dimension. Kept behind a
+              flag so the sub-group rewrite can finally be measured on its own -- it was only ever
+              measured bundled with the int8 mirror and the parallel gather. The int8 fast path is
+              mirrored here deliberately, so the toggle changes geometry and nothing else. */
+           auto cooperative_distance = [&](int32_t id) {
+             auto group = item.get_group();
+             if (use_int8) {
+               const uint8_t* qrow = Q8 + qi * D;
+               const uint8_t* drow = DS8 + static_cast<size_t>(id) * D;
+               int32_t l2 = 0, ip = 0, nx = 0, ny = 0;
+               for (size_t d = lid; d < D; d += work_group_size) {
+                 const int32_t a = static_cast<int32_t>(qrow[d]);
+                 const int32_t b = static_cast<int32_t>(drow[d]);
+                 if (!needs_ip) {
+                   const int32_t delta = a - b;
+                   l2 += delta * delta;
+                 } else {
+                   ip += a * b;
+                   if (needs_norms) {
+                     nx += a * a;
+                     ny += b * b;
+                   }
+                 }
+               }
+               if (!needs_ip) {
+                 l2 = sycl::reduce_over_group(group, l2, sycl::plus<int32_t>());
+                 return finish_metric(static_cast<float>(l2), 0.f, 0.f, 0.f);
+               }
+               ip = sycl::reduce_over_group(group, ip, sycl::plus<int32_t>());
+               if (needs_norms) {
+                 nx = sycl::reduce_over_group(group, nx, sycl::plus<int32_t>());
+                 ny = sycl::reduce_over_group(group, ny, sycl::plus<int32_t>());
+               }
+               return finish_metric(0.f, static_cast<float>(ip), static_cast<float>(nx),
+                                    static_cast<float>(ny));
+             }
+             float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
+             for (size_t d = lid; d < D; d += work_group_size) {
+               const float a = Q[qi * D + d];
+               const float b = DS[static_cast<size_t>(id) * D + d];
+               const float delta = a - b;
+               if (!needs_ip) l2 += delta * delta;
+               if (needs_ip) ip += a * b;
+               if (needs_norms) {
+                 nx += a * a;
+                 ny += b * b;
+               }
+             }
+             if (!needs_ip) {
+               l2 = sycl::reduce_over_group(group, l2, sycl::plus<float>());
+               return finish_metric(l2, 0.f, 0.f, 0.f);
+             }
+             ip = sycl::reduce_over_group(group, ip, sycl::plus<float>());
+             if (needs_norms) {
+               nx = sycl::reduce_over_group(group, nx, sycl::plus<float>());
+               ny = sycl::reduce_over_group(group, ny, sycl::plus<float>());
+             }
+             return finish_metric(0.f, ip, nx, ny);
+           };
+
            auto subgroup_distance = [&](int32_t id) {
              if (use_int8) {
                /* 8 contiguous bytes per lane: a 128-dim row is two cache lines for the whole
                   sub-group, against eight for the fp32 row. Exact -- see kInt8MaxDim. */
+               if (packed_q8) {
+                 /* Exact-fit fast path: the data row as two dword loads per lane instead of
+                    eight byte loads, the query slice from the registers hoisted above, and
+                    L2 via the integer identity sum(a-b)^2 = sum a^2 + sum b^2 - 2*sum ab.
+                    Every term is bounded by dim*255^2 < 2^24 (see kInt8MaxDim), so the int32
+                    arithmetic cannot wrap and each lane's value is bit-identical to the
+                    subtractive form over the same owned bytes -- the reduction sees exactly
+                    the inputs it saw before. */
+                 const uint32_t* dp = reinterpret_cast<const uint32_t*>(
+                     DS8 + static_cast<size_t>(id) * D + subgroup_lane * 8u);
+                 const uint32_t b_w0 = dp[0];
+                 const uint32_t b_w1 = dp[1];
+                 int32_t qd = 0, dd = 0;
+                 for (int j = 0; j < 4; ++j) {
+                   const int32_t b0 = static_cast<int32_t>((b_w0 >> (8 * j)) & 0xFFu);
+                   const int32_t b1 = static_cast<int32_t>((b_w1 >> (8 * j)) & 0xFFu);
+                   const int32_t a0 = static_cast<int32_t>((q_w0 >> (8 * j)) & 0xFFu);
+                   const int32_t a1 = static_cast<int32_t>((q_w1 >> (8 * j)) & 0xFFu);
+                   qd += a0 * b0 + a1 * b1;
+                   dd += b0 * b0 + b1 * b1;
+                 }
+                 if (!needs_ip) {
+                   const int32_t l2 = sycl::reduce_over_group(subgroup, q_sq + dd - 2 * qd,
+                                                              sycl::plus<int32_t>());
+                   return finish_metric(static_cast<float>(l2), 0.f, 0.f, 0.f);
+                 }
+                 const int32_t ip = sycl::reduce_over_group(subgroup, qd, sycl::plus<int32_t>());
+                 if (!needs_norms) return finish_metric(0.f, static_cast<float>(ip), 0.f, 0.f);
+                 const int32_t nx = sycl::reduce_over_group(subgroup, q_sq, sycl::plus<int32_t>());
+                 const int32_t ny = sycl::reduce_over_group(subgroup, dd, sycl::plus<int32_t>());
+                 return finish_metric(0.f, static_cast<float>(ip), static_cast<float>(nx),
+                                      static_cast<float>(ny));
+               }
                const uint8_t* qrow = Q8 + qi * D;
                const uint8_t* drow = DS8 + static_cast<size_t>(id) * D;
                int32_t l2 = 0, ip = 0, nx = 0, ny = 0;
@@ -3139,15 +3879,34 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
                                     static_cast<float>(ny));
              }
              float l2 = 0.f, ip = 0.f, nx = 0.f, ny = 0.f;
-             for (size_t d = subgroup_lane; d < D; d += subgroup_size) {
-               const float a = Q[qi * D + d];
-               const float b = DS[static_cast<size_t>(id) * D + d];
-               const float delta = a - b;
-               if (!needs_ip) l2 += delta * delta;
-               if (needs_ip) ip += a * b;
-               if (needs_norms) {
-                 nx += a * a;
-                 ny += b * b;
+             if (reg_qf) {
+               /* Same elements in the same order as the loop below (k-th owned element is
+                  subgroup_lane + k*subgroup_size), so the float accumulation order -- and
+                  therefore the result -- is bit-identical; only the query loads move from
+                  global memory to the registers hoisted above. */
+               for (int k = 0; k < 8; ++k) {
+                 const size_t d = subgroup_lane + static_cast<size_t>(k) * subgroup_size;
+                 const float a = q_f[k];
+                 const float b = DS[static_cast<size_t>(id) * D + d];
+                 const float delta = a - b;
+                 if (!needs_ip) l2 += delta * delta;
+                 if (needs_ip) ip += a * b;
+                 if (needs_norms) {
+                   nx += a * a;
+                   ny += b * b;
+                 }
+               }
+             } else {
+               for (size_t d = subgroup_lane; d < D; d += subgroup_size) {
+                 const float a = Q[qi * D + d];
+                 const float b = DS[static_cast<size_t>(id) * D + d];
+                 const float delta = a - b;
+                 if (!needs_ip) l2 += delta * delta;
+                 if (needs_ip) ip += a * b;
+                 if (needs_norms) {
+                   nx += a * a;
+                   ny += b * b;
+                 }
                }
              }
              if (!needs_ip) {
@@ -3189,12 +3948,24 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              const float admit_threshold =
                  beam_full ? candidate_distances[static_cast<size_t>(state[3])]
                            : std::numeric_limits<float>::max();
-             for (int32_t f = static_cast<int32_t>(subgroup_id); f < frontier_count;
-                  f += static_cast<int32_t>(subgroup_count)) {
-               const float score = subgroup_distance(frontier_ids[static_cast<size_t>(f)]);
-               if (subgroup_lane == 0) {
-                 frontier_scores[static_cast<size_t>(f)] = score;
-                 keep_flags[static_cast<size_t>(f)] = score < admit_threshold ? 1 : 0;
+             if (subgroup_geometry) {
+               for (int32_t f = static_cast<int32_t>(subgroup_id); f < frontier_count;
+                    f += static_cast<int32_t>(subgroup_count)) {
+                 const float score = subgroup_distance(frontier_ids[static_cast<size_t>(f)]);
+                 if (subgroup_lane == 0) {
+                   frontier_scores[static_cast<size_t>(f)] = score;
+                   keep_flags[static_cast<size_t>(f)] = score < admit_threshold ? 1 : 0;
+                 }
+               }
+             } else {
+               /* Every work-item walks the same candidate list, because the reduction below is a
+                  work-group collective and must be reached by all of them. */
+               for (int32_t f = 0; f < frontier_count; ++f) {
+                 const float score = cooperative_distance(frontier_ids[static_cast<size_t>(f)]);
+                 if (lid == 0) {
+                   frontier_scores[static_cast<size_t>(f)] = score;
+                   keep_flags[static_cast<size_t>(f)] = score < admit_threshold ? 1 : 0;
+                 }
                }
              }
              item.barrier(sycl::access::fence_space::local_space);
@@ -3412,7 +4183,14 @@ bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t d
              Counter(COUNTERS[OVVS_CAGRA_WALK_COUNTER_SURVIVORS]).fetch_add(c_survivors);
            }
          };
-         const sycl::nd_range<1> range(sycl::range<1>(launch_queries * work_group_size),
+         /* Persistent mapping: launch only as many work-groups as the device can hold
+            resident (16 per Xe-core x 4 Xe-cores, probed) -- the queue keeps every
+            sub-group fed until the queries run out, so surplus work-groups would only pay
+            dispatch cost to find an empty queue. */
+         const size_t launch_groups =
+             QPW > 1 ? std::min<size_t>((launch_queries + QPW - 1u) / QPW, 64u)
+                     : launch_queries;
+         const sycl::nd_range<1> range(sycl::range<1>(launch_groups * work_group_size),
                                        sycl::range<1>(work_group_size));
          /* 16 is the natural Xe SIMD width and the width the geometry was tuned at: it gives
             eight candidates in flight per 128-item work-group and exactly two cache lines per
