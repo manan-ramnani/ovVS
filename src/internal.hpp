@@ -55,6 +55,20 @@ inline float l2sq(const float* a, const float* b, int64_t d) {
   return s;
 }
 
+/* Exact integer sum of squared byte differences. Every partial sum is bounded by
+   dim*255^2 < 2^24 for dim <= 256, and the fp32 l2sq over the same integer-valued data
+   has exactly representable partials for the same reason -- so this is BITWISE equal to
+   l2sq() on any dataset/query pair that qualified for the int8 mirror, while touching a
+   quarter of the bytes. icx vectorizes the u8->i32 square-difference reduction well. */
+inline float l2sq_u8(const uint8_t* a, const uint8_t* b, int64_t d) {
+  int32_t s = 0;
+  for (int64_t i = 0; i < d; ++i) {
+    const int32_t t = static_cast<int32_t>(a[i]) - static_cast<int32_t>(b[i]);
+    s += t * t;
+  }
+  return static_cast<float>(s);
+}
+
 inline float dot(const float* a, const float* b, int64_t d) {
   float s = 0.f;
   for (int64_t i = 0; i < d; ++i) s += a[i] * b[i];
@@ -485,6 +499,9 @@ OVVS_API ovvsStatus gpu_cagra_optimize_ranked(ResourcesData& r,
                                                int32_t initial_degree,
                                                int32_t final_degree,
                                                std::vector<int32_t>& output);
+const uint8_t* gpu_cagra_int8_mirror_host(ResourcesData& r, const float* dataset, int64_t rows,
+                                          int64_t dim);
+void ovvs_gpu_mirror_invalidate();
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
                     int32_t itopk, int32_t search_width, const uint8_t* bitset, int64_t* neighbors,

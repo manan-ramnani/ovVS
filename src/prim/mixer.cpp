@@ -525,23 +525,20 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     if (!(parsed > 0.0) || parsed >= 1.0) return 0.0;
     return parsed;
   }();
-  /* OVVS_POLICY_HETERO is the adaptive "turbo hybrid": below the nq crossover the batch
-     takes the low-latency CPU path outright (a lone query answers in ~0.18-0.33 ms there
-     against ~1.8 ms spinning up the GPU); past it the GPU spools up. The routing is
-     n-aware, because the engines scale oppositely with corpus size (measured on Arrow
-     Lake-S 265K + Xe-LPG, SIFT-128, b1000):
-       - small corpus (<32K rows): the threaded CPU walk wins at EVERY batch size
-         (10K rows: 118.6K vs 53.9K QPS) -> never spin up the GPU;
-       - mid corpus: crossover nq=256, split f=0.50 (60K at 100K rows; re-tuned after
-         the persistent pool sped the CPU leg up -- the old 128/0.55 predates it);
-       - large corpus (>=320K rows): the GPU walk keeps scaling while the CPU walk goes
-         bandwidth-bound (1M rows: 38.9K vs 9.9K), and past f=0.95 the CPU leg still
-         costs the GPU more bandwidth than it contributes -> above a small crossover
-         the batch goes to the GPU whole.
-     OVVS_HYBRID_MIN_NQ / OVVS_HYBRID_WALK override the crossover / fraction for sweeps;
-     an explicit fraction forces a split at any corpus size. */
+  /* OVVS_POLICY_HETERO is the adaptive "turbo hybrid", and after the persistent pool
+     and the int8 CPU leg the measured law on this box collapsed to two clean regimes
+     (Arrow Lake-S 265K + Xe-LPG, SIFT-128, b1000):
+       - rows < 320K: the CPU walk is simply the better engine at every batch size
+         (100K rows: ~96-107K QPS CPU-only vs 45K GPU-only; splits win nothing outside
+         window noise and lose through b512) -> never spin up the GPU;
+       - rows >= 320K: the GPU keeps scaling while the CPU goes memory-latency-bound
+         (1M rows: 39.7K vs 14.6K), splits still lose to GPU-only at every fraction,
+         and only singles favour the CPU (0.28 ms vs ~1.8 ms of GPU spin-up) -> the
+         batch goes to the GPU whole from nq=8 up.
+     The 320K boundary is interpolated between the 100K and 1M anchors, not probed;
+     re-measure it during R2 validation. OVVS_HYBRID_MIN_NQ overrides the crossover;
+     OVVS_HYBRID_WALK forces a CPU+GPU split at any corpus size (sweep knob). */
   const bool hetero = r.policy == OVVS_POLICY_HETERO;
-  const bool hetero_small = hetero && n < 32000;
   const bool hetero_large = hetero && n >= 320000;
   const int64_t hetero_min_nq = [&]() -> int64_t {
     const char* env = std::getenv("OVVS_HYBRID_MIN_NQ");
@@ -549,10 +546,8 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
       const long parsed = std::strtol(env, nullptr, 10);
       if (parsed > 0) return static_cast<int64_t>(parsed);
     }
-    if (hetero_small) return std::numeric_limits<int64_t>::max();
-    return hetero_large ? 8 : 256;
+    return hetero_large ? 8 : std::numeric_limits<int64_t>::max();
   }();
-  if (hetero && hybrid_frac == 0.0 && gpu_metric_supported && !hetero_large) hybrid_frac = 0.50;
   const bool hetero_cpu_only = hetero && nq < hetero_min_nq;
   const bool hybrid_ok = !hetero_cpu_only && hybrid_frac > 0.0 && gpu_metric_supported &&
                          nq >= 2 &&
@@ -593,7 +588,18 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     float d;
     int64_t id;
   };
-  auto score_ids = [&](const float* query, const std::vector<int64_t>& ids, std::vector<float>& sc) -> ovvsStatus {
+  /* int8 fast path for the CPU walk: read the same shared-USM mirror the GPU kernel
+     uses (one copy, both engines). l2sq_u8 is bitwise-equal to l2sq on qualifying data,
+     so this changes bandwidth, never output. Gated to squared-L2; per-query the walk
+     still verifies the query itself is integer-valued. OVVS_CPU_INT8=0 disables. */
+  const uint8_t* q8_rows = [&]() -> const uint8_t* {
+    if (metric != OVVS_METRIC_L2_EXPANDED) return nullptr;
+    const char* env = std::getenv("OVVS_CPU_INT8");
+    if (env && *env && *env == '0') return nullptr;
+    return gpu_cagra_int8_mirror_host(r, dataset, n, dim);
+  }();
+  auto score_ids = [&](const float* query, const uint8_t* q8_query,
+                       const std::vector<int64_t>& ids, std::vector<float>& sc) -> ovvsStatus {
     sc.resize(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
       const int64_t id = ids[i];
@@ -601,7 +607,8 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
         sc[i] = kInf;
         continue;
       }
-      sc[i] = distance_one(metric, query, dataset + id * dim, dim, 2.f);
+      sc[i] = q8_query ? l2sq_u8(q8_query, q8_rows + id * dim, dim)
+                       : distance_one(metric, query, dataset + id * dim, dim, 2.f);
     }
     return OVVS_STATUS_SUCCESS;
   };
@@ -610,8 +617,40 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
      bit-identical results at any thread count.
      TEMPORARY default: all hardware threads; OVVS_CPU_WALK_THREADS overrides (1 = the old
      serial behaviour) until a thread-count parameter earns a place in the ABI. */
+  /* Patience, ported from the GPU walk: stop expanding once `patience` consecutive
+     iterations admit nothing to the beam (the top-itopk of the candidate set). Same
+     env, same zero-admission-streak semantics; output-changing like the GPU's, so it
+     defaults off and is judged on the recall/QPS frontier. CPU and GPU legs remain
+     bit-identical at patience 0 (the tested invariant); at patience > 0 each engine
+     stops by its own iteration structure and the merged hybrid output is judged on
+     recall, per the campaign rules. */
+  const int stall_patience = []() -> int {
+    const char* env = std::getenv("OVVS_CAGRA_PATIENCE");
+    if (!env || !*env) return 0;
+    const long parsed = std::strtol(env, nullptr, 10);
+    if (parsed <= 0) return 0;
+    return static_cast<int>(std::min<long>(parsed, 1 << 20));
+  }();
+
   auto walk_one = [&](int64_t q) -> ovvsStatus {
     const float* query = queries + q * dim;
+    /* The dataset qualified (mirror exists); the query must too, or this one query
+       walks fp32 while others use int8 -- outputs are bitwise identical either way. */
+    std::vector<uint8_t> q8_query_buf;
+    const uint8_t* q8_query = nullptr;
+    if (q8_rows) {
+      q8_query_buf.resize(static_cast<size_t>(dim));
+      bool ok = true;
+      for (int64_t i = 0; i < dim; ++i) {
+        const float v = query[i];
+        if (!(v >= 0.f && v <= 255.f && v == std::floor(v))) {
+          ok = false;
+          break;
+        }
+        q8_query_buf[static_cast<size_t>(i)] = static_cast<uint8_t>(static_cast<int32_t>(v));
+      }
+      if (ok) q8_query = q8_query_buf.data();
+    }
     std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
     std::vector<char> expanded(static_cast<size_t>(n), 0);
     std::vector<Node> cand;
@@ -626,7 +665,7 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
       seed_ids.push_back(id);
     }
     std::vector<float> seed_sc;
-    const ovvsStatus ss = score_ids(query, seed_ids, seed_sc);
+    const ovvsStatus ss = score_ids(query, q8_query, seed_ids, seed_sc);
     if (ss != OVVS_STATUS_SUCCESS) return ss;
     for (size_t i = 0; i < seed_ids.size(); ++i) cand.push_back({seed_sc[i], seed_ids[i]});
     if (static_cast<int32_t>(cand.size()) > itopk) {
@@ -642,6 +681,8 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
       return OVVS_STATUS_SUCCESS; /* this query is done (was `continue` in the loop) */
     }
     int iters = 0;
+    int s_stall = 0;
+    std::vector<float> beam_scratch;
     const int max_iters = std::max(24, itopk * 6);
     while (iters++ < max_iters) {
       std::vector<int64_t> picks;
@@ -682,8 +723,33 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
         }
       }
       std::vector<float> bsc;
-      const ovvsStatus bs = score_ids(query, batch, bsc);
+      const ovvsStatus bs = score_ids(query, q8_query, batch, bsc);
       if (bs != OVVS_STATUS_SUCCESS) return bs;
+      if (stall_patience > 0) {
+        /* Beam max BEFORE the merge: the itopk-th best distance (kInf while the beam
+           is not yet full -- everything admits then, as on the GPU). A batch node
+           strictly better than it would enter the beam. */
+        float beam_max = kInf;
+        if (static_cast<int32_t>(cand.size()) >= itopk) {
+          beam_scratch.resize(cand.size());
+          for (size_t i = 0; i < cand.size(); ++i) beam_scratch[i] = cand[i].d;
+          std::nth_element(beam_scratch.begin(), beam_scratch.begin() + (itopk - 1),
+                           beam_scratch.end());
+          beam_max = beam_scratch[static_cast<size_t>(itopk - 1)];
+        }
+        bool admitted = false;
+        for (const float d : bsc) {
+          if (d < beam_max) {
+            admitted = true;
+            break;
+          }
+        }
+        s_stall = admitted ? 0 : s_stall + 1;
+        if (s_stall >= stall_patience) {
+          for (size_t i = 0; i < batch.size(); ++i) cand.push_back({bsc[i], batch[i]});
+          break;
+        }
+      }
       for (size_t i = 0; i < batch.size(); ++i) cand.push_back({bsc[i], batch[i]});
       const int32_t keep = itopk * 2;
       if (static_cast<int32_t>(cand.size()) > keep) {

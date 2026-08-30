@@ -1474,6 +1474,9 @@ ovvsStatus ovvsCagraCounts(ovvsCagraIndex_t index, int64_t* live, int64_t* delet
    is the same repair `cagra_insert_one` performs for a newly appended row. Used by update, where
    the vector at `row` has changed and its old neighbourhood no longer describes it. */
 static ovvsStatus cagra_relink_one(CagraIndex* ix, ResourcesData& r, int64_t row) {
+  /* The vector at `row` was just rewritten in place; the int8 mirror fingerprint only
+     samples 64 strided values and can miss it. Force a rebuild on the next walk. */
+  ovvs_gpu_mirror_invalidate();
   const int64_t dim = ix->ds.dim;
   const int32_t degree = ix->degree;
   std::vector<int64_t> nb(static_cast<size_t>(degree));
@@ -1532,6 +1535,10 @@ static int64_t cagra_mutate_chunk(int64_t n) {
 static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int64_t* slots,
                                      int64_t count, std::vector<CagraGraphRowBackup>* journal) {
   if (count <= 0) return OVVS_STATUS_SUCCESS;
+  /* Callers rewrote these rows' vectors in place; the mirror fingerprint samples only
+     64 strided values and can miss that. Invalidate so this chunk's own batched search
+     (and any later query) sees fresh data. */
+  ovvs_gpu_mirror_invalidate();
   const int64_t dim = ix->ds.dim;
   const int32_t degree = ix->degree;
   std::vector<float> qbuf(static_cast<size_t>(count) * static_cast<size_t>(dim));

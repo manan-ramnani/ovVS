@@ -1316,4 +1316,56 @@ Append newest last. One line per real event: what landed, what number it produce
   together, the one lever behind every remaining loss; (3) recall-target mode (per-index
   frontier calibration table; design in the 1M-frontier entry); (4) cold-box certified
   session — now THREE leads to certify: 100K b1000 (1.14×), 1M b1000 (1.70×), b32 band
-  (3.2-3.8×); (5) GPU-assisted mutation (needs device-mirror invalidation audit).
+  (3.2-3.8×); (5) GPU-assisted mutation (needs device-mirror invalidation audit).- **2026-08-31** — **INT8 CPU WALK LEG + CPU PATIENCE PORT LANDED. The 100K rung went
+  from statistical tie to 1.58× AHEAD at b1000; the routing law collapsed to two clean
+  regimes.** (User work program: perf/latency block.)
+  1. **CPU patience port** (`mixer.cpp`, same env/semantics as GPU: zero-admission streak
+     vs the top-itopk beam max, checked pre-merge; default off; bit-parity invariant
+     unchanged at p0). CPU frontier at 100K `32/2` b1000: p0 0.9962@40.3K, p16
+     0.9959@46.2K (+15%), p10 0.9948@54.8K (+36%), p6 0.9908@62.7K (+56%) — patience is
+     worth far MORE on the CPU than the GPU's +10% because the CPU loop bound (itopk*6)
+     was much looser than the GPU's (BEAM/SW+24). Knob only; default stays 0.
+  2. **int8 CPU leg**: the GPU's int8 mirror moved from device USM to ONE shared-USM
+     allocation (`ovvs_usm_malloc`) serving both engines — G3 unchanged, GPU unaffected
+     (A/B: 39.7-39.9K vs 38.9K baseline; the one 32.8K reading was cold-window drift).
+     New `gpu_cagra_int8_mirror_host()` + `l2sq_u8` (exact integer SSD, bitwise-equal to
+     fp32 l2sq below 2^24 — parity preserved automatically, recall values identical);
+     per-query eligibility in walk_one; `OVVS_CPU_INT8=0` escape. Gated to squared-L2.
+     **Same-window A/B at 100K CPU-only: b1 5.4K→6.8K (0.182→0.134 ms), b32 28.8K→65.0K
+     (2.25×), b1000 41.5K→107.2K (2.6×).** 1M CPU b1000 9.9K→14.6K (+47%; latency-bound
+     there, not purely bandwidth). 10K +6% (corpus already cache-resident).
+  3. **Mirror staleness bug fixed (pre-existing, GPU-affecting)**: the 64-sample
+     fingerprint could miss in-place updates → stale mirror serving searches. Mutation
+     now bumps the shared invalidation generation (`ovvs_gpu_mirror_invalidate()` at
+     relink_one/relink_batch). Follow-up fix: a REJECTED corpus re-caches its verdict
+     across generation bumps instead of re-scanning 4n bytes per mutation chunk
+     (measured −23% on 1M updates before the fix; recovered after).
+  4. **Routing re-probed and SIMPLIFIED — the mid-corpus split regime is dead**: with
+     pool+int8, CPU-only at 100K (96-107K) beats GPU-only (45K) and every split through
+     b512 (f-sweep flat ~106K vs CPU-only within window noise). New law: rows < 320K →
+     CPU for everything; rows ≥ 320K → CPU singles (nq<8), GPU takes the batch whole.
+     f-splits remain env-only sweep knobs. 320K boundary is interpolated, NOT probed —
+     re-measure in R2 validation (500K spot-check queued).
+  **CAPSTONE MATRIX (shared window, matched recall, shipped policy):**
+  - 10K (0.9996/0.9997): b1 0.50×; b32 3.22×; b1000 162.7K vs 263.8K (0.62×);
+    insert 39.2K (0.32×); update 43.3K vs 44.0K (0.98×); delete 22×.
+  - 100K (0.9962/0.9959): b1 5.7K vs 6.6K (0.87× — 0.171 vs 0.149 ms, nearly closed);
+    **b32 41.3K vs 7.6K (5.46×)**; **b1000 72.2K vs 45.8K (1.58×)**; insert 13.1K
+    (0.63×); update 14.5K vs 12.0K (1.20×); delete 69×.
+  - 1M (0.9735/0.9712-23): b1 0.46×; **b32 3.02-3.23×**; **b1000 36.2K vs 21.5K
+    (1.68×)**; insert 4.3K (0.52×); update 4.8K (0.84×); delete 76×.
+  Churn G4 re-verified through the int8+invalidation path: 0.9642/0.9644/0.9638 —
+  identical to the validated batched-mutation trajectory. 9/9 CTest at every step.
+  **User question logged ("fp16 instead of int8?") and answered in-session: not instead
+  — layered.** int8-exact stays (bitwise-exact 4× for integer corpora, zero risk); fp16
+  matters as PRIMARY STORAGE for the general-embedding lane (B20): halves G3 footprint
+  AND bandwidth for every corpus, and — key fact — fp16 exactly represents integers up
+  to 2048, so it is ALSO bitwise-exact on SIFT-class data. Plan of record for B20:
+  fp16 primary storage first (simpler than SQ8+rerank, captures most of the win, huge
+  G3 headroom), int8-exact mirror on top where data qualify, SQ8+rerank reserved for
+  R3/10M where G3 forces 4×. Multi-session item; queued behind nothing else in the lane.
+  **Remaining from the perf/latency block (queued):** GPU-assisted mutation (invalidation
+  now exists — audit is unblocked); merged CPU+GPU work queue (only matters ≥320K now);
+  insert-effort sweep; L0 command-list reuse for the ~1.8 ms GPU floor; p99 under mixed
+  read/write load (harness gap); 1M b1 0.46× (CPU singles latency-bound — L2 prefetch
+  of neighbor rows is the next idea there).

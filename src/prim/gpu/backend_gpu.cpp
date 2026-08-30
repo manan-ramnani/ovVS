@@ -2649,14 +2649,24 @@ static const uint8_t* gpu_int8_mirror(ResourcesData& r, sycl::queue& q, const fl
   const uint64_t fingerprint = sample_fingerprint(dataset, count, rows, dim);
 
   std::lock_guard<std::mutex> lock(r.gpu_int8_mutex);
-  if (r.gpu_int8_source == dataset && r.gpu_int8_rows == rows && r.gpu_int8_dim == dim &&
-      r.gpu_int8_fingerprint == fingerprint) {
-    return r.gpu_int8_usable ? static_cast<const uint8_t*>(r.gpu_int8_data) : nullptr;
+  if (r.gpu_int8_source == dataset && r.gpu_int8_rows == rows && r.gpu_int8_dim == dim) {
+    if (r.gpu_int8_fingerprint == fingerprint) {
+      return r.gpu_int8_usable ? static_cast<const uint8_t*>(r.gpu_int8_data) : nullptr;
+    }
+    if (!r.gpu_int8_usable && !r.gpu_int8_data) {
+      /* Same corpus shape, new fingerprint (mutation bumped the generation), but the
+         verdict was REJECT: content edits cannot make a rejected corpus eligible in any
+         workload we care about, and re-scanning 4n bytes per mutation chunk was measured
+         at -23%% on 1M updates. Re-cache the reject under the new fingerprint; fp32 is
+         always correct. A rows/dim/pointer change still rescans from scratch. */
+      r.gpu_int8_fingerprint = fingerprint;
+      return nullptr;
+    }
   }
 
   if (r.gpu_int8_data) {
     q.wait_and_throw();
-    ovvs_gpu_workspace_free(r.gpu_int8_data);
+    ovvs_usm_free(r.gpu_int8_data);
     r.gpu_int8_data = nullptr;
   }
   r.gpu_int8_source = dataset;
@@ -2665,8 +2675,16 @@ static const uint8_t* gpu_int8_mirror(ResourcesData& r, sycl::queue& q, const fl
   r.gpu_int8_fingerprint = fingerprint;
   r.gpu_int8_usable = false;
 
-  void* raw = ovvs_gpu_workspace_alloc(count + sizeof(int32_t));
+  /* Shared USM, not device workspace: the same physical DDR on this iGPU, but the CPU
+     walk can read the mirror too -- one copy serves both engines (G3 stays intact). */
+  void* raw = ovvs_usm_malloc(count + sizeof(int32_t));
   if (!raw) return nullptr;
+  if (sycl::get_pointer_type(raw, q.get_context()) == sycl::usm::alloc::unknown) {
+    /* SYCL alloc failed and ovvs_usm_malloc fell back to std::malloc: the GPU kernel
+       cannot read that. Bail out to the fp32 path rather than fault. */
+    ovvs_usm_free(raw);
+    return nullptr;
+  }
   auto* mirror = static_cast<uint8_t*>(raw);
   auto* reject = reinterpret_cast<int32_t*>(mirror + count);
   try {
@@ -2684,11 +2702,11 @@ static const uint8_t* gpu_int8_mirror(ResourcesData& r, sycl::queue& q, const fl
     int32_t rejected = 0;
     q.memcpy(&rejected, reject, sizeof(rejected)).wait_and_throw();
     if (rejected != 0) {
-      ovvs_gpu_workspace_free(raw);
+      ovvs_usm_free(raw);
       return nullptr;
     }
   } catch (...) {
-    ovvs_gpu_workspace_free(raw);
+    ovvs_usm_free(raw);
     return nullptr;
   }
   r.gpu_int8_data = raw;
@@ -2696,6 +2714,36 @@ static const uint8_t* gpu_int8_mirror(ResourcesData& r, sycl::queue& q, const fl
   return mirror;
 }
 #endif
+
+/* Host-readable view of the int8 mirror for the CPU walk leg. Builds (or returns the
+   cached) shared-USM mirror; nullptr when SYCL is off, the GPU is absent, or the
+   dataset does not qualify -- callers fall back to fp32. */
+const uint8_t* gpu_cagra_int8_mirror_host(ResourcesData& r, const float* dataset, int64_t rows,
+                                          int64_t dim) {
+#if defined(OVVS_WITH_SYCL)
+  if (!gpu_available() || rows <= 0 || dim <= 0) return nullptr;
+  try {
+    const size_t count = static_cast<size_t>(rows) * static_cast<size_t>(dim);
+    return gpu_int8_mirror(r, gpu_queue(), dataset, static_cast<size_t>(rows),
+                           static_cast<size_t>(dim), count);
+  } catch (...) {
+    return nullptr;
+  }
+#else
+  (void)r;
+  (void)dataset;
+  (void)rows;
+  (void)dim;
+  return nullptr;
+#endif
+}
+
+/* Explicit mirror invalidation for in-place dataset mutation. The fingerprint samples
+   only 64 strided values, so an update that misses every sample would leave a STALE
+   mirror serving searches -- a correctness hole that predates the CPU leg (GPU search
+   after update had the same exposure). Mutation bumps the same generation the
+   fingerprint already mixes in, forcing a rebuild on the next walk. */
+void ovvs_gpu_mirror_invalidate() { g_usm_free_generation.fetch_add(1, std::memory_order_relaxed); }
 
 bool gpu_cagra_walk(ResourcesData& r, const float* dataset, int64_t n, int64_t dim, ovvsMetric metric,
                     const int32_t* graph, int32_t degree, const float* queries, int64_t nq, int64_t k,
