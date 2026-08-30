@@ -33,6 +33,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from quick_cagra import (  # noqa: E402
+    POLICY_AUTO,
     POLICY_FORCE_GPU,
     SCALES,
     bind_serialization,
@@ -90,7 +91,9 @@ def main() -> int:
     index = ovvs.CagraIndex(
         resource, handle, dim, own_res=False, destroy=ovvs._lib.ovvsCagraDestroy, n=n
     )
-    resource.set_policy(POLICY_FORCE_GPU)
+    # AUTO permits both engines, which is what the hybrid split needs; without
+    # OVVS_HYBRID_WALK set it still runs the GPU path exactly as FORCE_GPU did.
+    resource.set_policy(POLICY_AUTO if os.environ.get("OVVS_HYBRID_WALK") else POLICY_FORCE_GPU)
 
     hnsw = hnswlib.Index(space="l2", dim=dim)
     hnsw.init_index(max_elements=n, ef_construction=200, M=16, random_seed=7)

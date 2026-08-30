@@ -190,7 +190,7 @@ def main() -> int:
     ap.add_argument("--passes", type=int, default=5)
     ap.add_argument("--graph-degree", type=int, default=16)
     ap.add_argument("--intermediate-degree", type=int, default=32)
-    ap.add_argument("--search-policy", choices=("gpu", "cpu"), default="gpu")
+    ap.add_argument("--search-policy", choices=("gpu", "cpu", "auto"), default="gpu")
     ap.add_argument(
         "--counters",
         action="store_true",
@@ -265,7 +265,12 @@ def main() -> int:
             n=int(base.shape[0]),
         )
 
-        resource.set_policy(POLICY_FORCE_GPU if args.search_policy == "gpu" else POLICY_FORCE_CPU)
+        policy = {
+            "gpu": POLICY_FORCE_GPU,
+            "cpu": POLICY_FORCE_CPU,
+            "auto": POLICY_AUTO,  # both engines permitted; OVVS_HYBRID_WALK splits them
+        }[args.search_policy]
+        resource.set_policy(policy)
         results = []
         for itopk, width, batch in points:
             row = run_point(index, queries, truth, itopk, width, batch, args.warmup, args.passes)

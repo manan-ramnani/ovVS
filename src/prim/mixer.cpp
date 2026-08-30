@@ -509,7 +509,30 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
                           r.policy == OVVS_POLICY_GPU_IF_FASTER ||
                           r.policy == OVVS_POLICY_HETERO ||
                           r.policy == OVVS_POLICY_FORCE_GPU;
-  if (gpu_policy && gpu_metric_supported) {
+  /* Hybrid split: run the iGPU and the CPU workers on disjoint query ranges of the same
+     batch, one wall clock. Per-query CPU/GPU parity is a tested invariant, so the merged
+     output is bit-identical to either engine alone at any split. A forced device stays
+     exclusive; the GPU leg failing falls back to the CPU for its share, preserving the
+     existing fallback semantics.
+     TEMPORARY knob until OVVS_POLICY_HETERO adopts it as default behaviour:
+     OVVS_HYBRID_WALK = fraction of queries sent to the GPU, 0 < f < 1 (0/unset = off;
+     measured contended engine rates put the optimum near 0.5). */
+  const double hybrid_frac = [&]() -> double {
+    const char* env = std::getenv("OVVS_HYBRID_WALK");
+    if (!env || !*env) return 0.0;
+    const double parsed = std::strtod(env, nullptr);
+    if (!(parsed > 0.0) || parsed >= 1.0) return 0.0;
+    return parsed;
+  }();
+  const bool hybrid_ok = hybrid_frac > 0.0 && gpu_metric_supported && nq >= 2 &&
+                         (r.policy == OVVS_POLICY_AUTO || r.policy == OVVS_POLICY_GPU_IF_FASTER ||
+                          r.policy == OVVS_POLICY_HETERO);
+  int64_t cpu_begin = 0;
+  bool hybrid_active = false;
+  bool gpu_leg_ok = false;
+  std::thread gpu_worker;
+
+  if (gpu_policy && gpu_metric_supported && !hybrid_ok) {
     if (gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, nq, k, itopk, search_width,
                        bitset, neighbors, distances)) {
       r.last_device = OVVS_DEVICE_GPU;
@@ -517,6 +540,19 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     }
   }
   if (r.policy == OVVS_POLICY_FORCE_GPU) return finish_forced_fail(r);
+  if (hybrid_ok) {
+    cpu_begin = static_cast<int64_t>(hybrid_frac * static_cast<double>(nq) + 0.5);
+    cpu_begin = std::max<int64_t>(1, std::min<int64_t>(cpu_begin, nq - 1));
+    hybrid_active = true;
+    gpu_worker = std::thread([&, cpu_begin]() {
+      try {
+        gpu_leg_ok = gpu_cagra_walk(r, dataset, n, dim, metric, graph, degree, queries, cpu_begin,
+                                    k, itopk, search_width, bitset, neighbors, distances);
+      } catch (...) {
+        gpu_leg_ok = false; /* the CPU picks this range up after the join */
+      }
+    });
+  }
 
   r.last_device = OVVS_DEVICE_CPU;
 
@@ -648,38 +684,53 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     if (parsed < 1) parsed = 1;
     return static_cast<int>(std::min<long>(parsed, 256));
   }();
-  if (walk_threads <= 1 || nq <= 1) {
-    for (int64_t q = 0; q < nq; ++q) {
-      const ovvsStatus s = walk_one(q);
-      if (s != OVVS_STATUS_SUCCESS) return s;
-    }
-    return OVVS_STATUS_SUCCESS;
-  }
-  /* Work-stealing over queries: per-query cost varies, so workers claim the next index
-     from an atomic counter rather than taking fixed chunks. First failure wins; workers
-     drain out on it. */
-  std::atomic<ovvsStatus> walk_status{OVVS_STATUS_SUCCESS};
-  std::atomic<int64_t> next_query{0};
-  const int worker_count = static_cast<int>(std::min<int64_t>(walk_threads, nq));
-  std::vector<std::thread> workers;
-  workers.reserve(static_cast<size_t>(worker_count));
-  for (int t = 0; t < worker_count; ++t) {
-    workers.emplace_back([&]() {
-      for (;;) {
-        const int64_t q = next_query.fetch_add(1, std::memory_order_relaxed);
-        if (q >= nq) return;
-        if (walk_status.load(std::memory_order_relaxed) != OVVS_STATUS_SUCCESS) return;
+  /* Work-stealing over a query range: per-query cost varies, so workers claim the next
+     index from an atomic counter rather than taking fixed chunks. First failure wins;
+     workers drain out on it. */
+  auto run_cpu_range = [&](int64_t lo, int64_t hi) -> ovvsStatus {
+    if (hi <= lo) return OVVS_STATUS_SUCCESS;
+    if (walk_threads <= 1 || hi - lo <= 1) {
+      for (int64_t q = lo; q < hi; ++q) {
         const ovvsStatus s = walk_one(q);
-        if (s != OVVS_STATUS_SUCCESS) {
-          ovvsStatus expected = OVVS_STATUS_SUCCESS;
-          walk_status.compare_exchange_strong(expected, s);
-          return;
-        }
+        if (s != OVVS_STATUS_SUCCESS) return s;
       }
-    });
+      return OVVS_STATUS_SUCCESS;
+    }
+    std::atomic<ovvsStatus> walk_status{OVVS_STATUS_SUCCESS};
+    std::atomic<int64_t> next_query{lo};
+    const int worker_count = static_cast<int>(std::min<int64_t>(walk_threads, hi - lo));
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(worker_count));
+    for (int t = 0; t < worker_count; ++t) {
+      workers.emplace_back([&]() {
+        for (;;) {
+          const int64_t q = next_query.fetch_add(1, std::memory_order_relaxed);
+          if (q >= hi) return;
+          if (walk_status.load(std::memory_order_relaxed) != OVVS_STATUS_SUCCESS) return;
+          const ovvsStatus s = walk_one(q);
+          if (s != OVVS_STATUS_SUCCESS) {
+            ovvsStatus expected = OVVS_STATUS_SUCCESS;
+            walk_status.compare_exchange_strong(expected, s);
+            return;
+          }
+        }
+      });
+    }
+    for (auto& w : workers) w.join();
+    return walk_status.load();
+  };
+
+  const ovvsStatus cpu_status = run_cpu_range(cpu_begin, nq);
+  if (hybrid_active) {
+    gpu_worker.join();
+    if (!gpu_leg_ok) {
+      /* The accelerator leg failed: finish its share on the CPU so the call keeps the
+         all-or-nothing contract the non-hybrid fallback already provides. */
+      const ovvsStatus fallback = run_cpu_range(0, cpu_begin);
+      if (fallback != OVVS_STATUS_SUCCESS) return fallback;
+    }
   }
-  for (auto& w : workers) w.join();
-  return walk_status.load();
+  return cpu_status;
 }
 
 ovvsStatus brute_search_impl(ResourcesData& r, const float* dataset, int64_t n, int64_t dim,

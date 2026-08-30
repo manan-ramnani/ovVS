@@ -1148,3 +1148,24 @@ Append newest last. One line per real event: what landed, what number it produce
   walk reads fp32 rows — pointing it at the int8 mirror (AVX2) would cut its bandwidth
   4× and should lift the contended sum further. **NEXT: implement OVVS_POLICY_HYBRID and
   score it properly.**
+- **2026-08-31** — **SINGLE-PROCESS HYBRID ROUTER LANDED (`OVVS_HYBRID_WALK=<frac>`,
+  TEMPORARY until OVVS_POLICY_HETERO adopts it).** GPU leg [0, f·nq) on an
+  exception-guarded worker thread + CPU work-stealing pool on [f·nq, nq); GPU-leg failure
+  falls back to CPU for its share; forced policies stay exclusive. Per-query CPU/GPU
+  parity makes the merged output bit-identical at any fraction — **recall 0.9962 at every
+  f tested.** `quick_cagra --search-policy auto` and an ab_g1 hybrid lane added. 9/9 CTest.
+  **Solo-window fraction sweep (b1024, d32 32/2 p0): f=0.4→53.9K, 0.45→55.9K, 0.5→
+  53.8-55.8K, `f=0.55`→61.4K, 0.6→57.3K.** Best 61.4K = 1.31× the best single engine,
+  ~73% of the naive engine sum (the rest is shared package power/bandwidth).
+  **Shared-window ab_g1 vs hnswlib ef=96 (0.9962 vs 0.9955-6), 2×5 rounds:** run 1 median
+  **0.808 (ovVS ahead 1.24×, 4/5 rounds)**; run 2 median 1.043 (hnswlib climbed through
+  the run as the package heated). **Pooled 10-round median 0.932 → ovVS ahead ~7% at
+  higher recall — the first time ovVS has led ANY shared window, but a statistical tie,
+  not a certified pass.** Both lanes fail the ≤10% stability bar on the hours-hot box;
+  rule 1b: no further scoring tonight. JSONs `out/quick/g1-hybrid-ef96{,-r2}.json`.
+  **Margin sitting on the table for the certified pass (queued):** (1) CPU leg reads fp32
+  — port it to the int8 mirror (AVX2 dot: 4× less bandwidth in the contended regime);
+  (2) port patience to the CPU walk (unlocks the p-frontier configs for hybrid, ~+10%);
+  (3) persistent CPU worker pool (thread spawn per call ≈ 6-10% at b1024);
+  (4) adaptive split fraction. Then a COLD-BOX certified G1 session with lane-stability
+  discipline. Known-good pieces, each measured-adjacent, all additive.
