@@ -1,8 +1,15 @@
 #include "internal.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <queue>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include <fstream>
 #include <thread>
 
@@ -131,6 +138,68 @@ struct CagraSync {
   std::mutex writer;
 };
 
+/* Write-ahead log (opt-in): every successful mutation appends one CRC-guarded record;
+   ovvsCagraWalOpen replays whatever the file holds (crash recovery, torn tail
+   truncated away) before appending resumes; ovvsCagraSerialize truncates the log
+   because the snapshot supersedes it. Insert records carry (rows_before,
+   deleted_before) preconditions so the tiny serialize-then-crash-before-truncate
+   window cannot double-apply them; update, delete and quantize replay is idempotent
+   by nature. */
+struct CagraWal {
+  std::FILE* f = nullptr;
+  std::string path;
+  int32_t fsync_every = 1;
+  bool replaying = false;
+  ~CagraWal() {
+    if (f) std::fclose(f);
+  }
+};
+
+static uint32_t wal_crc32(const void* data, size_t len, uint32_t seed) {
+  static const auto table = []() {
+    std::array<uint32_t, 256> tab{};
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+      tab[i] = c;
+    }
+    return tab;
+  }();
+  uint32_t c = ~seed;
+  const auto* p = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < len; ++i) c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+  return ~c;
+}
+
+static constexpr uint32_t kWalMagic = 0x4C57564Fu; /* 'OVWL' */
+enum : uint32_t {
+  kWalInsert = 1,
+  kWalUpdate = 2,
+  kWalDelete = 3,
+  kWalQuantize = 4,
+  kWalInsertNoIds = 5, /* the original call had no out_ids, so no slot reuse */
+};
+
+struct WalHeader {
+  uint32_t magic;
+  uint32_t type;
+  int64_t rows_before;
+  int64_t deleted_before;
+  int64_t count;
+  int64_t payload_bytes;
+};
+
+static void wal_flush(CagraWal* w) {
+  std::fflush(w->f);
+  if (w->fsync_every > 0) {
+#if defined(_WIN32)
+    _commit(_fileno(w->f));
+#else
+    fsync(fileno(w->f));
+#endif
+  }
+}
+
 struct CagraIndex {
   Dataset ds;
   int32_t degree = 0;
@@ -143,6 +212,7 @@ struct CagraIndex {
   UsmU8Vec mirror8;
   bool mirror8_ok = false;
   std::shared_ptr<CagraSync> sync = std::make_shared<CagraSync>();
+  std::shared_ptr<CagraWal> wal;
   int32_t pq_m = 0;
   int32_t pq_ks = 0;
   int32_t dsub = 0;
@@ -178,6 +248,36 @@ static bool cagra_f16_mode() {
 }
 
 static bool cagra_is_f16(const CagraIndex& ix) { return !ix.ds.x16.empty(); }
+
+/* Appends one record. Called at the end of a successful mutation, under the writer
+   mutex, with the counters as they stood BEFORE the mutation. Append failure surfaces
+   as IO: the in-memory mutation stands, but a durability caller must know the log no
+   longer covers it. */
+static ovvsStatus wal_append(CagraIndex* ix, uint32_t type, int64_t rows_before,
+                             int64_t deleted_before, int64_t count, const void* payload,
+                             size_t payload_bytes) {
+  CagraWal* w = ix->wal.get();
+  if (!w || !w->f || w->replaying) return OVVS_STATUS_SUCCESS;
+  WalHeader h{kWalMagic, type, rows_before, deleted_before, count,
+              static_cast<int64_t>(payload_bytes)};
+  uint32_t crc = wal_crc32(&h, sizeof(h), 0);
+  if (payload_bytes) crc = wal_crc32(payload, payload_bytes, crc);
+  if (std::fwrite(&h, sizeof(h), 1, w->f) != 1) return OVVS_STATUS_IO;
+  if (payload_bytes && std::fwrite(payload, 1, payload_bytes, w->f) != payload_bytes) {
+    return OVVS_STATUS_IO;
+  }
+  if (std::fwrite(&crc, sizeof(crc), 1, w->f) != 1) return OVVS_STATUS_IO;
+  wal_flush(w);
+  return OVVS_STATUS_SUCCESS;
+}
+
+static void wal_truncate(CagraIndex* ix) {
+  CagraWal* w = ix->wal.get();
+  if (!w || !w->f) return;
+  std::fclose(w->f);
+  w->f = std::fopen(w->path.c_str(), "wb");
+  if (w->f) wal_flush(w);
+}
 
 static bool cagra_dataset_present(const CagraIndex& ix) {
   return ix.has_dataset && (!ix.ds.x.empty() || !ix.ds.x16.empty());
@@ -1579,7 +1679,11 @@ ovvsStatus ovvsCagraSerializeEx(ovvsCagraIndex_t index, const char* path, int32_
     f.write(reinterpret_cast<const char*>(ix->generation.data()),
             static_cast<std::streamsize>(ix->generation.size() * sizeof(uint32_t)));
   }
-  return f.good() ? OVVS_STATUS_SUCCESS : OVVS_STATUS_IO;
+  f.flush();
+  if (!f.good()) return OVVS_STATUS_IO;
+  f.close();
+  wal_truncate(ix); /* the snapshot now covers everything the log held */
+  return OVVS_STATUS_SUCCESS;
 }
 
 ovvsStatus ovvsCagraSerialize(ovvsCagraIndex_t index, const char* path) {
@@ -1686,6 +1790,8 @@ ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const in
     }
   }
   try {
+    const int64_t wal_rows = ix->ds.n;
+    const int64_t wal_deleted = ix->deleted_count;
     std::unique_lock<std::shared_mutex> ex(ix->sync->rw);
     if (ix->deleted.empty()) {
       ix->deleted.assign(static_cast<size_t>((ix->ds.n + 7) / 8), 0u);
@@ -1699,8 +1805,10 @@ ovvsStatus ovvsCagraDelete(ovvsResources_t res, ovvsCagraIndex_t index, const in
       ++ix->deleted_count;
       ix->free_slots.push_back(static_cast<int32_t>(slot));
     }
+    ex.unlock();
     rd(res)->last_device = OVVS_DEVICE_CPU;
-    return OVVS_STATUS_SUCCESS;
+    return wal_append(ix, kWalDelete, wal_rows, wal_deleted, nids, ids,
+                      static_cast<size_t>(nids) * sizeof(int64_t));
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
   } catch (...) {
@@ -1981,6 +2089,8 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
   }
   if (resources->policy == OVVS_POLICY_FORCE_GPU) return OVVS_STATUS_DEVICE_UNAVAILABLE;
   std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
+  const int64_t wal_rows = ix->ds.n;
+  const int64_t wal_deleted = ix->deleted_count;
   std::vector<int64_t> slots(static_cast<size_t>(nids));
   for (int64_t i = 0; i < nids; ++i) {
     if (!cagra_resolve_id(*ix, ids[i], &slots[static_cast<size_t>(i)])) {
@@ -2053,6 +2163,15 @@ ovvsStatus ovvsCagraUpdate(ovvsResources_t res, ovvsCagraIndex_t index, const in
       cagra_pq_encode_all(ix);
     }
     resources->last_device = OVVS_DEVICE_CPU;
+    if (ix->wal && ix->wal->f && !ix->wal->replaying) {
+      std::vector<uint8_t> payload(static_cast<size_t>(nids) *
+                                   (sizeof(int64_t) + static_cast<size_t>(dim) * sizeof(float)));
+      std::memcpy(payload.data(), ids, static_cast<size_t>(nids) * sizeof(int64_t));
+      std::memcpy(payload.data() + static_cast<size_t>(nids) * sizeof(int64_t), vectors,
+                  static_cast<size_t>(nids) * static_cast<size_t>(dim) * sizeof(float));
+      return wal_append(ix, kWalUpdate, wal_rows, wal_deleted, nids, payload.data(),
+                        payload.size());
+    }
     return OVVS_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
@@ -2103,6 +2222,7 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
        rewrites per insert. That is degree*degree*4 bytes, about 1 KB at degree 16.
        Everything else is append-only and unwound by truncating. */
     const int64_t original_n = ix->ds.n;
+    const int64_t wal_deleted = ix->deleted_count;
     /* Grow both buffers at most once for the whole batch. Two things are being balanced here.
        Reserving the exact final size would make every single-vector Extend reallocate and copy
        the whole dataset, i.e. O(n) per insert -- and inserting one vector at a time is precisely
@@ -2254,8 +2374,12 @@ ovvsStatus ovvsCagraExtendEx(ovvsResources_t res, ovvsCagraIndex_t index, const 
     if (ix->pq_m > 0) {
       cagra_pq_encode_all(ix);
     }
+    tail_ex.unlock();
     resources->last_device = OVVS_DEVICE_CPU;
-    return OVVS_STATUS_SUCCESS;
+    return wal_append(ix, out_ids ? kWalInsert : kWalInsertNoIds, original_n, wal_deleted,
+                      nextra,
+                      extra, static_cast<size_t>(nextra) * static_cast<size_t>(dim) *
+                                 sizeof(float));
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
   } catch (...) {
@@ -2329,12 +2453,160 @@ ovvsStatus ovvsCagraQuantize(ovvsResources_t res, ovvsCagraIndex_t index, int32_
       *ix = std::move(staged);
     }
     resources->last_device = OVVS_DEVICE_CPU;
-    return OVVS_STATUS_SUCCESS;
+    {
+      const int32_t params[2] = {pq_m, pq_nbits};
+      return wal_append(ix, kWalQuantize, ix->ds.n, ix->deleted_count, 0, params,
+                        sizeof(params));
+    }
   } catch (const std::bad_alloc&) {
     return OVVS_STATUS_OOM;
   } catch (...) {
     return OVVS_STATUS_ERROR;
   }
+}
+
+/* Attach a write-ahead log. Existing records are REPLAYED first (crash recovery; a
+   torn or corrupt tail is truncated away), then every successful mutation appends one
+   fsync'd record until ovvsCagraSerialize truncates the log or ovvsCagraWalClose
+   detaches it. Attach before serving traffic; replay calls the public mutation entry
+   points. fsync_every <= 0 leaves flushing to the OS (survives a process crash, not a
+   power cut). */
+ovvsStatus ovvsCagraWalOpen(ovvsResources_t res, ovvsCagraIndex_t index, const char* path,
+                            int32_t fsync_every) {
+  if (!res || !index || !path || !*path) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  if (ix->wal) return OVVS_STATUS_INVALID_ARGUMENT; /* already attached */
+  try {
+    auto w = std::make_shared<CagraWal>();
+    w->path = path;
+    w->fsync_every = fsync_every;
+    int64_t good_end = 0;
+    std::FILE* rf = std::fopen(path, "rb");
+    if (rf) {
+      ix->wal = w;
+      w->replaying = true;
+      const int64_t dim = ix->ds.dim;
+      std::vector<uint8_t> payload;
+      for (;;) {
+        WalHeader h;
+        if (std::fread(&h, sizeof(h), 1, rf) != 1) break;
+        if (h.magic != kWalMagic || h.count < 0 || h.payload_bytes < 0 ||
+            h.payload_bytes > (int64_t{1} << 34)) {
+          break;
+        }
+        payload.resize(static_cast<size_t>(h.payload_bytes));
+        if (h.payload_bytes &&
+            std::fread(payload.data(), 1, payload.size(), rf) != payload.size()) {
+          break;
+        }
+        uint32_t crc_read = 0;
+        if (std::fread(&crc_read, sizeof(crc_read), 1, rf) != 1) break;
+        uint32_t crc = wal_crc32(&h, sizeof(h), 0);
+        if (!payload.empty()) crc = wal_crc32(payload.data(), payload.size(), crc);
+        if (crc != crc_read) break;
+
+        bool stop = false;
+        switch (h.type) {
+          case kWalDelete: {
+            if (payload.size() != static_cast<size_t>(h.count) * sizeof(int64_t)) {
+              stop = true;
+              break;
+            }
+            /* Idempotent; a record whose ids no longer resolve was already absorbed. */
+            ovvsCagraDelete(res, index, reinterpret_cast<const int64_t*>(payload.data()),
+                            h.count);
+            break;
+          }
+          case kWalUpdate: {
+            const size_t ids_bytes = static_cast<size_t>(h.count) * sizeof(int64_t);
+            const size_t vec_bytes =
+                static_cast<size_t>(h.count) * static_cast<size_t>(dim) * sizeof(float);
+            if (payload.size() != ids_bytes + vec_bytes) {
+              stop = true;
+              break;
+            }
+            ovvsCagraUpdate(res, index, reinterpret_cast<const int64_t*>(payload.data()),
+                            reinterpret_cast<const float*>(payload.data() + ids_bytes),
+                            h.count);
+            break;
+          }
+          case kWalInsert:
+          case kWalInsertNoIds: {
+            if (payload.size() !=
+                static_cast<size_t>(h.count) * static_cast<size_t>(dim) * sizeof(float)) {
+              stop = true;
+              break;
+            }
+            /* Precondition guard: a record the snapshot already reflects (the
+               serialize-then-crash-before-truncate window) will not match and is
+               skipped instead of duplicating rows. */
+            if (h.rows_before != ix->ds.n || h.deleted_before != ix->deleted_count) break;
+            if (h.type == kWalInsert) {
+              std::vector<int64_t> got(static_cast<size_t>(h.count));
+              ovvsCagraExtendEx(res, index, reinterpret_cast<const float*>(payload.data()),
+                                h.count, got.data());
+            } else {
+              ovvsCagraExtendEx(res, index, reinterpret_cast<const float*>(payload.data()),
+                                h.count, nullptr);
+            }
+            break;
+          }
+          case kWalQuantize: {
+            if (payload.size() != 2 * sizeof(int32_t)) {
+              stop = true;
+              break;
+            }
+            const int32_t* params = reinterpret_cast<const int32_t*>(payload.data());
+            ovvsCagraQuantize(res, index, params[0], params[1]);
+            break;
+          }
+          default:
+            stop = true;
+            break;
+        }
+        if (stop) break;
+#if defined(_WIN32)
+        good_end = _ftelli64(rf);
+#else
+        good_end = static_cast<int64_t>(ftello(rf));
+#endif
+      }
+      std::fclose(rf);
+      w->replaying = false;
+      ix->wal.reset();
+    }
+    w->f = std::fopen(path, rf ? "r+b" : "wb");
+    if (!w->f) w->f = std::fopen(path, "wb");
+    if (!w->f) return OVVS_STATUS_IO;
+#if defined(_WIN32)
+    _chsize_s(_fileno(w->f), good_end); /* drop any torn tail */
+    _fseeki64(w->f, 0, SEEK_END);
+#else
+    if (ftruncate(fileno(w->f), good_end) != 0) { /* keep going; appends still land */
+    }
+    fseeko(w->f, 0, SEEK_END);
+#endif
+    {
+      std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
+      ix->wal = std::move(w);
+    }
+    return OVVS_STATUS_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    ix->wal.reset();
+    return OVVS_STATUS_OOM;
+  } catch (...) {
+    ix->wal.reset();
+    return OVVS_STATUS_ERROR;
+  }
+}
+
+ovvsStatus ovvsCagraWalClose(ovvsCagraIndex_t index) {
+  if (!index) return OVVS_STATUS_INVALID_ARGUMENT;
+  auto* ix = reinterpret_cast<CagraIndex*>(index);
+  std::lock_guard<std::mutex> writer_lock(ix->sync->writer);
+  if (ix->wal && ix->wal->f) wal_flush(ix->wal.get());
+  ix->wal.reset();
+  return OVVS_STATUS_SUCCESS;
 }
 
 /* Recall-target mode: pick the cheapest (itopk, search_width) whose measured recall@k

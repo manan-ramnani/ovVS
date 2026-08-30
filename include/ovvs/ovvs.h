@@ -321,6 +321,15 @@ OVVS_API ovvsStatus ovvsCagraBuildEx2(ovvsResources_t res, const float* dataset,
 OVVS_API ovvsStatus ovvsCagraSearch(ovvsResources_t res, ovvsCagraIndex_t index, const float* queries,
                                     int64_t nq, int64_t k, int32_t itopk_size, int32_t search_width,
                                     const uint8_t* bitset, int64_t* neighbors, float* distances);
+/* Durability: attach a write-ahead log to a CAGRA index. Existing records replay
+   first (crash recovery; a torn tail is truncated), then every successful mutation
+   appends one CRC-guarded record; ovvsCagraSerialize truncates the log because the
+   snapshot supersedes it. fsync_every > 0 flushes to stable storage per mutation
+   (power-cut durable); <= 0 leaves flushing to the OS (process-crash durable). Attach
+   before serving traffic; pair one WAL file with one snapshot lineage. */
+OVVS_API ovvsStatus ovvsCagraWalOpen(ovvsResources_t res, ovvsCagraIndex_t index,
+                                     const char* path, int32_t fsync_every);
+OVVS_API ovvsStatus ovvsCagraWalClose(ovvsCagraIndex_t index);
 /* Recall-target mode: measures recall@k on a displaced self-sample against exact
    brute-force truth across an effort ladder, and returns the cheapest
    (itopk, search_width) meeting target_recall -- or the best available config when the

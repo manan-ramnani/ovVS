@@ -809,6 +809,25 @@ class CagraIndex(_Index):
         self.n = live + deleted
         return list(out)
 
+    def wal_open(self, path, fsync_every=1):
+        """Attach a write-ahead log (replays existing records first)."""
+        fn = getattr(_lib, "ovvsCagraWalOpen", None)
+        if fn is None:
+            raise RuntimeError("wal_open requires ovvsCagraWalOpen")
+        fn.argtypes = [c_void_p, c_void_p, ctypes.c_char_p, c_int32]
+        fn.restype = c_int32
+        rc = fn(self._res._h, self._h, os.fsencode(path), c_int32(fsync_every))
+        _check_status(rc, "CAGRA wal_open")
+
+    def wal_close(self):
+        fn = getattr(_lib, "ovvsCagraWalClose", None)
+        if fn is None:
+            raise RuntimeError("wal_close requires ovvsCagraWalClose")
+        fn.argtypes = [c_void_p]
+        fn.restype = c_int32
+        rc = fn(self._h)
+        _check_status(rc, "CAGRA wal_close")
+
     def calibrate(self, target_recall, k=10):
         """Pick the cheapest (itopk, search_width) meeting target_recall at this k.
 
