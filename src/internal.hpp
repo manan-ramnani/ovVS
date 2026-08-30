@@ -3,12 +3,15 @@
 #include "ovvs/ovvs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -18,6 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -204,6 +208,97 @@ struct NnDescentBuildStats {
   void submission() noexcept { GpuWorkStats::add(submission_calls, 1); }
 };
 
+/* Persistent CPU work-stealing pool. Spawning a fresh std::thread set per call cost
+   6-10% of a b1024 walk and made small parallel regions net losses; the pool parks its
+   workers on a condition variable instead. One pool per Resources, matching the
+   documented one-Resources-per-worker concurrency model; `run` is serialized by a
+   submitter mutex, so a second concurrent caller waits instead of corrupting job state.
+   Lazily created on first use (size fixed then); joined by the destructor, which runs
+   from the explicit ovvsResourcesDestroy call, not DllMain -- no loader-lock hazard. */
+struct CpuWorkPool {
+  explicit CpuWorkPool(int nthreads) {
+    workers.reserve(static_cast<size_t>(nthreads > 1 ? nthreads - 1 : 0));
+    for (int t = 1; t < nthreads; ++t) {
+      workers.emplace_back([this]() { worker_loop(); });
+    }
+  }
+  ~CpuWorkPool() {
+    {
+      std::lock_guard<std::mutex> lk(m);
+      shutdown = true;
+    }
+    cv.notify_all();
+    for (auto& w : workers) w.join();
+  }
+
+  int size() const { return static_cast<int>(workers.size()) + 1; }
+
+  /* Runs fn(i) for i in [lo, hi); the calling thread participates. fn must not throw. */
+  void run(int64_t lo, int64_t hi, const std::function<void(int64_t)>& fn) {
+    if (hi <= lo) return;
+    if (workers.empty() || hi - lo == 1) {
+      for (int64_t i = lo; i < hi; ++i) fn(i);
+      return;
+    }
+    std::lock_guard<std::mutex> submit(run_mutex);
+    {
+      std::lock_guard<std::mutex> lk(m);
+      body = &fn;
+      next.store(lo, std::memory_order_relaxed);
+      end = hi;
+      active.store(static_cast<int>(workers.size()), std::memory_order_relaxed);
+      ++generation;
+    }
+    cv.notify_all();
+    for (int64_t i = next.fetch_add(1, std::memory_order_relaxed); i < hi;
+         i = next.fetch_add(1, std::memory_order_relaxed)) {
+      fn(i);
+    }
+    std::unique_lock<std::mutex> lk(m);
+    done_cv.wait(lk, [&]() { return active.load(std::memory_order_acquire) == 0; });
+    body = nullptr;
+  }
+
+ private:
+  void worker_loop() {
+    uint64_t seen = 0;
+    for (;;) {
+      const std::function<void(int64_t)>* fn = nullptr;
+      int64_t hi = 0;
+      {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&]() { return shutdown || generation != seen; });
+        if (shutdown) return;
+        seen = generation;
+        fn = body;
+        hi = end;
+      }
+      for (int64_t i = next.fetch_add(1, std::memory_order_relaxed); i < hi;
+           i = next.fetch_add(1, std::memory_order_relaxed)) {
+        (*fn)(i);
+      }
+      bool last = false;
+      {
+        std::lock_guard<std::mutex> lk(m);
+        last = active.fetch_sub(1, std::memory_order_acq_rel) == 1;
+      }
+      if (last) done_cv.notify_all();
+    }
+  }
+
+  std::mutex run_mutex;
+  std::mutex m;
+  std::condition_variable cv;
+  std::condition_variable done_cv;
+  uint64_t generation = 0;
+  bool shutdown = false;
+  const std::function<void(int64_t)>* body = nullptr;
+  std::atomic<int64_t> next{0};
+  int64_t end = 0;
+  std::atomic<int> active{0};
+  std::vector<std::thread> workers;
+};
+
 struct ResourcesData {
   ovvsPolicy policy = OVVS_POLICY_AUTO;
   bool npu_available = false;
@@ -265,6 +360,16 @@ struct ResourcesData {
   float* scratch_f(size_t n) {
     if (scratch.size() < n) scratch.resize(n);
     return scratch.data();
+  }
+
+  /* Lazily created; sized by the first caller (the walk reads OVVS_CPU_WALK_THREADS
+     once, at that moment) and fixed for the life of the Resources. */
+  std::mutex cpu_pool_mutex;
+  std::unique_ptr<CpuWorkPool> cpu_pool;
+  CpuWorkPool& pool(int nthreads) {
+    std::lock_guard<std::mutex> lk(cpu_pool_mutex);
+    if (!cpu_pool) cpu_pool = std::make_unique<CpuWorkPool>(nthreads);
+    return *cpu_pool;
   }
 
   /* Device-local scratch reused across graph-walk calls. Allocating and freeing the visited

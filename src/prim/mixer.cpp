@@ -532,7 +532,8 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
      Lake-S 265K + Xe-LPG, SIFT-128, b1000):
        - small corpus (<32K rows): the threaded CPU walk wins at EVERY batch size
          (10K rows: 118.6K vs 53.9K QPS) -> never spin up the GPU;
-       - mid corpus: R1 optimum, crossover nq=128, split f=0.55 (61.4K at 100K rows);
+       - mid corpus: crossover nq=256, split f=0.50 (60K at 100K rows; re-tuned after
+         the persistent pool sped the CPU leg up -- the old 128/0.55 predates it);
        - large corpus (>=320K rows): the GPU walk keeps scaling while the CPU walk goes
          bandwidth-bound (1M rows: 38.9K vs 9.9K), and past f=0.95 the CPU leg still
          costs the GPU more bandwidth than it contributes -> above a small crossover
@@ -549,9 +550,9 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
       if (parsed > 0) return static_cast<int64_t>(parsed);
     }
     if (hetero_small) return std::numeric_limits<int64_t>::max();
-    return hetero_large ? 8 : 128;
+    return hetero_large ? 8 : 256;
   }();
-  if (hetero && hybrid_frac == 0.0 && gpu_metric_supported && !hetero_large) hybrid_frac = 0.55;
+  if (hetero && hybrid_frac == 0.0 && gpu_metric_supported && !hetero_large) hybrid_frac = 0.50;
   const bool hetero_cpu_only = hetero && nq < hetero_min_nq;
   const bool hybrid_ok = !hetero_cpu_only && hybrid_frac > 0.0 && gpu_metric_supported &&
                          nq >= 2 &&
@@ -714,9 +715,9 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
     if (parsed < 1) parsed = 1;
     return static_cast<int>(std::min<long>(parsed, 256));
   }();
-  /* Work-stealing over a query range: per-query cost varies, so workers claim the next
-     index from an atomic counter rather than taking fixed chunks. First failure wins;
-     workers drain out on it. */
+  /* Work-stealing over a query range on the persistent per-Resources pool: per-query
+     cost varies, so workers claim the next index from an atomic counter rather than
+     taking fixed chunks. First failure wins; the rest drain out on it. */
   auto run_cpu_range = [&](int64_t lo, int64_t hi) -> ovvsStatus {
     if (hi <= lo) return OVVS_STATUS_SUCCESS;
     if (walk_threads <= 1 || hi - lo <= 1) {
@@ -727,26 +728,15 @@ ovvsStatus prim_graph_walk(ResourcesData& r, const float* dataset, int64_t n, in
       return OVVS_STATUS_SUCCESS;
     }
     std::atomic<ovvsStatus> walk_status{OVVS_STATUS_SUCCESS};
-    std::atomic<int64_t> next_query{lo};
-    const int worker_count = static_cast<int>(std::min<int64_t>(walk_threads, hi - lo));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<size_t>(worker_count));
-    for (int t = 0; t < worker_count; ++t) {
-      workers.emplace_back([&]() {
-        for (;;) {
-          const int64_t q = next_query.fetch_add(1, std::memory_order_relaxed);
-          if (q >= hi) return;
-          if (walk_status.load(std::memory_order_relaxed) != OVVS_STATUS_SUCCESS) return;
-          const ovvsStatus s = walk_one(q);
-          if (s != OVVS_STATUS_SUCCESS) {
-            ovvsStatus expected = OVVS_STATUS_SUCCESS;
-            walk_status.compare_exchange_strong(expected, s);
-            return;
-          }
-        }
-      });
-    }
-    for (auto& w : workers) w.join();
+    const std::function<void(int64_t)> body = [&](int64_t q) {
+      if (walk_status.load(std::memory_order_relaxed) != OVVS_STATUS_SUCCESS) return;
+      const ovvsStatus s = walk_one(q);
+      if (s != OVVS_STATUS_SUCCESS) {
+        ovvsStatus expected = OVVS_STATUS_SUCCESS;
+        walk_status.compare_exchange_strong(expected, s);
+      }
+    };
+    r.pool(walk_threads).run(lo, hi, body);
     return walk_status.load();
   };
 

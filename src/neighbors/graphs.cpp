@@ -1612,23 +1612,16 @@ static ovvsStatus cagra_relink_batch(CagraIndex* ix, ResourcesData& r, const int
     for (size_t gi = 0; gi < groups.size(); ++gi) prune_group(gi);
     return OVVS_STATUS_SUCCESS;
   }
-  std::atomic<size_t> next{0};
   std::atomic<bool> threw{false};
-  auto worker = [&]() {
+  const std::function<void(int64_t)> body = [&](int64_t gi) {
+    if (threw.load(std::memory_order_relaxed)) return;
     try {
-      for (size_t gi = next.fetch_add(1); gi < groups.size(); gi = next.fetch_add(1)) {
-        if (threw.load(std::memory_order_relaxed)) return;
-        prune_group(gi);
-      }
+      prune_group(static_cast<size_t>(gi));
     } catch (...) {
       threw.store(true);
     }
   };
-  std::vector<std::thread> pool;
-  pool.reserve(static_cast<size_t>(nthreads - 1));
-  for (int64_t t = 1; t < nthreads; ++t) pool.emplace_back(worker);
-  worker();
-  for (auto& th : pool) th.join();
+  r.pool(static_cast<int>(nthreads)).run(0, static_cast<int64_t>(groups.size()), body);
   /* A throwing prune leaves some targets un-pruned; their rows still hold valid (older)
      edges, so the graph stays consistent -- edges are hints. Report it all the same. */
   if (threw.load()) return OVVS_STATUS_OOM;

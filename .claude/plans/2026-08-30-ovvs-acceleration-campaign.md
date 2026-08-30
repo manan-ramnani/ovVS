@@ -1281,4 +1281,39 @@ Append newest last. One line per real event: what landed, what number it produce
   queries AND mutation together. hnswlib insert is also intrinsically cheaper per op than
   its own update; our insert search rides itopk=2×degree (sweepable later, one variable).
   **NEXT (per the user work program): persistent CPU worker pool → patience port to the
-  CPU walk → int8 CPU leg; then recall-target mode design; cold-box certification last.
+  CPU walk → int8 CPU leg; then recall-target mode design; cold-box certification last.- **2026-08-31** — **PERSISTENT CPU WORKER POOL LANDED (`CpuWorkPool`, one per Resources)
+  + MID-CORPUS ROUTING RE-TUNED: the burst band exploded — b32 is now 3.2-3.8× AHEAD of
+  hnswlib at EVERY scale.** Per-call thread spawn was costing ~1.5 ms per walk call —
+  devastating at b32 (half the batch time). The pool parks workers on a condition
+  variable (generation handshake, all workers participate, `run` serialized by a
+  submitter mutex, joined in ovvsResourcesDestroy — no DllMain loader-lock hazard);
+  the walk driver and the mutation prune phase both ride it; callers keep their tiny-work
+  serial thresholds. 9/9 CTest, recall bit-identical (0.9962 etc. unchanged).
+  **Solo-window effects:** 100K CPU b32 12.1K → 37.0K (3.1×); 100K CPU b1000 → 44.6K
+  (+12-17%); 100K hetero b1000 46.7K → 60.3K; 10K CPU b1000 123.8K → 138.6K.
+  **Constants re-tuned to the faster CPU leg** (probes: f-sweep peak moved 0.55 → 0.45-
+  0.50 with steeper falloff low, so f=0.50; CPU-only beats the split through b128 and
+  ties at b256): mid-corpus HETERO is now crossover nq=256, split f=0.50. Small/large
+  corpus rules unchanged (CPU-always <32K; GPU-whole ≥320K from nq=8).
+  **FINAL MATRIX OF THE NIGHT (shared window, matched recall, shipped policy):**
+  - 10K: b1 0.49×; **b32 90.8K vs 27.9K = 3.25×**; b1000 150.2K vs 238.9K = 0.63×;
+    insert 43.1K vs 126.5K = 0.34×; **update 52.9K vs 45.5K = 1.16× AHEAD**; delete 32×.
+  - 100K: b1 0.65×; **b32 24.4K vs 6.5K = 3.78×**; **b1000 47.4K vs 41.6K = 1.14×
+    AHEAD**; insert 13.5K vs 22.2K = 0.61×; **update 14.8K vs 12.1K = 1.23× AHEAD**;
+    delete 50×.
+  - 1M: b1 0.56×; **b32 17.3K vs 5.3K = 3.24×**; **b1000 38.8K vs 22.8K = 1.70×
+    AHEAD**; insert 5.0K vs 8.8K = 0.57×; update 5.0K vs 6.0K = 0.83×; delete 68×.
+  - Memory unchanged by the pool (idle 68/126/702 MB, active 90/192/885 MB).
+  Compared with the START of tonight: b32 went from 0.62-0.72× BEHIND to 3.2-3.8× ahead
+  at 10K/100K (1M was already ahead); 100K b1000 from 0.95× to 1.14×; insert from
+  0.02-0.11× to 0.34-0.61×; update from 0.08-0.17× to 0.83-1.23×.
+  **Where the remaining losses are: b1 singles (0.49-0.65×) and 10K bulk (0.63×) — both
+  the CPU walk itself (fp32 rows, no patience), NOT spawn overhead (b1 always ran
+  inline; earlier ledger claim corrected). 1M insert 0.57× is walk-bandwidth-bound.**
+  **QUEUE (user work program, remaining):** (1) patience port to the CPU walk — must
+  match GPU patience semantics exactly to keep hybrid-leg parity; (2) int8-mirror CPU
+  leg (AVX2-VNNI dword dot, exact identity) — lifts b1, 10K bulk, AND mutation searches
+  together, the one lever behind every remaining loss; (3) recall-target mode (per-index
+  frontier calibration table; design in the 1M-frontier entry); (4) cold-box certified
+  session — now THREE leads to certify: 100K b1000 (1.14×), 1M b1000 (1.70×), b32 band
+  (3.2-3.8×); (5) GPU-assisted mutation (needs device-mirror invalidation audit).
