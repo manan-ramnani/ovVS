@@ -1497,3 +1497,71 @@ Append newest last. One line per real event: what landed, what number it produce
      package power/bandwidth sharing makes any CPU co-run cost the GPU more than it
      adds. No regime on this silicon where a merged queue pays; revisit only on
      hardware with separate GPU power/memory domains (dGPU).
+- **2026-08-31** — **THE HARDENING BLOCK: fp16 goes API-first (storage= ABI, PQ, XMX
+  probe), the store learns to survive (concurrent read-during-write, WAL), the engine
+  learns to self-tune (recall-target mode), and three open measurements close (320K
+  boundary CONFIRMED both lanes, energy 0.29-0.36x of hnswlib, env knobs culled).**
+  (User: "Lets work on the fp16 items..., cold-box certification..., 320K boundary...,
+  concurrent read-during-write, durability/WAL, energy measurement, env-knob cull,
+  recall-target mode.")
+  1. **ABI `storage=` [caf86e9]**: `ovvsCagraBuildEx2` + `ovvsCagraStorage`
+     {AUTO, FP32, FP16, FP16_IF_LOSSLESS}. AUTO keeps the env-override behaviour, the
+     explicit values ignore the env; IF_LOSSLESS converts only when every value
+     round-trips. Python `build(..., storage=)`. Verified: fp16 file 3.84 vs 6.40 MB,
+     lossy-corpus guard holds, recall 1.0000 every mode.
+  2. **Env cull [5d949c4]**: OVVS_CAGRA_STOP_EF DELETED (feature +
+     both kernel blocks — lost on the frontier); OVVS_GPU_SUBGROUP_GEOM retired (the
+     2.4-5.7x geometry is now unconditional); QPW=8 lane re-commented with its recorded
+     verdict (0.82x at b1024 — kept for bigger-SLM SKUs); SEEN_RING stale comment fixed
+     (measured default 0). `docs/env.md` is the complete inventory by class.
+  3. **PQ-on-fp16 [7cb3f85]**: quantize/mutation re-encode/detach all storage-agnostic;
+     fp16 encodes row-at-a-time so transient memory stays O(dim) (an fp32 copy at R3
+     would be 5 GB). fp16+PQ recall identical to fp32+PQ at search, post-mutation, and
+     across a serialize round-trip.
+  4. **XMX probe [0ba2aa2]**: `ovvsGpuHasXmx()` via joint-matrix combinations — the
+     portability-pass routing hook for where fp16 COMPUTE pays. Reports 0 on Xe-LPG,
+     as measured reality requires.
+  5. **Recall-target mode [073bc99]**: `ovvsCagraCalibrate(target, k) -> (itopk, width,
+     estimate)` — 256 live rows displaced by their FULL nearest-other distance (raw
+     self-samples read +0.018 too easy at 1M and saturate the ladder), exact truth from
+     a threaded brute-force scan, ladder through the PUBLIC search path, cheapest
+     config meeting target wins. Transfer to real SIFT queries: 100K all targets met
+     (calib 0.1s); 1M 0.90/0.95 met at (32,2), 0.99 climbs to (48,1) real 0.9867
+     (calib ~7s). Residual estimate optimism (+0.002 at 100K, up to +0.016 at 1M low
+     effort) is STRUCTURAL — real query sets can be harder than anything derived from
+     stored rows — documented on the API: hard floors should aim above.
+  6. **Concurrent read-during-write [4902654]**: v1 contract — any number
+     of searches, one mutation at a time, searches keep running DURING mutation.
+     Per-index shared_mutex covers pointer-moves and value tears (readers shared for a
+     whole call, mutations exclusive only for ms-scale write phases); the repair search
+     runs UNLOCKED and SUB-BATCHED at 512 queries (a whole 4096 chunk owned the iGPU
+     for hundreds of ms: reader p95 hit 560ms); edge publication + back-link prunes run
+     UNLOCKED BY DESIGN — aligned int32 hint-edges cannot tear, and holding the lock
+     there was measured to CONVOY readers (581ms p99: the writer re-acquired within
+     microseconds and readers starved). Engine choice for the repair search now travels
+     as a prim_graph_walk policy_override (never mutates r.policy under readers);
+     fp32-mirror GPU walks serialize per-Resources (rebuild frees a buffer an in-flight
+     walk could read; f16 walks have no cached GPU state and overlap freely).
+     **Measured (concurrent_rw.py, 1M f16, 2 readers + churn writer): zero errors;
+     read-only b32 p99 1.9ms; under sustained writes b32 p99 18.9ms with GPU-assisted
+     mutation at FULL writer speed (10K upd/s), or 6.6ms with OVVS_CAGRA_MUTATE_GPU=0
+     at 0.63x writer speed — a clean, documented trade.** Single-thread numbers
+     unchanged (churn 0.964 band, upd 17-18us/op).
+  7. **WAL [6097665]**: `ovvsCagraWalOpen(path, fsync_every)` — replay-on-open drives
+     the PUBLIC mutation entry points so slot reuse/relink/pq reproduce the exact
+     pre-crash state (verified: neighbor ids AND distances bitwise-equal after crash +
+     replay); CRC per record, torn tail truncated away (verified: a mid-record tear
+     drops exactly that record); Serialize truncates the log; insert records carry
+     (rows_before, deleted_before) preconditions so the serialize-crash window cannot
+     double-apply. fsync per mutation when fsync_every > 0.
+  8. **320K boundary spot-check: the constant SURVIVES, on BOTH lanes.** fp32:
+     200K 0.94x (CPU), 320K 1.17x (GPU), 500K 1.13x — the CPU falls off its memory
+     cliff right around the interpolated point. DS16 (mirror dropped): 200K 0.77x,
+     320K 1.00x, 500K 1.04x — a dead tie from the boundary up, so GPU-whole stays a
+     valid single law. Side finding: the CPU f16 walk degrades far more gracefully
+     with n than fp32 (29.9K vs 21.0K at 500K — half the memory traffic).
+  9. **Energy (energy.py, EMI RAPL package counter — ovvsResourcesEnergyUj works on
+     this box): ovVS uses 0.29x hnswlib's energy per query at 100K and 0.36x at 1M.**
+     The 1M profile is the story: GPU-whole draws ~4W over the idle window (41.4 vs
+     37.2W) while delivering 2.9x hnswlib's throughput at equal package watts. The
+     iGPU is the efficiency play as well as the throughput play.
