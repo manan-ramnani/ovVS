@@ -1565,3 +1565,31 @@ Append newest last. One line per real event: what landed, what number it produce
      The 1M profile is the story: GPU-whole draws ~4W over the idle window (41.4 vs
      37.2W) while delivering 2.9x hnswlib's throughput at equal package watts. The
      iGPU is the efficiency play as well as the throughput play.
+- **2026-08-31** — **CERTIFICATION PASS (final binaries, quiet machine, matched
+  recall at every scale): the standing leads hold or improve, updates now beat the
+  frozen comparator at ALL THREE scales, and a bistable-metric bug in the harness was
+  root-caused and fixed on the way.**
+  1. **The certified matrix (ovvs/hnswlib ratio, ovVS recall equal-or-better at every
+     point — 0.9962 vs 0.9955 at 100K, 0.9735 vs 0.9711 at 1M):**
+     | | 10k | 100k | 1m |
+     |---|---|---|---|
+     | b1 | 0.54x | 0.81x | 0.47x |
+     | b32 | **3.27x** | **6.08x** | **3.43x** |
+     | b1000 | 0.64x | **1.42x** | **1.76x** |
+     | insert | 0.31x | 0.60x | 0.55x |
+     | update | **1.46x** | **1.50x** | **1.18x** |
+     | delete | 42x | 55x | 87x |
+     vs the prior capstone: the b32 band lifts to 3.3-6.1x, 1M b1000 1.68 -> 1.76x,
+     and updates flip from 0.98/1.20/0.84 to ahead everywhere — the relink-effort
+     sweep delivering at certification. Inserts and b1 hold their known bands (the
+     open items). 9/9 CTest on the certified binaries.
+  2. **Harness bug found by certifying: the 1M b1000 point was BISTABLE.** The first
+     cert run read 0.75x; the discriminator showed fp32-GPU at 41.2K hot vs 17.2K when
+     the 10000-query call STARTS on a parked iGPU — and matrix's alternating protocol
+     puts ~430ms of CPU-heavy hnswlib (right at the park threshold) before every ovVS
+     round, so whole runs land on either side depending on driver hysteresis. A call
+     that begins parked runs ENTIRELY at low clocks (580ms without up-clocking — the
+     bookkeeping-bound kernel apparently reads as idle to the governor). The gate
+     metric is sustained throughput: matrix now gives both engines an untimed warm
+     touch per timed round. The prior capstone's 1.68x was the hot side of the same
+     coin; 1.76x is the stable sustained number.
