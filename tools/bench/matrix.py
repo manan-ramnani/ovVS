@@ -193,10 +193,19 @@ def perf(args) -> int:
         timed_round(ovvs_search, chunks, nq)  # warmup
         timed_round(hnsw_search, chunks, nq)
         lanes = {"ovvs": {"qps": [], "ms": []}, "hnswlib": {"qps": [], "ms": []}}
+        # The gate metric is SUSTAINED throughput, so each engine gets an untimed
+        # warm touch before its timed round. Without it the b1000 point is bistable:
+        # the ~430ms of CPU-heavy hnsw between ovVS rounds sits right at the iGPU's
+        # park threshold, and a 10000-query call that STARTS parked runs entirely at
+        # low clocks (measured 17.2K vs 41.2K hot in the same window, ratio flipping
+        # 0.75x vs 1.76x run to run).
+        warm = chunks[: max(1, len(chunks) // 16)]
         for _ in range(args.rounds):
+            timed_round(ovvs_search, warm, sum(c.shape[0] for c in warm))
             q, ms, _ = timed_round(ovvs_search, chunks, nq)
             lanes["ovvs"]["qps"].append(q)
             lanes["ovvs"]["ms"].extend(ms)
+            timed_round(hnsw_search, warm, sum(c.shape[0] for c in warm))
             q, ms, _ = timed_round(hnsw_search, chunks, nq)
             lanes["hnswlib"]["qps"].append(q)
             lanes["hnswlib"]["ms"].extend(ms)
